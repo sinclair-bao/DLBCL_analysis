@@ -1,0 +1,64 @@
+# =============================================
+# 原始 / 中间 / 处理后数据（体积大，不上传）
+# =============================================
+data/raw/**
+!data/raw/.gitkeep
+data/interim/**
+!data/interim/.gitkeep
+data/processed/**
+!data/processed/.gitkeep
+
+# 结果中的大文件与模型权重（表格/小图可按需取消忽略）
+results/models/**
+!results/models/.gitkeep
+results/figures/**
+!results/figures/.gitkeep
+results/tables/**
+!results/tables/.gitkeep
+
+# =============================================
+# 医学影像与 DICOM 相关
+# =============================================
+*.nii
+*.nii.gz
+*.dcm
+*.dicom
+*.img
+*.hdr
+*.mha
+*.mhd
+*.nrrd
+DICOMDIR*
+DIR_INFO.TXT
+
+# =============================================
+# 日志与临时文件
+# =============================================
+logs/**
+!logs/.gitkeep
+*.log
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# =============================================
+# 环境与本地密钥
+# =============================================
+.env
+.venv/
+venv/
+*.mat
+*.pth
+*.pt
+*.h5
+*.hdf5
+*.ckpt
+*.zip
+*.rar
+*.tar
+*.tar.gz
+*.7z

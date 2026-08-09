@@ -1,0 +1,19 @@
+name: dlbcl
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - nibabel
+  - pydicom
+  - tqdm
+  - pyyaml
+  - pip
+  - pip:
+      - SimpleITK
