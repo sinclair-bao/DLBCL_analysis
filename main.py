@@ -27,7 +27,7 @@
           直接运行对应模块自己的 CLI（见各模块文件头部的用法示例）。
 
 @用法示例
-    # 完整跑一遍（转换 -> 预处理 -> 分割 -> 分析）
+    # 完整跑一遍（转换 -> 预处理 -> 分割 -> 分析）b
     python main.py --stage all --dcm2niix-bin /home/sun/fsl/bin/dcm2niix
 
     # 只跑某一阶段
