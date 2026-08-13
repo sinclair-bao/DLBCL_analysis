@@ -12,6 +12,8 @@ data/interim/**
 !data/interim/.gitkeep
 data/processed/**
 !data/processed/.gitkeep
+data/nnunet_export/**
+!data/nnunet_export/.gitkeep
 
 # 结果中的大文件与模型权重（表格/小图可按需取消忽略）
 results/models/**
