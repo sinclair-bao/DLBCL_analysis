@@ -9,47 +9,36 @@
     病灶分割阶段：读取 preprocess.py 产出的重采样后 CT/PET，生成二值分割
     掩码（Mask），写入 data/processed/。
 
-    分割算法本身通过可注入的 `segmentation_fn` 解耦：
-        - 默认提供一个真实可用、核医学领域标准的基线方法——固定/相对 SUV
-          阈值分割（`threshold_suv_mask()`，见下方说明），适用于有 PET 的
-          Study，可直接产出有意义的结果，而不是一个空占位符。
-        - 如果团队后续训练了专门的分割模型（如基于 nnU-Net / TotalSegmentator
-          的病灶分割），只需在构造 `LesionSegmenter` 时传入自定义
-          `segmentation_fn`（签名见类文档），不需要改动本文件其余的发现 /
-          跳过 / 日志基础设施。
-        - 仅有 CT、没有 PET 的 Study：目前没有集成任何 CT-only 的分割算法
-          （避免在没有验证依据的情况下编造分割逻辑），会记录为 "warning"，
-          明确提示需要接入自定义 segmentation_fn 或专用 CT 分割模型。
+    支持两种分割后端（通过 --method 切换，默认 nnunet）：
 
-@输入 (Input)
-    data/interim/<PatientID>/<StudyDate>/preprocessed/PET/*.nii.gz
-    data/interim/<PatientID>/<StudyDate>/preprocessed/CT/*.nii.gz（可选，
-    仅用于后续可能的 CT-based 算法接入，当前默认算法不使用）
+    1. nnunet（默认）
+       调用 infer_nnunet.NnuNetInferrer 对 nnunet_export 目录中已导出的
+       CT/PET 对执行 AutoPET III 冠军模型推理（5-fold 集成，GPU），
+       产出病灶掩码到 data/processed/<PatientID>/<StudyDate>/masks/
+       文件名：{PatientID}_{StudyDate}_lesion.nii.gz
 
-@输出 (Output)
-    data/processed/<PatientID>/<StudyDate>/masks/<PET文件名去掉扩展名>_mask.nii.gz
-    掩码为 uint8，1=病灶，0=背景，仿射矩阵与输入 PET 完全一致。
+    2. threshold（SUV 阈值基线，原始方法）
+       直接对 preprocessed PET SUV 图做固定/相对阈值分割，
+       无需 GPU 或 nnU-Net，适用于快速验证或无 GPU 场景。
+       文件名：{PET原始名}_mask.nii.gz
 
-@默认分割算法：SUV 阈值法 (threshold_suv_mask)
-    - mode="absolute"（默认）：mask = (SUV >= threshold)，默认
-      threshold=2.5 g/mL，是 PET 肿瘤学文献中最常用的固定阈值之一。
-    - mode="relative"：mask = (SUV >= threshold * SUVmax)，threshold 常取
-      0.41（即 41% SUVmax，亦是文献中常见取值）。
-    这是一个简单、可复现、有文献依据的基线，不代表最终临床级分割结果，
-    仅作为流程打通与后续对比的起点。
-
-@关键执行逻辑
-    - discover_studies()：复用 scripts/common/pipeline_utils。
-    - segment_study()：为每个 Study 定位其 preprocessed PET（找不到则跳过
-      并给出 warning，不影响其他 Study）；调用 segmentation_fn 得到掩码
-      数组；用与输入相同的 affine/header 保存，保证空间一致性；每个 Study
-      独立 try/except。
-    - 增量执行：目标掩码已存在则跳过，除非 overwrite=True。
+    两种方法产出的掩码均为 uint8（1=病灶, 0=背景），仿射矩阵与输入一致，
+    因此可直接互换用于下游特征提取。
 
 @用法示例
-    python scripts/processing/segmentation.py
-    python scripts/processing/segmentation.py --threshold-mode relative --threshold 0.41
-    python scripts/processing/segmentation.py --dry-run -v
+    # 使用 nnU-Net（默认，需在 autopet 环境运行）
+    /home/sun/miniconda3/envs/autopet/bin/python scripts/processing/segmentation.py
+    /home/sun/miniconda3/envs/autopet/bin/python scripts/processing/segmentation.py --patient-id 00857723
+
+    # 使用 SUV 阈值基线（任意环境）
+    python scripts/processing/segmentation.py --method threshold
+    python scripts/processing/segmentation.py --method threshold --threshold-mode relative --threshold 0.41
+
+    # 两种方法并行运行（用于对比）
+    python scripts/processing/segmentation.py --method both
+
+    # 通过 main.py（nnunet 方法需指定 autopet Python）
+    python main.py --stage segment
 """
 
 from __future__ import annotations
@@ -65,7 +54,7 @@ import numpy as np
 
 try:
     import nibabel as nib
-except ImportError as exc:  # pragma: no cover - environment guard
+except ImportError as exc:  # pragma: no cover
     raise SystemExit("缺少 nibabel，请先安装。") from exc
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
@@ -83,20 +72,30 @@ STAGE_NAME = "segment"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INTERIM_ROOT = PROJECT_ROOT / "data" / "interim"
+DEFAULT_EXPORT_ROOT = PROJECT_ROOT / "data" / "nnunet_export"
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
+DEFAULT_MODEL_FOLDER = (
+    PROJECT_ROOT
+    / "autoPET"
+    / "Dataset222_AutoPETIII_2024"
+    / "autoPET3_Trainer__nnUNetResEncUNetLPlansMultiTalent__3d_fullres_bs3"
+)
 
-# 自定义分割函数的统一签名：接收 PET 像素数组（float），返回同形状的 0/1 掩码。
 SegmentationFn = Callable[[np.ndarray], np.ndarray]
 
 
-def threshold_suv_mask(suv_data: np.ndarray, mode: str = "absolute", threshold: float = 2.5) -> np.ndarray:
-    """
-    SUV 阈值分割基线方法，返回 uint8 掩码（1=病灶，0=背景）。
+# ---------------------------------------------------------------------------
+# SUV 阈值基线
+# ---------------------------------------------------------------------------
 
-    mode="absolute": mask = suv_data >= threshold（默认 threshold=2.5 g/mL）
-    mode="relative": mask = suv_data >= threshold * suv_data.max()
-                      （默认建议 threshold=0.41，即 41% SUVmax）
+def threshold_suv_mask(
+    suv_data: np.ndarray,
+    mode: str = "absolute",
+    threshold: float = 2.5,
+) -> np.ndarray:
+    """
+    SUV 阈值分割基线（mode='absolute' 或 'relative'），返回 uint8 掩码。
     """
     if mode == "absolute":
         mask = suv_data >= threshold
@@ -104,54 +103,35 @@ def threshold_suv_mask(suv_data: np.ndarray, mode: str = "absolute", threshold: 
         suv_max = float(np.nanmax(suv_data)) if suv_data.size else 0.0
         mask = suv_data >= (threshold * suv_max)
     else:
-        raise ValueError(f"未知的 threshold mode: {mode!r}，应为 'absolute' 或 'relative'。")
+        raise ValueError(f"未知的 threshold mode: {mode!r}")
     return mask.astype(np.uint8)
 
 
-class LesionSegmenter:
-    """
-    病灶分割阶段的编排类：负责发现 Study、定位输入、调用分割算法、落盘掩码。
+# ---------------------------------------------------------------------------
+# 阈值分割后端
+# ---------------------------------------------------------------------------
 
-    Parameters
-    ----------
-    interim_root, processed_root:
-        分别对应 data/interim（读取 preprocessed PET/CT）与 data/processed
-        （写出掩码）。
-    segmentation_fn:
-        可选的自定义分割函数，签名为 `f(pet_data: np.ndarray) -> np.ndarray`
-        （返回与输入同形状的 0/1 掩码）。默认使用 `threshold_suv_mask`
-        （固定参数见 threshold_mode / threshold）。团队后续接入真实模型时，
-        只需传入形如::
-
-            def my_model_segmentation(pet_data: np.ndarray) -> np.ndarray:
-                ...  # 调用 nnU-Net / TotalSegmentator 等真实模型推理
-                return mask
-
-        并在构造时传入 `segmentation_fn=my_model_segmentation` 即可，无需
-        改动本类其余逻辑。
-    """
+class ThresholdSegmenter:
+    """对 preprocessed PET 执行 SUV 阈值分割（基线方法）。"""
 
     def __init__(
         self,
         interim_root: Path | str,
         processed_root: Path | str,
         overwrite: bool = False,
-        segmentation_fn: Optional[SegmentationFn] = None,
         threshold_mode: str = "absolute",
         threshold: float = 2.5,
+        segmentation_fn: Optional[SegmentationFn] = None,
     ) -> None:
         self.interim_root = Path(interim_root)
         self.processed_root = Path(processed_root)
         self.overwrite = overwrite
         self.threshold_mode = threshold_mode
         self.threshold = threshold
-        self.segmentation_fn = segmentation_fn or self._default_segmentation_fn
+        self.segmentation_fn = segmentation_fn or self._default_fn
 
-    def _default_segmentation_fn(self, pet_data: np.ndarray) -> np.ndarray:
-        return threshold_suv_mask(pet_data, mode=self.threshold_mode, threshold=self.threshold)
-
-    def discover_studies(self) -> list[tuple[str, str, Path]]:
-        return discover_subject_studies(self.interim_root)
+    def _default_fn(self, pet_data: np.ndarray) -> np.ndarray:
+        return threshold_suv_mask(pet_data, self.threshold_mode, self.threshold)
 
     @staticmethod
     def _find_preprocessed_pet(study_dir: Path) -> Optional[Path]:
@@ -166,85 +146,201 @@ class LesionSegmenter:
         if pet_path is None:
             return StageResult(
                 STAGE_NAME, patient_id, study_date, "warning", "",
-                "未找到 preprocessed PET，跳过分割（当前默认算法依赖 PET/SUV）。"
-                " 如需 CT-only 分割，请传入自定义 segmentation_fn。",
+                "未找到 preprocessed PET，跳过阈值分割。",
             )
 
         output_dir = self.processed_root / patient_id / study_date / "masks"
-        mask_path = output_dir / f"{pet_path.stem.removesuffix('.nii')}_mask.nii.gz"
-        if mask_path.exists() and not self.overwrite:
-            return StageResult(
-                STAGE_NAME, patient_id, study_date, "skipped", str(mask_path),
-                "输出已存在，overwrite=True 可强制重转。",
-            )
+        stem = pet_path.name.removesuffix(".nii.gz").removesuffix(".nii")
+        mask_path = output_dir / f"{stem}_mask.nii.gz"
 
+        if mask_path.exists() and not self.overwrite:
+            return StageResult(STAGE_NAME, patient_id, study_date, "skipped", str(mask_path),
+                               "输出已存在，overwrite=True 可强制重跑。")
         try:
             img = nib.load(str(pet_path))
             pet_data = img.get_fdata(dtype=np.float64)
             mask_data = self.segmentation_fn(pet_data)
             if mask_data.shape != pet_data.shape:
-                raise ValueError(
-                    f"segmentation_fn 返回的掩码形状 {mask_data.shape} 与输入 {pet_data.shape} 不一致。"
-                )
+                raise ValueError(f"掩码形状 {mask_data.shape} 与输入 {pet_data.shape} 不一致。")
             mask_img = nib.Nifti1Image(mask_data.astype(np.uint8), img.affine, img.header)
             mask_img.header.set_data_dtype(np.uint8)
             output_dir.mkdir(parents=True, exist_ok=True)
             nib.save(mask_img, str(mask_path))
-            n_voxels = int(mask_data.sum())
             return StageResult(
                 STAGE_NAME, patient_id, study_date, "ok", str(mask_path),
-                f"分割完成，阳性体素数={n_voxels} (mode={self.threshold_mode}, threshold={self.threshold})",
+                f"阈值分割完成，体素数={int(mask_data.sum())} "
+                f"(mode={self.threshold_mode}, threshold={self.threshold})",
             )
-        except NotImplementedError as exc:
-            return StageResult(
-                STAGE_NAME, patient_id, study_date, "warning", str(mask_path),
-                f"分割算法未实现: {exc}",
-            )
-        except Exception as exc:  # noqa: BLE001 - 单个 Study 失败不影响其他 Study
-            logger.exception("分割失败: %s", pet_path)
-            return StageResult(STAGE_NAME, patient_id, study_date, "error", str(mask_path), str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("阈值分割失败: %s", pet_path)
+            return StageResult(STAGE_NAME, patient_id, study_date, "error", "", str(exc))
 
-    def run(self, dry_run: bool = False) -> list[StageResult]:
-        studies = self.discover_studies()
-        logger.info("共发现 %d 个 (patient, study) 待分割。", len(studies))
-
+    def run(
+        self,
+        dry_run: bool = False,
+        patient_id: Optional[str] = None,
+        study_date: Optional[str] = None,
+    ) -> list[StageResult]:
+        studies = discover_subject_studies(self.interim_root)
+        if patient_id:
+            studies = [s for s in studies if s[0] == patient_id]
+        if study_date:
+            studies = [s for s in studies if s[1] == study_date]
+        logger.info("[threshold] 共发现 %d 个 study 待分割。", len(studies))
         if dry_run:
-            for patient_id, study_date, study_dir in studies:
-                pet_path = self._find_preprocessed_pet(study_dir)
-                logger.info(
-                    "[DRY-RUN] patient=%s study=%s pet=%s",
-                    patient_id, study_date, pet_path if pet_path else "(未找到)",
-                )
+            for pid, sdate, study_dir in studies:
+                pet = self._find_preprocessed_pet(study_dir)
+                logger.info("[DRY-RUN] threshold patient=%s study=%s pet=%s", pid, sdate, pet)
             return []
-
-        results: list[StageResult] = []
-        for idx, (patient_id, study_date, study_dir) in enumerate(studies, start=1):
-            logger.info("[%d/%d] 分割 patient=%s study=%s", idx, len(studies), patient_id, study_date)
-            result = self.segment_study(patient_id, study_date, study_dir)
-            results.append(result)
-            if result.status == "error":
-                logger.error("失败: patient=%s study=%s -> %s", patient_id, study_date, result.message)
-            elif result.status == "warning":
-                logger.warning("警告: patient=%s study=%s -> %s", patient_id, study_date, result.message)
+        results = []
+        for idx, (pid, sdate, study_dir) in enumerate(studies, start=1):
+            logger.info("[%d/%d] threshold patient=%s study=%s", idx, len(studies), pid, sdate)
+            results.append(self.segment_study(pid, sdate, study_dir))
         return results
 
 
+# ---------------------------------------------------------------------------
+# nnU-Net 后端（委托给 infer_nnunet）
+# ---------------------------------------------------------------------------
+
+class NnunetSegmenter:
+    """对 nnunet_export 的 CT/PET 对执行 AutoPET nnU-Net 推理。"""
+
+    def __init__(
+        self,
+        export_root: Path | str,
+        processed_root: Path | str,
+        model_folder: Path | str,
+        overwrite: bool = False,
+        folds: list[int] | None = None,
+        device: str = "cuda",
+        num_proc: int = 2,
+    ) -> None:
+        # 延迟导入，避免无 nnunet 环境时 import 阶段报错
+        try:
+            from infer_nnunet import NnuNetInferrer  # noqa: PLC0415
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from infer_nnunet import NnuNetInferrer  # noqa: PLC0415
+        self._inferrer = NnuNetInferrer(
+            export_root=export_root,
+            processed_root=processed_root,
+            model_folder=model_folder,
+            overwrite=overwrite,
+            folds=folds or [0, 1, 2, 3, 4],
+            device=device,
+            num_proc=num_proc,
+        )
+
+    def run(
+        self,
+        dry_run: bool = False,
+        patient_id: Optional[str] = None,
+        study_date: Optional[str] = None,
+    ) -> list[StageResult]:
+        return self._inferrer.run(
+            dry_run=dry_run, patient_id=patient_id, study_date=study_date,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 统一入口
+# ---------------------------------------------------------------------------
+
+class LesionSegmenter:
+    """
+    统一的分割阶段入口，支持 method='nnunet'（默认）、'threshold' 或 'both'。
+
+    'both' 模式会同时运行两种方法，产出不同文件名，便于对比评估。
+    """
+
+    def __init__(
+        self,
+        interim_root: Path | str = DEFAULT_INTERIM_ROOT,
+        processed_root: Path | str = DEFAULT_PROCESSED_ROOT,
+        export_root: Path | str = DEFAULT_EXPORT_ROOT,
+        model_folder: Path | str = DEFAULT_MODEL_FOLDER,
+        overwrite: bool = False,
+        method: str = "nnunet",
+        # 阈值方法参数
+        segmentation_fn: Optional[SegmentationFn] = None,
+        threshold_mode: str = "absolute",
+        threshold: float = 2.5,
+        # nnU-Net 参数
+        folds: list[int] | None = None,
+        device: str = "cuda",
+        num_proc: int = 2,
+    ) -> None:
+        self.method = method
+        self._threshold_seg = ThresholdSegmenter(
+            interim_root=interim_root,
+            processed_root=processed_root,
+            overwrite=overwrite,
+            segmentation_fn=segmentation_fn,
+            threshold_mode=threshold_mode,
+            threshold=threshold,
+        )
+        if method in ("nnunet", "both"):
+            self._nnunet_seg = NnunetSegmenter(
+                export_root=export_root,
+                processed_root=processed_root,
+                model_folder=model_folder,
+                overwrite=overwrite,
+                folds=folds,
+                device=device,
+                num_proc=num_proc,
+            )
+        else:
+            self._nnunet_seg = None
+
+    def run(
+        self,
+        dry_run: bool = False,
+        patient_id: Optional[str] = None,
+        study_date: Optional[str] = None,
+    ) -> list[StageResult]:
+        results: list[StageResult] = []
+        if self.method in ("threshold", "both"):
+            results.extend(
+                self._threshold_seg.run(dry_run=dry_run,
+                                        patient_id=patient_id, study_date=study_date)
+            )
+        if self.method in ("nnunet", "both") and self._nnunet_seg is not None:
+            results.extend(
+                self._nnunet_seg.run(dry_run=dry_run,
+                                     patient_id=patient_id, study_date=study_date)
+            )
+        return results
+
+
+# ---------------------------------------------------------------------------
+# CLI 入口
+# ---------------------------------------------------------------------------
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="对 preprocessed PET 做 SUV 阈值病灶分割（基线方法，可替换为自定义模型）。",
+        description="病灶分割：支持 nnU-Net AutoPET 模型（默认）和 SUV 阈值基线。",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--interim-root", type=Path, default=DEFAULT_INTERIM_ROOT, help="data/interim 根目录。")
-    parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT, help="data/processed 根目录。")
-    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR, help="CSV 日志输出目录。")
-    parser.add_argument(
-        "--threshold-mode", choices=["absolute", "relative"], default="absolute",
-        help="'absolute'=固定 SUV 阈值；'relative'=相对 SUVmax 的比例阈值。",
-    )
-    parser.add_argument("--threshold", type=float, default=2.5, help="阈值数值（absolute 模式单位为 SUV，relative 模式为比例）。")
-    parser.add_argument("--overwrite", action="store_true", help="已存在的输出也强制重新分割。")
-    parser.add_argument("--dry-run", action="store_true", help="只打印将要处理的 Study，不实际执行。")
-    parser.add_argument("-v", "--verbose", action="store_true", help="输出 DEBUG 级别日志。")
+    parser.add_argument("--method", choices=["nnunet", "threshold", "both"], default="nnunet",
+                        help="分割方法：nnunet=AutoPET模型，threshold=SUV阈值，both=两者并行。")
+    parser.add_argument("--interim-root", type=Path, default=DEFAULT_INTERIM_ROOT)
+    parser.add_argument("--export-root", type=Path, default=DEFAULT_EXPORT_ROOT)
+    parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT)
+    parser.add_argument("--model-folder", type=Path, default=DEFAULT_MODEL_FOLDER)
+    parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
+    parser.add_argument("--patient-id", default=None)
+    parser.add_argument("--study-date", default=None)
+    # 阈值参数
+    parser.add_argument("--threshold-mode", choices=["absolute", "relative"], default="absolute")
+    parser.add_argument("--threshold", type=float, default=2.5)
+    # nnU-Net 参数
+    parser.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--num-proc", type=int, default=2)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
 
@@ -255,18 +351,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     segmenter = LesionSegmenter(
         interim_root=args.interim_root,
         processed_root=args.processed_root,
+        export_root=args.export_root,
+        model_folder=args.model_folder,
         overwrite=args.overwrite,
+        method=args.method,
         threshold_mode=args.threshold_mode,
         threshold=args.threshold,
+        folds=args.folds,
+        device=args.device,
+        num_proc=args.num_proc,
     )
-    results = segmenter.run(dry_run=args.dry_run)
+    results = segmenter.run(
+        dry_run=args.dry_run, patient_id=args.patient_id, study_date=args.study_date,
+    )
     if args.dry_run:
         logger.info("Dry-run 完成，未执行任何处理。")
         return 0
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     write_stage_log_csv(results, args.log_dir / f"segment_{timestamp}.csv")
-
     counts = summarize(results)
     logger.info("分割完成: %s", counts)
     return 1 if counts.get("error") else 0

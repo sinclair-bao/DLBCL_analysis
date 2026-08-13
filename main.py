@@ -13,27 +13,36 @@
         convert    -> scripts/tools/pacs_dicom_to_nifti_suv.py
                       （PACS 归档 DICOM -> NIfTI，PET 换算为 SUVbw）
         preprocess -> scripts/processing/preprocess.py
-                      （CT/PET 重采样为统一各向同性体素间距）
+                      （CT/PET 重采样为统一各向同性体素间距，
+                        PET 对齐到 CT 网格，保证双通道 shape 一致）
+        export     -> scripts/processing/export_nnunet.py
+                      （将 preprocessed CT/PET 导出为 nnU-Net 推理命名格式
+                        data/nnunet_export/{patient}_{date}_0000/0001.nii.gz）
         segment    -> scripts/processing/segmentation.py
-                      （SUV 阈值病灶分割基线，可替换为自定义模型）
+                      （病灶分割：默认使用 AutoPET III nnU-Net 模型，
+                        也可用 --segment-method threshold 切换到 SUV 阈值基线，
+                        或 --segment-method both 并行运行两种方法对比）
         analyze    -> scripts/analysis/plot_results.py (+ stats_analysis.R)
-                      （特征统计与绘图；当前为占位，等特征提取步骤补齐后
-                      再接入）
+                      （特征统计与绘图；当前为占位，等特征提取步骤补齐后接入）
 
-    每个阶段内部都做了“输出已存在则跳过”的增量式处理（除非 --overwrite），
+    每个阶段内部都做了"输出已存在则跳过"的增量式处理（除非 --overwrite），
     单个病例/序列失败不会中断整批任务，因此：
         - 中断后重跑 `python main.py --stage all` 只会补跑未完成的部分；
         - 只想调试某一步时，可以只跑 `--stage preprocess` 等单一阶段，或
           直接运行对应模块自己的 CLI（见各模块文件头部的用法示例）。
 
 @用法示例
-    # 完整跑一遍（转换 -> 预处理 -> 分割 -> 分析）b
-    python main.py --stage all --dcm2niix-bin /home/sun/fsl/bin/dcm2niix
+    # 完整跑一遍（需在 autopet 环境，包含 GPU nnU-Net 推理）
+    /home/sun/miniconda3/envs/autopet/bin/python main.py --stage all
 
     # 只跑某一阶段
-    python main.py --stage preprocess --voxel-size 1.5
+    /home/sun/miniconda3/envs/autopet/bin/python main.py --stage segment
+    /home/sun/miniconda3/envs/autopet/bin/python main.py --stage export
 
-    # 干跑，只看计划、不实际处理
+    # 使用 SUV 阈值基线（任意环境均可）
+    python main.py --stage segment --segment-method threshold
+
+    # 干跑，只看计划
     python main.py --stage all --dry-run
 """
 
@@ -52,6 +61,7 @@ for _subdir in ("tools", "processing", "analysis", "common"):
 
 from pacs_dicom_to_nifti_suv import PacsDicomToNiftiSuvConverter  # noqa: E402
 from preprocess import ImagePreprocessor  # noqa: E402
+from export_nnunet import NnuNetExporter  # noqa: E402
 from segmentation import LesionSegmenter  # noqa: E402
 from pipeline_utils import (  # noqa: E402
     StageResult,
@@ -64,6 +74,13 @@ import plot_results  # noqa: E402
 
 logger = logging.getLogger("main")
 
+DEFAULT_MODEL_FOLDER = (
+    ROOT
+    / "autoPET"
+    / "Dataset222_AutoPETIII_2024"
+    / "autoPET3_Trainer__nnUNetResEncUNetLPlansMultiTalent__3d_fullres_bs3"
+)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -72,31 +89,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stage",
-        choices=["convert", "preprocess", "segment", "analyze", "all"],
+        choices=["convert", "preprocess", "export", "segment", "analyze", "all"],
         default="all",
         help="Pipeline stage to run",
     )
-    parser.add_argument("--data-root", type=Path, default=ROOT / "data", help="Data root containing raw/interim/processed")
-    parser.add_argument("--results-root", type=Path, default=ROOT / "results", help="Results output root")
-    parser.add_argument("--log-dir", type=Path, default=ROOT / "logs", help="Stage log (CSV) output directory")
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data",
+                        help="Data root containing raw/interim/processed")
+    parser.add_argument("--results-root", type=Path, default=ROOT / "results",
+                        help="Results output root")
+    parser.add_argument("--log-dir", type=Path, default=ROOT / "logs",
+                        help="Stage log (CSV) output directory")
 
     parser.add_argument(
         "--source", action="append", dest="sources",
         help="[convert] 源 DICOM 路径（glob 或目录），可重复传入；默认 <data-root>/raw/DICOM*",
     )
-    parser.add_argument("--dcm2niix-bin", default="dcm2niix", help="[convert] dcm2niix 可执行文件路径。")
+    parser.add_argument("--dcm2niix-bin", default="dcm2niix",
+                        help="[convert] dcm2niix 可执行文件路径。")
 
-    parser.add_argument("--voxel-size", type=float, default=2.0, help="[preprocess] 目标各向同性体素间距（mm）。")
+    parser.add_argument("--voxel-size", type=float, default=2.0,
+                        help="[preprocess] 目标各向同性体素间距（mm）。")
 
     parser.add_argument(
-        "--threshold-mode", choices=["absolute", "relative"], default="absolute",
-        help="[segment] 'absolute'=固定 SUV 阈值；'relative'=相对 SUVmax 比例阈值。",
+        "--segment-method", choices=["nnunet", "threshold", "both"], default="nnunet",
+        help="[segment] nnunet=AutoPET模型（默认），threshold=SUV阈值基线，both=两者并行对比。",
     )
-    parser.add_argument("--threshold", type=float, default=2.5, help="[segment] 阈值数值。")
+    parser.add_argument(
+        "--threshold-mode", choices=["absolute", "relative"], default="absolute",
+        help="[segment/threshold] 'absolute'=固定 SUV 阈值；'relative'=相对 SUVmax 比例阈值。",
+    )
+    parser.add_argument("--threshold", type=float, default=2.5,
+                        help="[segment/threshold] 阈值数值。")
+    parser.add_argument("--model-folder", type=Path, default=DEFAULT_MODEL_FOLDER,
+                        help="[segment/nnunet] AutoPET nnU-Net 模型权重目录（含 fold_0..4）。")
+    parser.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4],
+                        help="[segment/nnunet] 使用的 fold 编号。")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
+                        help="[segment/nnunet] 推理设备。")
+    parser.add_argument("--num-proc", type=int, default=2,
+                        help="[segment/nnunet] nnU-Net 预处理/后处理并行进程数。")
 
-    parser.add_argument("--overwrite", action="store_true", help="已存在的输出也强制重新处理（适用于所有阶段）。")
-    parser.add_argument("--dry-run", action="store_true", help="只打印各阶段将要处理的对象，不实际执行。")
-    parser.add_argument("-v", "--verbose", action="store_true", help="输出 DEBUG 级别日志。")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="已存在的输出也强制重新处理（适用于所有阶段）。")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只打印各阶段将要处理的对象，不实际执行。")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="输出 DEBUG 级别日志。")
     return parser
 
 
@@ -108,7 +146,6 @@ def run_convert(args: argparse.Namespace) -> list[StageResult]:
     )
     sources = args.sources or [str(args.data_root / "raw" / "DICOM*")]
     conversion_results = converter.run(sources, dry_run=args.dry_run)
-    # 统一转换成 StageResult，方便与其他阶段合并打印/写日志。
     return [
         StageResult("convert", r.patient_id, r.study_date, r.status, r.output_dir, r.message)
         for r in conversion_results
@@ -124,13 +161,28 @@ def run_preprocess(args: argparse.Namespace) -> list[StageResult]:
     return preprocessor.run(dry_run=args.dry_run)
 
 
+def run_export(args: argparse.Namespace) -> list[StageResult]:
+    exporter = NnuNetExporter(
+        interim_root=args.data_root / "interim",
+        export_root=args.data_root / "nnunet_export",
+        overwrite=args.overwrite,
+    )
+    return exporter.run(dry_run=args.dry_run)
+
+
 def run_segment(args: argparse.Namespace) -> list[StageResult]:
     segmenter = LesionSegmenter(
         interim_root=args.data_root / "interim",
         processed_root=args.data_root / "processed",
+        export_root=args.data_root / "nnunet_export",
+        model_folder=args.model_folder,
         overwrite=args.overwrite,
+        method=args.segment_method,
         threshold_mode=args.threshold_mode,
         threshold=args.threshold,
+        folds=args.folds,
+        device=args.device,
+        num_proc=args.num_proc,
     )
     return segmenter.run(dry_run=args.dry_run)
 
@@ -140,17 +192,18 @@ def run_analyze(args: argparse.Namespace) -> list[StageResult]:
     分析阶段当前为占位：特征提取步骤（从 data/processed 的掩码/影像汇总出
     results/tables/features.csv）尚未实现，因此这里只是尝试调用绘图函数
     并把 NotImplementedError 记录为 warning，而不是让整个流程崩溃。
-    等特征提取脚本补齐后，把这里替换为真正的调用即可。
     """
     if args.dry_run:
-        logger.info("[DRY-RUN] analyze: 将读取 %s 并输出图表到 %s", args.results_root / "tables", args.results_root / "figures")
+        logger.info("[DRY-RUN] analyze: 将读取 %s 并输出图表到 %s",
+                    args.results_root / "tables", args.results_root / "figures")
         return []
     try:
         plot_results.plot_feature_distributions(
             args.results_root / "tables" / "features.csv",
             args.results_root / "figures" / "feature_distributions.png",
         )
-        return [StageResult("analyze", "-", "-", "ok", str(args.results_root / "figures"), "分析完成。")]
+        return [StageResult("analyze", "-", "-", "ok",
+                            str(args.results_root / "figures"), "分析完成。")]
     except NotImplementedError as exc:
         logger.warning("analyze 阶段尚未实现: %s", exc)
         return [StageResult("analyze", "-", "-", "warning", "", f"尚未实现: {exc}")]
@@ -159,6 +212,7 @@ def run_analyze(args: argparse.Namespace) -> list[StageResult]:
 STAGE_RUNNERS = {
     "convert": run_convert,
     "preprocess": run_preprocess,
+    "export": run_export,
     "segment": run_segment,
     "analyze": run_analyze,
 }
