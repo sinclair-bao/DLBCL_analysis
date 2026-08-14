@@ -16,7 +16,8 @@ AutoPET III 冠军模型病灶分割的全自动批处理管线。
    - [5.2 preprocess — CT/PET 重采样与对齐](#52-preprocess--ctpet-重采样与对齐)
    - [5.3 export — nnU-Net 推理格式导出](#53-export--nnu-net-推理格式导出)
    - [5.4 segment — 病灶分割](#54-segment--病灶分割)
-   - [5.5 analyze — 特征统计与绘图（占位）](#55-analyze--特征统计与绘图占位)
+   - [5.5 qc — 分割结果质控可视化](#55-qc--分割结果质控可视化)
+   - [5.6 analyze — 特征统计与绘图（占位）](#56-analyze--特征统计与绘图占位)
 6. [脚本功能一览](#6-脚本功能一览)
 7. [数据说明](#7-数据说明)
 8. [Git 远程仓库](#8-git-远程仓库)
@@ -49,6 +50,11 @@ data/processed/<PatientID>/<StudyDate>/masks/
     │  · {case}_lesion.nii.gz  —— AutoPET III nnU-Net 病灶掩码（uint8）
     │  · {case}.nii.gz          —— nnU-Net 原始多标签输出（可选保留）
     │  · {PET原名}_mask.nii.gz  —— SUV 阈值基线掩码（--method threshold 时）
+    │
+    ▼  [qc]  scripts/visualization/qc_segmentation.py
+data/qc/<PatientID>/<PatientID>_<StudyDate>_qc.png
+    │  · 2×3 面板（冠状面+矢状面 × PET MIP/Mask/Overlay）
+    │  · 放射学方向（患者右侧在图像左侧）
     │
     ▼  [analyze]  plot_results.py（待实现）
 results/tables/features.csv
@@ -89,11 +95,13 @@ DLBCL/
 │   │           └── PET/
 │   ├── nnunet_export/               # nnU-Net 推理输入（Git 忽略）
 │   │   └── {PatientID}_{Date}_0000/0001.nii.gz
-│   └── processed/                   # 最终病灶掩码（Git 忽略）
-│       └── <PatientID>/<StudyDate>/masks/
-│           ├── {case}_lesion.nii.gz     # nnU-Net 病灶掩码
-│           ├── {case}.nii.gz            # nnU-Net 原始输出
-│           └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
+│   ├── processed/                   # 最终病灶掩码（Git 忽略）
+│   │   └── <PatientID>/<StudyDate>/masks/
+│   │       ├── {case}_lesion.nii.gz     # nnU-Net 病灶掩码
+│   │       ├── {case}.nii.gz            # nnU-Net 原始输出
+│   │       └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
+│   └── qc/                          # 分割质控图（Git 忽略，本地生成）
+│       └── <PatientID>/<PatientID>_<StudyDate>_qc.png
 │
 ├── autoPET/                         # 第三方模型（Git 忽略）
 │   ├── autopet-3-submission-master/ # 模型代码（editable install 到 autopet 环境）
@@ -114,6 +122,8 @@ DLBCL/
 │   │   ├── export_nnunet.py         # 导出 nnU-Net 推理命名格式
 │   │   ├── infer_nnunet.py          # AutoPET nnU-Net 推理（GPU）
 │   │   └── segmentation.py          # 分割阶段统一入口（nnunet/threshold/both）
+│   ├── visualization/
+│   │   └── qc_segmentation.py       # 分割质控 MIP 图生成
 │   └── analysis/
 │       └── plot_results.py          # 特征绘图（占位，待实现）
 │
@@ -204,6 +214,9 @@ python main.py --stage segment --segment-method threshold
 
 # 4c. 两种方法并行（对比评估）
 $PYTHON main.py --stage segment --segment-method both
+
+# 5. 生成分割质控图（可选，data-analysis 环境）
+conda run -n data-analysis python scripts/visualization/qc_segmentation.py
 ```
 
 ### 调试单个病例
@@ -387,7 +400,45 @@ $PYTHON scripts/processing/segmentation.py --method both
 
 ---
 
-### 5.5 analyze — 特征统计与绘图（占位）
+### 5.5 qc — 分割结果质控可视化
+
+**脚本：** `scripts/visualization/qc_segmentation.py`
+
+**功能：** 为每个完成 nnU-Net 分割的病例生成全身 PET MIP 质控图，便于快速审查分割结果的合理性。
+
+**输出：** `data/qc/<PatientID>/<PatientID>_<StudyDate>_qc.png`
+
+每张图为 **2×3 面板**（约 1.2MB PNG，120 dpi）：
+
+|  | 列 1：PET MIP | 列 2：Lesion Mask MIP | 列 3：叠加图 |
+|--|---|---|---|
+| **行 1（冠状面）** | 临床伪彩 PET 全身 MIP（AP 方向投影） | 白色病灶轮廓 | 红色半透明病灶叠加在 PET MIP |
+| **行 2（矢状面）** | 同上（RL 方向投影） | 同上 | 同上 |
+
+- **显示方向**：放射学惯例，患者右侧在图像左侧，头在上
+- **SUV 显示范围**：0–6 SUVbw（可用 `--suv-max` 调整）
+- 顶部标注：患者 ID、检查日期、病灶体素数、SUV 原始最大值
+- **增量执行**：已有图跳过，`--overwrite` 强制重新生成
+
+```bash
+# data-analysis 环境运行
+# 生成全部病例
+conda run -n data-analysis python scripts/visualization/qc_segmentation.py
+
+# 指定病例（快速测试）
+conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
+    --patient-id 00136597 --study-date 20220425
+
+# 覆盖重新生成 + 自定义 SUV 上限
+conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
+    --overwrite --suv-max 8.0
+```
+
+> **注意：** `data/qc/` 已加入 `.gitignore`，QC 图不入版本库。
+
+---
+
+### 5.6 analyze — 特征统计与绘图（占位）
 
 **脚本：** `scripts/analysis/plot_results.py`
 
@@ -512,12 +563,36 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 ---
 
+### `scripts/visualization/qc_segmentation.py` — 分割质控可视化
+
+| 项目 | 说明 |
+|------|------|
+| 核心函数 | `make_qc_figure()` 生成单病例 2×3 面板 PNG |
+| 批量入口 | `run()` 扫描全部含 `_lesion.nii.gz` 的病例，增量生成 |
+| 输入 | preprocessed PET（`data/interim/.../preprocessed/PET/`）+ lesion mask |
+| 输出 | `data/qc/<PatientID>/<PatientID>_<StudyDate>_qc.png` |
+| 面板布局 | 2 行（冠状/矢状）× 3 列（PET MIP / Mask MIP / Overlay） |
+| 显示方向 | 放射学惯例：患者右→图像左，头朝上 |
+| 颜色方案 | 临床 PET 伪彩色（黑→紫→蓝→绿→黄→红→白），病灶红色半透明叠加 |
+| 主要参数 | `--suv-max`（显示上限，默认 6.0）/ `--overwrite` / `--patient-id` |
+
+---
+
 ## 7. 数据说明
 
 - 原始 DICOM 批次位于 `data/raw/`（`DICOM`、`DICOMDIS`–`DICOMDIY` 等）
-- 所有数据目录（`data/raw/`、`data/interim/`、`data/processed/`、`data/nnunet_export/`）均已加入 `.gitignore`，请勿强制添加上传
+- 所有数据目录（`data/raw/`、`data/interim/`、`data/processed/`、`data/nnunet_export/`、`data/qc/`）均已加入 `.gitignore`，请勿强制添加上传
 - `autoPET/` 第三方模型目录（~4GB）同样已被 `.gitignore` 忽略
 - 中间结果可安全删除后重新生成（所有阶段均为增量幂等）
+
+**本地数据集运行结果（截至 2026-08-14）：**
+
+| 阶段 | 结果 |
+|------|------|
+| preprocess | 318 studies 完成，CT/PET shape 全部对齐（2mm 各向同性） |
+| export | 310 cases 导出（8 studies 因缺 CT 或 PET 跳过） |
+| segment (nnunet) | 310/310 lesion mask 生成完毕，零失败 |
+| qc | 310 张质控 PNG 生成完毕（`data/qc/`） |
 
 ---
 
