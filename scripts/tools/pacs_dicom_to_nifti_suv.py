@@ -166,6 +166,7 @@ import dataclasses
 import datetime as dt
 import glob
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -255,8 +256,13 @@ def _looks_like_dicom(path: Path) -> bool:
 
 
 def _sanitize_path_component(value: str) -> str:
-    """把可能含有空格 / 特殊符号的 DICOM 字符串转成安全的路径片段。"""
+    """把可能含有空格 / 特殊符号的 DICOM 字符串转成安全的路径片段。
+
+    折叠连续下划线（dcm2niix 在写文件名时会将多个连续下划线压缩为一个，
+    此处保持一致以确保 glob 匹配成功）。
+    """
     cleaned = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in value.strip())
+    cleaned = re.sub(r"_{2,}", "_", cleaned)   # 折叠连续下划线
     return cleaned or "unknown"
 
 
