@@ -14,10 +14,12 @@ AutoPET III 冠军模型病灶分割的全自动批处理管线。
 5. [各阶段详细说明与注意要点](#5-各阶段详细说明与注意要点)
    - [5.1 convert — DICOM 转 NIfTI + SUV](#51-convert--dicom-转-nifti--suv)
    - [5.2 preprocess — CT/PET 重采样与对齐](#52-preprocess--ctpet-重采样与对齐)
-   - [5.3 export — nnU-Net 推理格式导出](#53-export--nnu-net-推理格式导出)
-   - [5.4 segment — 病灶分割](#54-segment--病灶分割)
-   - [5.5 qc — 分割结果质控可视化](#55-qc--分割结果质控可视化)
-   - [5.6 analyze — 特征统计与绘图（占位）](#56-analyze--特征统计与绘图占位)
+   - [5.3 register — PET→CT 刚体配准（ANTs）](#53-register--petct-刚体配准ants)
+   - [5.4 organ_seg — 器官分割（TotalSegmentator）](#54-organ_seg--器官分割totalsegmentator)
+   - [5.5 export — nnU-Net 推理格式导出](#55-export--nnu-net-推理格式导出)
+   - [5.6 segment — 病灶分割](#56-segment--病灶分割)
+   - [5.7 qc — 分割结果质控可视化](#57-qc--分割结果质控可视化)
+   - [5.8 analyze — 特征统计与绘图（占位）](#58-analyze--特征统计与绘图占位)
 6. [脚本功能一览](#6-脚本功能一览)
 7. [数据说明](#7-数据说明)
 8. [Git 远程仓库](#8-git-远程仓库)
@@ -38,6 +40,19 @@ data/interim/<PatientID>/<StudyDate>/{CT,PET}/*.nii.gz
 data/interim/…/preprocessed/{CT,PET}/*.nii.gz
     │  · CT：各向同性重采样（默认 2mm）
     │  · PET：对齐到 CT 网格（同 shape/affine，nnU-Net 双通道硬性要求）
+    │
+    ▼  [register]  register_pet_ct.py
+data/processed/<PatientID>/<StudyDate>/registration/
+    │  · pet_to_ct_0GenericAffine.mat  刚体变换矩阵（原始分辨率估计）
+    │  · pet_orig_warped.nii.gz         原始 SUV 配准到 CT 空间（质控用）
+    │  · pet_iso_aligned.nii.gz         2 mm SUV 配准后（影像组学工作图）
+    │  · ct_iso_reference.nii.gz        2 mm CT 副本（影像组学固定图像）
+    │
+    ▼  [organ_seg]  organ_extraction/organ_segmentation.py
+data/processed/<PatientID>/<StudyDate>/organs/organs.nii.gz
+    │  · 11 类器官掩码（0=BG, 1=脾, 2=肾, 3=肝, 4=膀胱, 5=肺,
+    │    6=脑, 7=心脏, 8=胃, 9=前列腺, 10=头颈腺体）
+    │  · 输入 CT 为 data/interim 原始分辨率（无需 preprocess）
     │
     ▼  [export]  export_nnunet.py
 data/nnunet_export/{PatientID}_{StudyDate}_0000.nii.gz   # CT
@@ -95,11 +110,20 @@ DLBCL/
 │   │           └── PET/
 │   ├── nnunet_export/               # nnU-Net 推理输入（Git 忽略）
 │   │   └── {PatientID}_{Date}_0000/0001.nii.gz
-│   ├── processed/                   # 最终病灶掩码（Git 忽略）
-│   │   └── <PatientID>/<StudyDate>/masks/
-│   │       ├── {case}_lesion.nii.gz     # nnU-Net 病灶掩码
-│   │       ├── {case}.nii.gz            # nnU-Net 原始输出
-│   │       └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
+│   ├── processed/                   # 各阶段输出结果（Git 忽略）
+│   │   └── <PatientID>/<StudyDate>/
+│   │       ├── registration/        # ANTs PET-CT 配准产物
+│   │       │   ├── pet_to_ct_0GenericAffine.mat   # 刚体变换矩阵
+│   │       │   ├── pet_to_ct_affine.txt            # 人可读变换参数
+│   │       │   ├── pet_orig_warped.nii.gz          # 原始空间 QC 图
+│   │       │   ├── pet_iso_aligned.nii.gz          # 2mm 对齐后 PET
+│   │       │   └── ct_iso_reference.nii.gz         # 2mm CT 参考图像
+│   │       ├── organs/              # TotalSegmentator 器官分割
+│   │       │   └── organs.nii.gz   # 11 类器官标签
+│   │       └── masks/               # 病灶分割掩码
+│   │           ├── {case}_lesion.nii.gz     # nnU-Net 二值病灶掩码
+│   │           ├── {case}.nii.gz            # nnU-Net 原始输出
+│   │           └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
 │   └── qc/                          # 分割质控图（Git 忽略，本地生成）
 │       └── <PatientID>/<PatientID>_<StudyDate>_qc.png
 │
@@ -119,6 +143,9 @@ DLBCL/
 │   │   └── dicom2suvmaps.py            # 早期原型（已被上者取代，保留备查）
 │   ├── processing/
 │   │   ├── preprocess.py            # CT/PET 重采样 + PET 对齐到 CT 网格
+│   │   ├── register_pet_ct.py       # ANTs PET→CT 刚体配准（原始+2mm 两步）
+│   │   ├── organ_extraction/
+│   │   │   └── organ_segmentation.py   # TotalSegmentator 11 类器官分割
 │   │   ├── export_nnunet.py         # 导出 nnU-Net 推理命名格式
 │   │   ├── infer_nnunet.py          # AutoPET nnU-Net 推理（GPU）
 │   │   └── segmentation.py          # 分割阶段统一入口（nnunet/threshold/both）
@@ -144,7 +171,7 @@ DLBCL/
 
 | 环境 | 用途 | 关键包 |
 |------|------|--------|
-| `data-analysis` | convert / preprocess / export / analyze | nibabel, SimpleITK, scipy, numpy, torch 2.13（可选） |
+| `data-analysis` | convert / preprocess / register / organ_seg / export / analyze | nibabel, SimpleITK, scipy, numpy, TotalSegmentator, ANTs（系统级） |
 | `autopet` | segment（nnU-Net GPU 推理） | torch 2.5.1+cu124, nnunetv2 2.5.1（editable）, nibabel, SimpleITK |
 
 ### 3.1 data-analysis 环境
@@ -155,6 +182,9 @@ conda activate data-analysis
 conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia -y
 pip install nibabel SimpleITK scipy scikit-image pandas matplotlib seaborn TotalSegmentator
 ```
+
+> **ANTs** 独立安装于 `/home/sun/ants-2.6.5/`，无需 conda 管理。
+> 运行 `register_pet_ct.py` 时脚本自动定位该路径，无需手动配置 PATH。
 
 ### 3.2 autopet 环境
 
@@ -177,74 +207,89 @@ print('autoPET3_Trainer OK')
 "
 ```
 
+### 3.3 TotalSegmentator 权重
+
+首次运行前需下载模型权重到 `~/.totalsegmentator/`（约 3GB）：
+
+```bash
+# 若网络不稳定，手动下载后解压
+totalseg_download_weights -t total
+totalseg_download_weights -t head_glands_cavities
+```
+
+解压目标目录结构：
+```
+~/.totalsegmentator/nnunet/results/
+    Dataset291_TotalSegmentator_part1_organs_1559subj/
+    Dataset292_TotalSegmentator_part2_vertebrae_1532subj/
+    ...
+    Dataset300_TotalSegmentator_head_glands_cavities_1.0/
+```
+
 ---
 
 ## 4. 完整流程使用方法
 
-### 一键运行全流程
-
-```bash
-# 需在 autopet 环境（包含 GPU nnU-Net 推理）
-/home/sun/miniconda3/envs/autopet/bin/python main.py --stage all \
-    --dcm2niix-bin /home/sun/fsl/bin/dcm2niix
-
-# 干跑，只查看计划不执行
-/home/sun/miniconda3/envs/autopet/bin/python main.py --stage all --dry-run -v
-```
-
 ### 分阶段运行
 
 ```bash
-PYTHON=/home/sun/miniconda3/envs/autopet/bin/python
+DA=/home/sun/miniconda3/envs/data-analysis/bin/python
+AP=/home/sun/miniconda3/envs/autopet/bin/python
 
-# 1. DICOM 转换
-$PYTHON main.py --stage convert --dcm2niix-bin /home/sun/fsl/bin/dcm2niix
+# 1. DICOM 转换（需指定 dcm2niix 路径）
+$DA scripts/tools/pacs_dicom_to_nifti_suv.py \
+    --source data/raw/DICOM \
+    --output-root data/interim \
+    --dcm2niix-bin /home/sun/fsl/bin/dcm2niix
 
 # 2. 预处理（CT 重采样 + PET 对齐）
-$PYTHON main.py --stage preprocess --voxel-size 2.0
+$DA scripts/processing/preprocess.py --voxel-size 2.0
 
-# 3. 导出 nnU-Net 格式
-$PYTHON main.py --stage export
+# 3. PET-CT 刚体配准（ANTs，data-analysis 环境）
+$DA scripts/processing/register_pet_ct.py          # 全部时间点
+$DA scripts/processing/register_pet_ct.py --first-study-only   # 仅每患者首次
 
-# 4. 分割（默认 nnU-Net，需 GPU）
-$PYTHON main.py --stage segment
+# 4. 器官分割（TotalSegmentator，data-analysis 环境，建议 nohup 后台运行）
+nohup $DA scripts/processing/organ_extraction/organ_segmentation.py \
+    --totalseg-device gpu \
+    > logs/organ_seg_run.log 2>&1 &
 
-# 4b. 仅 SUV 阈值基线（无需 GPU，任意环境可用）
-python main.py --stage segment --segment-method threshold
+# 5. 导出 nnU-Net 格式
+$AP scripts/processing/export_nnunet.py
 
-# 4c. 两种方法并行（对比评估）
-$PYTHON main.py --stage segment --segment-method both
+# 6. 病灶分割（AutoPET III nnU-Net，autopet 环境，需 GPU）
+$AP scripts/processing/segmentation.py --method nnunet
 
-# 5. 生成分割质控图（可选，data-analysis 环境）
-conda run -n data-analysis python scripts/visualization/qc_segmentation.py
+# 6b. 仅 SUV 阈值基线（无需 GPU）
+$DA scripts/processing/segmentation.py --method threshold
+
+# 7. 生成分割质控图（可选）
+$DA scripts/visualization/qc_segmentation.py
 ```
 
 ### 调试单个病例
 
 ```bash
-PYTHON=/home/sun/miniconda3/envs/autopet/bin/python
+DA=/home/sun/miniconda3/envs/data-analysis/bin/python
+AP=/home/sun/miniconda3/envs/autopet/bin/python
 
-# 对单个病例跑全部阶段
-$PYTHON scripts/processing/preprocess.py --patient-id 00857723 --study-date 20180905 -v
-$PYTHON scripts/processing/export_nnunet.py --patient-id 00857723 --study-date 20180905 -v
-$PYTHON scripts/processing/infer_nnunet.py --patient-id 00857723 --study-date 20180905 -v
-$PYTHON scripts/processing/segmentation.py --method nnunet --patient-id 00857723 -v
+$DA scripts/processing/preprocess.py     --patient-id 00857723 --study-date 20180905 -v
+$DA scripts/processing/register_pet_ct.py --patient-ids 00857723 -v
+$DA scripts/processing/organ_extraction/organ_segmentation.py \
+                                          --patient-id 00857723 --study-date 20180905 -v
+$AP scripts/processing/export_nnunet.py  --patient-id 00857723 --study-date 20180905 -v
+$AP scripts/processing/segmentation.py  --method nnunet --patient-id 00857723 -v
 ```
 
-### 常用参数
+### 常用参数（各脚本通用）
 
 | 参数 | 作用 | 默认值 |
 |------|------|--------|
-| `--stage` | 运行阶段（convert/preprocess/export/segment/analyze/all） | all |
-| `--voxel-size` | 预处理目标体素间距（mm） | 2.0 |
-| `--segment-method` | 分割方法（nnunet/threshold/both） | nnunet |
-| `--threshold-mode` | 阈值模式（absolute/relative） | absolute |
-| `--threshold` | 阈值数值（absolute: SUV g/mL；relative: 占 SUVmax 比例） | 2.5 |
-| `--folds` | nnU-Net 使用的 fold 编号，多个用空格分隔 | 0 1 2 3 4 |
-| `--device` | 推理设备（cuda/cpu） | cuda |
 | `--overwrite` | 强制重新处理已有输出 | False |
 | `--dry-run` | 只打印计划，不实际执行 | False |
 | `-v` / `--verbose` | 输出 DEBUG 日志 | False |
+| `--patient-id` | 只处理指定患者 | 全部 |
+| `--study-date` | 只处理指定日期（需同时指定患者） | 全部 |
 
 ---
 
@@ -310,7 +355,119 @@ python scripts/processing/preprocess.py --patient-id 00857723 --study-date 20180
 
 ---
 
-### 5.3 export — nnU-Net 推理格式导出
+### 5.3 register — PET→CT 刚体配准（ANTs）
+
+**脚本：** `scripts/processing/register_pet_ct.py`
+
+**背景：**
+PET/CT 同机采集但分段扫描，呼吸运动和胃肠道蠕动会造成 PET 与 CT 的空间不匹配，
+尤其在肺底、膈肌、腹部等区域较明显。纯仿射重采样（preprocess.py）只对齐几何网格，
+无法校正强度驱动的残余偏差。`register_pet_ct.py` 在原始分辨率图像上用 ANTs 求解
+刚体变换，再将变换复用到 2mm 各向同性图，最小化插值误差。
+
+**两步策略：**
+1. **原始分辨率配准**：原始 CT（~1.4mm×1.4mm×3.3mm）为 fixed，原始 SUVbw 为 moving，
+   ANTs Rigid + 互信息（MI）度量，得到 `.mat` 变换文件
+2. **变换应用**：将同一 `.mat` 应用到已重采样的 2mm SUVbw，以 2mm CT 为参考网格，
+   输出 `pet_iso_aligned.nii.gz`
+
+**输出结构：**
+```
+data/processed/<PatientID>/<StudyDate>/registration/
+    pet_to_ct_0GenericAffine.mat   ANTs 刚体变换（PET 空间 → CT 空间）
+    pet_to_ct_affine.txt           可读文本：平移量（mm）+ 旋转角（rad）
+    pet_orig_warped.nii.gz         原始 SUV 配准到原始 CT（质控，视觉检查偏差）
+    pet_iso_aligned.nii.gz         2mm SUV 已配准对齐（影像组学工作图像）
+    ct_iso_reference.nii.gz        2mm CT 副本（固定图像，与 pet_iso_aligned 一一对应）
+```
+
+**注意要点：**
+- 依赖 ANTs 二进制文件（`/home/sun/ants-2.6.5/bin/`），脚本自动定位，无需设置 PATH
+- 配准在**原始分辨率**（原始 CT 约 512×512×263，PET 约 192×192×263）上进行，
+  信息更丰富，变换估计更准确
+- 使用 `--float 1`（float32）以节省内存并避免极端值引起的数值不稳定
+- 子进程环境自动限制为单线程（`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1`），
+  防止与 NumPy/OpenMP 产生 SIGFPE 竞争崩溃
+- 若 ANTs 因信号终止（exit < 0），自动以保守 3 尺度参数重试一次
+- 每例配准耗时约 **5~6 分钟**（RTX 4090 服务器，CPU-only ANTs），建议 `nohup` 后台运行
+
+```bash
+# 全部患者，每人取最早一个 study
+nohup python scripts/processing/register_pet_ct.py --first-study-only \
+    > logs/register_run.log 2>&1 &
+
+# 全部患者全部时间点
+nohup python scripts/processing/register_pet_ct.py \
+    > logs/register_all.log 2>&1 &
+
+# 指定患者试跑（逗号分隔）
+python scripts/processing/register_pet_ct.py \
+    --patient-ids 00136597,00500538,00555598 --first-study-only -v
+
+# 干跑（只显示计划）
+python scripts/processing/register_pet_ct.py --dry-run -v
+```
+
+---
+
+### 5.4 organ_seg — 器官分割（TotalSegmentator）
+
+**脚本：** `scripts/processing/organ_extraction/organ_segmentation.py`
+
+**功能：**
+使用 [TotalSegmentator](https://github.com/wasserth/TotalSegmentator) 对原始分辨率 CT
+进行全身器官分割，将多个解剖结构合并为 **11 类统一标签**（与 AutoPET III 双头模型设计对齐），
+用于后续器官掩码分析及模型对齐验证。
+
+**标签定义（与 autoPET3 原始脚本一致）：**
+
+| 标签 | 器官 | TotalSeg 原始 ID |
+|------|------|-----------------|
+| 0 | Background | — |
+| 1 | Spleen（脾） | 1 |
+| 2 | Kidney（肾，左右合并） | 2, 3 |
+| 3 | Liver（肝） | 5 |
+| 4 | Urinary bladder（膀胱） | 21 |
+| 5 | Lung（肺，五叶合并） | 10–14 |
+| 6 | Brain（脑） | 90 |
+| 7 | Heart（心脏） | 51 |
+| 8 | Stomach（胃） | 6 |
+| 9 | Prostate（前列腺） | 22 |
+| 10 | Head/neck glands（头颈腺体，双侧腮腺+颌下腺） | 6–9（head_glands task） |
+
+**输出结构：**
+```
+data/processed/<PatientID>/<StudyDate>/organs/
+    organs.nii.gz    # 11 类器官标签（uint8），与原始 CT 同 affine
+```
+
+**注意要点：**
+- **输入为原始 CT**（`data/interim/.../CT/`），不依赖 preprocess 阶段
+- 每例运行两次 TotalSegmentator（`total` + `head_glands_cavities` 任务），
+  结果合并重映射为统一 11 类
+- 建议 `--totalseg-device gpu`（显著加速；无 GPU 时改为 `cpu`）
+- 首次运行需下载权重（见 [3.3 节](#33-totalsegmentator-权重)）；权重约 3GB
+- 中间文件存于临时目录，`--keep-staging` 可保留用于调试
+- 每例耗时约 **2~5 分钟**（GPU），202 患者全部时间点约需 **14~35 小时**
+
+```bash
+# 全量后台运行（推荐）
+nohup python scripts/processing/organ_extraction/organ_segmentation.py \
+    --totalseg-device gpu \
+    > logs/organ_seg_run.log 2>&1 &
+
+# 指定单例
+python scripts/processing/organ_extraction/organ_segmentation.py \
+    --patient-id 00136597 --study-date 20220425 --totalseg-device gpu -v
+
+# 强制重新分割
+python scripts/processing/organ_extraction/organ_segmentation.py \
+    --totalseg-device gpu --overwrite
+```
+
+---
+
+### 5.5 export — nnU-Net 推理格式导出
 
 **脚本：** `scripts/processing/export_nnunet.py`
 
@@ -336,7 +493,7 @@ python scripts/processing/export_nnunet.py --patient-id 00857723 --overwrite -v
 
 ---
 
-### 5.4 segment — 病灶分割
+### 5.6 segment — 病灶分割
 
 **脚本：** `scripts/processing/segmentation.py`（统一入口）  
 **底层脚本：** `scripts/processing/infer_nnunet.py`（nnU-Net 推理）
@@ -378,12 +535,6 @@ $PYTHON scripts/processing/segmentation.py --method nnunet --folds 0 -v
 
 无需 GPU，适合快速验证或无 GPU 场景。
 
-**输出：**
-```
-data/processed/<PatientID>/<StudyDate>/masks/
-    {PET原始名}_mask.nii.gz    # 二值掩码（uint8，1=病灶，0=背景）
-```
-
 **注意要点：**
 - `--threshold-mode absolute`（默认 2.5 g/mL）：PET 肿瘤学文献最常用固定阈值
 - `--threshold-mode relative`（建议 0.41）：41% SUVmax，适合摄取较低的病灶
@@ -400,7 +551,7 @@ $PYTHON scripts/processing/segmentation.py --method both
 
 ---
 
-### 5.5 qc — 分割结果质控可视化
+### 5.7 qc — 分割结果质控可视化
 
 **脚本：** `scripts/visualization/qc_segmentation.py`
 
@@ -421,7 +572,6 @@ $PYTHON scripts/processing/segmentation.py --method both
 - **增量执行**：已有图跳过，`--overwrite` 强制重新生成
 
 ```bash
-# data-analysis 环境运行
 # 生成全部病例
 conda run -n data-analysis python scripts/visualization/qc_segmentation.py
 
@@ -438,7 +588,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 ---
 
-### 5.6 analyze — 特征统计与绘图（占位）
+### 5.8 analyze — 特征统计与绘图（占位）
 
 **脚本：** `scripts/analysis/plot_results.py`
 
@@ -509,6 +659,34 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 | PET 插值 | 线性（order=1），避免 SUV 热点周围振铃 |
 | **关键：PET 对齐** | `resample_from_to(pet, ct_shape_affine)` 而非各自独立重采样 |
 | 筛选功能 | `--patient-id` / `--study-date` 参数可只处理指定病例 |
+
+---
+
+### `scripts/processing/register_pet_ct.py` — ANTs PET-CT 刚体配准
+
+| 项目 | 说明 |
+|------|------|
+| 核心类 | `PetCtRegistrar` |
+| 配准框架 | ANTs `antsRegistration`（`/home/sun/ants-2.6.5/bin/`） |
+| 变换类型 | 刚体（Rigid），MI 互信息度量，适合跨模态 PET/CT |
+| 两步策略 | 原始分辨率估计变换 → 变换应用到 2mm 图像，避免双重插值 |
+| 线程安全 | 子进程 env 设 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1`，防 SIGFPE |
+| 自动重试 | 信号终止（exit < 0）时自动切换保守 3 尺度参数重试一次 |
+| `--first-study-only` | 每患者仅处理最早的完整 study，用于基线分析 |
+| `--patient-ids` | 逗号分隔的患者 ID 白名单 |
+
+---
+
+### `scripts/processing/organ_extraction/organ_segmentation.py` — 器官分割
+
+| 项目 | 说明 |
+|------|------|
+| 工具 | TotalSegmentator（`total` + `head_glands_cavities` 两个 task） |
+| 输入 | 原始分辨率 CT（`data/interim/.../CT/`，无需 preprocess） |
+| 输出 | `organs.nii.gz`，11 类标签，与原始 CT 同 affine |
+| 标签设计 | 与 autoPET3 双头模型原始脚本完全对齐（包含前列腺） |
+| `--totalseg-device` | `gpu`（推荐）/ `cpu` |
+| `--keep-staging` | 保留 TotalSegmentator 中间结果（默认删除） |
 
 ---
 
@@ -585,14 +763,26 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 - `autoPET/` 第三方模型目录（~4GB）同样已被 `.gitignore` 忽略
 - 中间结果可安全删除后重新生成（所有阶段均为增量幂等）
 
-**本地数据集运行结果（截至 2026-08-14）：**
+**多时间点患者统计：**
 
-| 阶段 | 结果 |
+| 项目 | 数量 |
 |------|------|
-| preprocess | 318 studies 完成，CT/PET shape 全部对齐（2mm 各向同性） |
-| export | 310 cases 导出（8 studies 因缺 CT 或 PET 跳过） |
-| segment (nnunet) | 310/310 lesion mask 生成完毕，零失败 |
-| qc | 310 张质控 PNG 生成完毕（`data/qc/`） |
+| 患者总数 | 202 |
+| 具有多个时间点的患者 | 125 |
+| 总 study 数（所有时间点） | 422+ |
+| 每患者最多时间点数 | 8 |
+
+**本地数据集运行结果（截至 2026-08-17）：**
+
+| 阶段 | 结果 | 备注 |
+|------|------|------|
+| convert | 全部 DICOM 转换完成 | CT + PET _ACT / _SUVbw |
+| preprocess | 318 studies 完成 | CT/PET shape 全部对齐（2mm 各向同性） |
+| **register** | **7 / 202 完成（进行中）** | 每例约 5~6 min，预计 ~16 h 完成全量 |
+| **organ_seg** | **422 / 422+ 完成** | TotalSegmentator GPU，11 类器官 |
+| export | 310 cases 导出 | 8 studies 因缺 CT 或 PET 跳过 |
+| segment (nnunet) | 310 / 310 完成，零失败 | AutoPET III 5-fold 集成 |
+| qc | 310 张质控 PNG 完成 | `data/qc/` |
 
 ---
 
