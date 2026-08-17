@@ -17,3 +17,8 @@ dependencies:
   - pip
   - pip:
       - SimpleITK
+      - PySide6
+      - pyqtgraph
+      - versioneer
+      - pykwalify
+      - pyradiomics

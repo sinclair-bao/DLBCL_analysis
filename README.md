@@ -20,6 +20,7 @@ AutoPET III 冠军模型病灶分割的全自动批处理管线。
    - [5.6 segment — 病灶分割](#56-segment--病灶分割)
    - [5.7 qc — 分割结果质控可视化](#57-qc--分割结果质控可视化)
    - [5.8 analyze — 特征统计与绘图（占位）](#58-analyze--特征统计与绘图占位)
+   - [5.9 longitudinal — 纵向分析与桌面软件](#59-longitudinal--纵向分析与桌面软件)
 6. [脚本功能一览](#6-脚本功能一览)
 7. [数据说明](#7-数据说明)
 8. [Git 远程仓库](#8-git-远程仓库)
@@ -120,10 +121,16 @@ DLBCL/
 │   │       │   └── ct_iso_reference.nii.gz         # 2mm CT 参考图像
 │   │       ├── organs/              # TotalSegmentator 器官分割
 │   │       │   └── organs.nii.gz   # 11 类器官标签
-│   │       └── masks/               # 病灶分割掩码
-│   │           ├── {case}_lesion.nii.gz     # nnU-Net 二值病灶掩码
-│   │           ├── {case}.nii.gz            # nnU-Net 原始输出
-│   │           └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
+│   │       ├── masks/               # 病灶分割掩码
+│   │       │   ├── {case}_lesion.nii.gz     # nnU-Net 二值病灶掩码
+│   │       │   ├── {case}.nii.gz            # nnU-Net 原始输出
+│   │       │   └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
+│   │       └── longitudinal/        # 跨检查 CT–CT 映射（随访目录）
+│   │           ├── baseline_<BL>_to_this_0GenericAffine.mat
+│   │           └── baseline_lesion_warped.nii.gz
+│   │   └── <PatientID>/
+│   │       ├── longitudinal_session.json    # GUI 指定的 baseline/interim/end
+│   │       └── longitudinal_features.csv    # 该患者代谢 + 组学表
 │   └── qc/                          # 分割质控图（Git 忽略，本地生成）
 │       └── <PatientID>/<PatientID>_<StudyDate>_qc.png
 │
@@ -151,6 +158,13 @@ DLBCL/
 │   │   └── segmentation.py          # 分割阶段统一入口（nnunet/threshold/both）
 │   ├── visualization/
 │   │   └── qc_segmentation.py       # 分割质控 MIP 图生成
+│   ├── longitudinal/                # 跨时间点映射 + 代谢/组学
+│   │   ├── catalog.py
+│   │   ├── session.py
+│   │   ├── interscan_register.py
+│   │   └── features.py
+│   ├── gui/                         # PySide6 纵向浏览软件
+│   │   └── app.py                   # 入口：python scripts/gui/app.py
 │   └── analysis/
 │       └── plot_results.py          # 特征绘图（占位，待实现）
 │
@@ -171,7 +185,7 @@ DLBCL/
 
 | 环境 | 用途 | 关键包 |
 |------|------|--------|
-| `data-analysis` | convert / preprocess / register / organ_seg / export / analyze | nibabel, SimpleITK, scipy, numpy, TotalSegmentator, ANTs（系统级） |
+| `data-analysis` | convert / preprocess / register / organ_seg / longitudinal GUI / export / analyze | nibabel, SimpleITK, scipy, numpy, TotalSegmentator, ANTs, PySide6, pyqtgraph, pyradiomics |
 | `autopet` | segment（nnU-Net GPU 推理） | torch 2.5.1+cu124, nnunetv2 2.5.1（editable）, nibabel, SimpleITK |
 
 ### 3.1 data-analysis 环境
@@ -181,6 +195,10 @@ conda create -n data-analysis python=3.11 -y
 conda activate data-analysis
 conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia -y
 pip install nibabel SimpleITK scipy scikit-image pandas matplotlib seaborn TotalSegmentator
+pip install PySide6 pyqtgraph
+# pyradiomics 源码包需关闭 build isolation
+pip install versioneer pykwalify
+pip install --no-build-isolation pyradiomics
 ```
 
 > **ANTs** 独立安装于 `/home/sun/ants-2.6.5/`，无需 conda 管理。
@@ -265,6 +283,9 @@ $DA scripts/processing/segmentation.py --method threshold
 
 # 7. 生成分割质控图（可选）
 $DA scripts/visualization/qc_segmentation.py
+
+# 8. 纵向浏览软件（指定基线/中期/末期，映射病灶床，计算 SUVmax/MTV/TLG）
+$DA scripts/gui/app.py
 ```
 
 ### 调试单个病例
@@ -592,12 +613,64 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 **脚本：** `scripts/analysis/plot_results.py`
 
-**当前状态：** 占位实现，调用 `plot_feature_distributions()` 会抛出 `NotImplementedError`，主流程会记录 warning 而非报错，不影响前序阶段。
+**当前状态：** `main.py --stage analyze` 仍调用占位绘图。单患者代谢参数与组学已由 [5.9](#59-longitudinal--纵向分析与桌面软件) 的 `features.py` 写出。
 
-**待实现内容：**
-- 从 `data/processed/` 的病灶掩码 + 影像汇总出 PET/CT 定量特征（SUVmax、SUVmean、MTV、TLG 等）
-- 写出 `results/tables/features.csv`
-- 调用 `plot_feature_distributions()` 生成箱线图/小提琴图等
+---
+
+### 5.9 longitudinal — 纵向分析与桌面软件
+
+**后端：** `scripts/longitudinal/`  
+**GUI：** `scripts/gui/app.py`（PySide6）
+
+时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**（可只选 1–3 个），写入
+
+`data/processed/<PatientID>/longitudinal_session.json`
+
+**跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
+
+- fixed = 随访 2 mm CT，moving = 基线 2 mm CT
+- `antsApplyTransforms -n GenericLabel` 把基线 `*_lesion.nii.gz` 拉到随访网格
+- 输出在随访目录：
+
+```
+data/processed/<ID>/<FollowupDate>/longitudinal/
+    baseline_<BLDate>_to_this_0GenericAffine.mat
+    baseline_lesion_warped.nii.gz
+```
+
+**特征（每个已指定时间点）：**
+
+| ROI | 含义 |
+|-----|------|
+| `native_lesion` | 该次检查 nnU-Net 病灶（当时肿瘤负荷） |
+| `baseline_mapped` | 基线病灶床映射到该次检查（仅随访） |
+
+代谢：SUVmax、SUVmean、SUVpeak（1 cm³）、MTV、TLG；若有器官 mask 则附加肝/脾 SUVmean。组学：pyradiomics shape / firstorder / GLCM（PET binWidth 0.25 SUV，CT 25 HU）。
+
+写出 `data/processed/<ID>/longitudinal_features.csv`，批跑汇总 `results/tables/longitudinal_features.csv`。
+
+**GUI 布局：** 左患者树；中正交三视图（CT+PET 融合，红=本底 mask，青=映射 mask）+ 三时间点冠状 MIP；右时间点下拉框与特征表/折线。映射与组学在 `QThread` 中运行。
+
+同机 PET–CT 配准不在 GUI 内重算；缺 `pet_iso_aligned.nii.gz` 时特征回退到 preprocess PET。
+
+```bash
+# 桌面软件（需图形界面；SSH 时请开 X11/转发）
+conda activate data-analysis
+python scripts/gui/app.py
+
+# 仅 CLI：按会话 JSON 映射
+python scripts/longitudinal/interscan_register.py --patient-id 00136597
+
+# 指定一对日期
+python scripts/longitudinal/interscan_register.py \
+    --patient-id 00136597 --baseline 20220425 --followup 20220728
+
+# 提取特征
+python scripts/longitudinal/features.py --patient-id 00136597
+python scripts/longitudinal/features.py --no-radiomics   # 只要代谢参数
+```
+
+一期不做：SyN、跨时间点病灶 instance 匹配、GUI 内调用 nnU-Net、自动 Deauville 分期。
 
 ---
 
@@ -753,6 +826,30 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 | 显示方向 | 放射学惯例：患者右→图像左，头朝上 |
 | 颜色方案 | 临床 PET 伪彩色（黑→紫→蓝→绿→黄→红→白），病灶红色半透明叠加 |
 | 主要参数 | `--suv-max`（显示上限，默认 6.0）/ `--overwrite` / `--patient-id` |
+
+---
+
+### `scripts/longitudinal/` — 跨时间点映射与特征
+
+| 模块 | 说明 |
+|------|------|
+| `catalog.py` | 索引 2 mm CT/PET、同机配准、lesion/器官 mask |
+| `session.py` | `longitudinal_session.json`：baseline / interim / end |
+| `interscan_register.py` | 基线 CT → 随访 CT 刚体+仿射，GenericLabel 映射 mask |
+| `features.py` | SUVmax / SUVpeak / MTV / TLG + 肝脾参考 + pyradiomics |
+| `radiomics_params.yaml` | 组学：Original + shape/firstorder/GLCM |
+
+---
+
+### `scripts/gui/app.py` — 纵向浏览软件
+
+| 项目 | 说明 |
+|------|------|
+| 技术 | PySide6 + pyqtgraph + matplotlib |
+| 入口 | `python scripts/gui/app.py` |
+| 交互 | 选患者 → 指定时间点 → 计算映射 → 正交浏览 / MIP 演变 → 特征表 |
+| Overlay | 红 = 本底 nnU-Net mask；青 = 映射的基线病灶床 |
+| 导出 | 特征 CSV、MIP PNG、折线 PNG |
 
 ---
 

@@ -1,0 +1,17 @@
+# pyradiomics 参数：PET SUV 与 CT HU 分箱按 IBSI 常用默认。
+# 由 features.py 按模态覆盖 imageType / setting.binWidth。
+
+imageType:
+  Original: {}
+
+featureClass:
+  shape:
+  firstorder:
+  glcm:
+
+setting:
+  resampledPixelSpacing:
+  interpolator: sitkBSpline
+  normalize: false
+  geometryTolerance: 1e-4
+  additionalInfo: false
