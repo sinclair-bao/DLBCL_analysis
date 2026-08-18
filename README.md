@@ -1,7 +1,8 @@
 # DLBCL 影像分析项目
 
 弥漫大 B 细胞淋巴瘤（DLBCL）PET/CT 影像分析流程——从 PACS 原始 DICOM 到
-AutoPET III 冠军模型病灶分割的全自动批处理管线。
+AutoPET III 冠军模型病灶分割，再到纵向随访浏览（基线病灶床映射、SUVmax / MTV / TLG、
+影像组学）的批处理管线与桌面软件。
 
 ---
 
@@ -72,9 +73,15 @@ data/qc/<PatientID>/<PatientID>_<StudyDate>_qc.png
     │  · 2×3 面板（冠状面+矢状面 × PET MIP/Mask/Overlay）
     │  · 放射学方向（患者右侧在图像左侧）
     │
-    ▼  [analyze]  plot_results.py（待实现）
-results/tables/features.csv
-results/figures/
+    ▼  [longitudinal]  scripts/longitudinal/ + scripts/gui/app.py
+data/processed/<PatientID>/longitudinal_session.json
+data/processed/<PatientID>/<FollowupDate>/longitudinal/
+    │  · GUI 手动指定 baseline / interim / end
+    │  · CT→CT 刚体+仿射，把基线病灶床映射到随访网格
+    │  · native_lesion vs baseline_mapped：SUVmax / MTV / TLG + 组学
+    │
+    ▼  [analyze]  plot_results.py（队列分布图仍占位）
+results/tables/longitudinal_features.csv
 ```
 
 **模型信息（segment/nnunet）：**
@@ -159,14 +166,23 @@ DLBCL/
 │   ├── visualization/
 │   │   └── qc_segmentation.py       # 分割质控 MIP 图生成
 │   ├── longitudinal/                # 跨时间点映射 + 代谢/组学
-│   │   ├── catalog.py
-│   │   ├── session.py
-│   │   ├── interscan_register.py
-│   │   └── features.py
+│   │   ├── catalog.py               # 索引 2 mm CT/PET、mask、同机配准
+│   │   ├── session.py               # baseline/interim/end 会话 JSON
+│   │   ├── ants_runner.py           # ANTs 单线程子进程封装
+│   │   ├── interscan_register.py    # 基线 CT → 随访 CT 仿射 + mask 映射
+│   │   ├── features.py              # SUVmax/MTV/TLG + pyradiomics
+│   │   └── radiomics_params.yaml    # 组学：shape / firstorder / GLCM
 │   ├── gui/                         # PySide6 纵向浏览软件
-│   │   └── app.py                   # 入口：python scripts/gui/app.py
+│   │   ├── app.py                   # 入口：python scripts/gui/app.py
+│   │   ├── main_window.py           # 总布局、菜单导出
+│   │   ├── patient_browser.py       # 患者树与完整性状态灯
+│   │   ├── timepoint_panel.py       # 三个角色下拉框
+│   │   ├── ortho_viewer.py          # 轴/冠/矢 CT+PET 融合
+│   │   ├── evolution_strip.py       # 三时间点冠状 MIP
+│   │   ├── feature_panel.py         # 特征表与折线
+│   │   └── workers.py               # QThread：映射 / 组学
 │   └── analysis/
-│       └── plot_results.py          # 特征绘图（占位，待实现）
+│       └── plot_results.py          # 队列特征分布图（占位）
 │
 ├── results/
 │   ├── figures/                     # 论文用图（Git 忽略大文件）
@@ -300,6 +316,11 @@ $DA scripts/processing/organ_extraction/organ_segmentation.py \
                                           --patient-id 00857723 --study-date 20180905 -v
 $AP scripts/processing/export_nnunet.py  --patient-id 00857723 --study-date 20180905 -v
 $AP scripts/processing/segmentation.py  --method nnunet --patient-id 00857723 -v
+
+# 纵向：指定一对日期做基线病灶床映射，再提取代谢参数
+$DA scripts/longitudinal/interscan_register.py \
+    --patient-id 00136597 --baseline 20220425 --followup 20220728 -v
+$DA scripts/longitudinal/features.py --patient-id 00136597 --no-radiomics
 ```
 
 ### 常用参数（各脚本通用）
@@ -620,45 +641,77 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 ### 5.9 longitudinal — 纵向分析与桌面软件
 
 **后端：** `scripts/longitudinal/`  
-**GUI：** `scripts/gui/app.py`（PySide6）
+**GUI：** `scripts/gui/app.py`（PySide6 + pyqtgraph）  
+**环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）
 
 时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**（可只选 1–3 个），写入
 
 `data/processed/<PatientID>/longitudinal_session.json`
 
+映射与演变至少需要 **baseline + 一个随访**。三个角色不能指向同一检查日期。
+
 **跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
 
-- fixed = 随访 2 mm CT，moving = 基线 2 mm CT
+DLBCL 病灶会消退或进展，强变形容易把病灶床拉碎，因此只用刚体+仿射把基线解剖位置对到随访 CT。
+
+- 工作网格：2 mm 各向同性 CT（`ct_iso_reference.nii.gz` 优先，否则 `preprocessed/CT`）
+- fixed = 随访 CT，moving = 基线 CT；`Rigid[0.1]` 再 `Affine[0.1]`，度量 MI
 - `antsApplyTransforms -n GenericLabel` 把基线 `*_lesion.nii.gz` 拉到随访网格
-- 输出在随访目录：
+- ANTs 子进程单线程（`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1`），信号崩溃时自动降尺度重试
 
 ```
 data/processed/<ID>/<FollowupDate>/longitudinal/
     baseline_<BLDate>_to_this_0GenericAffine.mat
-    baseline_lesion_warped.nii.gz
+    baseline_<BLDate>_to_this_affine.txt
+    baseline_ct_warped.nii.gz          # 基线 CT 变到随访空间（质控）
+    baseline_lesion_warped.nii.gz      # 映射后的基线病灶床
 ```
 
-**特征（每个已指定时间点）：**
+**特征（每个已指定时间点、每种 ROI）：**
 
 | ROI | 含义 |
 |-----|------|
 | `native_lesion` | 该次检查 nnU-Net 病灶（当时肿瘤负荷） |
-| `baseline_mapped` | 基线病灶床映射到该次检查（仅随访） |
+| `baseline_mapped` | 基线病灶床映射到该次检查（仅随访；用于看原病灶床内残留摄取） |
 
-代谢：SUVmax、SUVmean、SUVpeak（1 cm³）、MTV、TLG；若有器官 mask 则附加肝/脾 SUVmean。组学：pyradiomics shape / firstorder / GLCM（PET binWidth 0.25 SUV，CT 25 HU）。
+| 参数 | 说明 |
+|------|------|
+| SUVmax / SUVmean | ROI 内最大 / 平均 SUVbw |
+| SUVpeak | 以 SUVmax 体素为球心的 1 cm³ 球均值 |
+| MTV / TLG | 体积 (mL)；TLG = SUVmean × MTV |
+| 肝 / 脾 SUVmean | 器官 mask 重采样到 PET 网格后的参考摄取 |
+| 组学 | pyradiomics Original：shape + firstorder + GLCM（PET binWidth 0.25 SUV，CT 25 HU） |
 
-写出 `data/processed/<ID>/longitudinal_features.csv`，批跑汇总 `results/tables/longitudinal_features.csv`。
+写出 `data/processed/<ID>/longitudinal_features.csv`；批跑汇总 `results/tables/longitudinal_features.csv`。未安装 pyradiomics 或加 `--no-radiomics` 时只写代谢参数。
 
-**GUI 布局：** 左患者树；中正交三视图（CT+PET 融合，红=本底 mask，青=映射 mask）+ 三时间点冠状 MIP；右时间点下拉框与特征表/折线。映射与组学在 `QThread` 中运行。
+**GUI 布局与交互：**
 
-同机 PET–CT 配准不在 GUI 内重算；缺 `pet_iso_aligned.nii.gz` 时特征回退到 preprocess PET。
+```
+┌────────────┬──────────────────────────────┬─────────────────┐
+│ 患者列表    │ 当前检查 轴/冠/矢 三视图       │ 时间点指定       │
+│ 绿/黄/红灯  │ CT 灰阶 + PET 伪彩 + mask     │ Baseline/Interim│
+│            │ 层厚滑条、融合透明度、SUV 上限  │ /End 下拉框      │
+├────────────┼──────────────────────────────┼─────────────────┤
+│            │ 最多三列冠状 MIP 演变条         │ 特征表 + 折线    │
+│            │ 本底 mask / 映射 mask 开关     │ SUVmax/MTV/TLG  │
+└────────────┴──────────────────────────────┴─────────────────┘
+```
+
+| Overlay | 颜色 | 含义 |
+|---------|------|------|
+| 本底 mask | 红 | 当前检查 nnU-Net 分割 |
+| 映射 mask | 青 | 基线病灶床 warp 到当前检查 |
+
+二者并存才能对比「旧病灶消退 vs 新病灶出现」。映射与组学在 `QThread` 中运行，不卡住界面。菜单可导出特征 CSV、MIP PNG、折线 PNG。
+
+同机 PET–CT 配准不在 GUI 内重算；缺 `pet_iso_aligned.nii.gz` 时 PET 回退到 `preprocessed/PET`。患者树状态灯：绿 = CT+PET+lesion 齐全，黄 = 缺 mask 或同机配准，红 = 缺 CT 或 PET。
 
 ```bash
-# 桌面软件（需图形界面；SSH 时请开 X11/转发）
+# 桌面软件（需图形界面；SSH 时请开 X11 转发）
 conda activate data-analysis
 python scripts/gui/app.py
 
-# 仅 CLI：按会话 JSON 映射
+# 仅 CLI：按会话 JSON 映射该患者全部随访
 python scripts/longitudinal/interscan_register.py --patient-id 00136597
 
 # 指定一对日期
@@ -670,7 +723,7 @@ python scripts/longitudinal/features.py --patient-id 00136597
 python scripts/longitudinal/features.py --no-radiomics   # 只要代谢参数
 ```
 
-一期不做：SyN、跨时间点病灶 instance 匹配、GUI 内调用 nnU-Net、自动 Deauville 分期。
+一期不做：SyN 变形、跨时间点病灶 instance 匹配、GUI 内调用 nnU-Net / TotalSegmentator、自动 Deauville / Lugano 分期。
 
 ---
 
@@ -809,8 +862,9 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 ### `scripts/analysis/plot_results.py` — 特征绘图（占位）
 
-`plot_feature_distributions(table_csv, figure_out)` 当前抛出 `NotImplementedError`，
-待特征提取脚本实现后替换为真实逻辑。
+`plot_feature_distributions(table_csv, figure_out)` 当前仍抛出 `NotImplementedError`。
+单患者代谢/组学表已由 `scripts/longitudinal/features.py` 写出；队列分布图可后续改为读取
+`results/tables/longitudinal_features.csv`。
 
 ---
 
@@ -833,8 +887,9 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 | 模块 | 说明 |
 |------|------|
-| `catalog.py` | 索引 2 mm CT/PET、同机配准、lesion/器官 mask |
+| `catalog.py` | 索引 2 mm CT/PET、同机配准、lesion/器官 mask；缺文件用状态灯表示 |
 | `session.py` | `longitudinal_session.json`：baseline / interim / end |
+| `ants_runner.py` | ANTs 单线程 env + 负退出码检测，供跨检查配准复用 |
 | `interscan_register.py` | 基线 CT → 随访 CT 刚体+仿射，GenericLabel 映射 mask |
 | `features.py` | SUVmax / SUVpeak / MTV / TLG + 肝脾参考 + pyradiomics |
 | `radiomics_params.yaml` | 组学：Original + shape/firstorder/GLCM |
@@ -845,10 +900,11 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 | 项目 | 说明 |
 |------|------|
-| 技术 | PySide6 + pyqtgraph + matplotlib |
+| 技术 | PySide6 + pyqtgraph（切片）+ matplotlib（MIP / 折线） |
 | 入口 | `python scripts/gui/app.py` |
 | 交互 | 选患者 → 指定时间点 → 计算映射 → 正交浏览 / MIP 演变 → 特征表 |
 | Overlay | 红 = 本底 nnU-Net mask；青 = 映射的基线病灶床 |
+| 后台线程 | `MappingWorker` / `FeatureWorker`，避免 ANTs 与组学卡住 UI |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |
 
 ---
@@ -866,20 +922,21 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 |------|------|
 | 患者总数 | 202 |
 | 具有多个时间点的患者 | 125 |
-| 总 study 数（所有时间点） | 422+ |
+| 总 study 数（所有时间点） | 427 |
 | 每患者最多时间点数 | 8 |
 
-**本地数据集运行结果（截至 2026-08-17）：**
+**本地数据集运行结果（截至 2026-08-18）：**
 
 | 阶段 | 结果 | 备注 |
 |------|------|------|
-| convert | 全部 DICOM 转换完成 | CT + PET _ACT / _SUVbw |
-| preprocess | 318 studies 完成 | CT/PET shape 全部对齐（2mm 各向同性） |
-| **register** | **7 / 202 完成（进行中）** | 每例约 5~6 min，预计 ~16 h 完成全量 |
-| **organ_seg** | **422 / 422+ 完成** | TotalSegmentator GPU，11 类器官 |
-| export | 310 cases 导出 | 8 studies 因缺 CT 或 PET 跳过 |
-| segment (nnunet) | 310 / 310 完成，零失败 | AutoPET III 5-fold 集成 |
-| qc | 310 张质控 PNG 完成 | `data/qc/` |
+| convert | 全部 DICOM 转换完成 | CT + PET `_ACT` / `_SUVbw` |
+| preprocess | 427 studies 已发现 | 工作网格 2 mm 各向同性 |
+| register（同机 PET→CT） | 199 / 427 `.mat` | 缺文件的 study 会跳过 |
+| organ_seg | 422 `organs.nii.gz` | TotalSegmentator，11 类 |
+| export | 419 pairs | 缺 CT 或 PET 的 study 跳过 |
+| segment (nnunet) | 419 / 419 lesion mask | AutoPET III 5-fold 集成 |
+| qc | 419 张质控 PNG | `data/qc/` |
+| longitudinal | GUI / CLI 已就绪 | 跨检查映射按患者在界面中触发 |
 
 ---
 
