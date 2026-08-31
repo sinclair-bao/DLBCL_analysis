@@ -46,7 +46,7 @@ class EditPanel(QWidget):
         seg_l.addWidget(self.btn_threshold)
         seg_l.addWidget(self.btn_manual)
         seg_l.addWidget(self.btn_other)
-        self.lbl_seg = QLabel("四种入口都会打开 3×3 编辑窗（CT/PET/融合 × 轴/冠/矢）。")
+        self.lbl_seg = QLabel("四种入口打开 CT/PET/融合编辑窗；点选轴位/冠状/矢状切换平面。")
         self.lbl_seg.setWordWrap(True)
         seg_l.addWidget(self.lbl_seg)
         seg_box.setLayout(seg_l)

@@ -95,8 +95,12 @@ class _RgbView(pg.GraphicsLayoutWidget):
         self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
 
     def set_crosshair(self, col: float, row: float) -> None:
-        self.vline.setPos(col)
-        self.hline.setPos(row)
+        pos = (float(col), float(row))
+        if getattr(self, "_xh", None) == pos:
+            return
+        self._xh = pos
+        self.vline.setPos(pos[0])
+        self.hline.setPos(pos[1])
 
     def set_crosshair_visible(self, on: bool) -> None:
         self.vline.setVisible(on)
@@ -104,7 +108,12 @@ class _RgbView(pg.GraphicsLayoutWidget):
 
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
-        self.item.setImage(img, autoLevels=False)
+        cur = self.item.image
+        if cur is not None and cur.shape == img.shape and cur.dtype == img.dtype:
+            np.copyto(cur, img)
+            self.item.updateImage()
+        else:
+            self.item.setImage(img, autoLevels=False)
 
     def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
@@ -122,6 +131,7 @@ class _RgbView(pg.GraphicsLayoutWidget):
 
 class OrthoViewer(QWidget):
     mask_changed = Signal()
+    role_requested = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -161,6 +171,20 @@ class OrthoViewer(QWidget):
         for r in (self.radio_fusion, self.radio_ct, self.radio_pet):
             self._mode_group.addButton(r)
             r.toggled.connect(self.refresh)
+
+        self.radio_bl = QRadioButton("基线")
+        self.radio_in = QRadioButton("中期")
+        self.radio_end = QRadioButton("末期")
+        self._role_group = QButtonGroup(self)
+        self._role_group.setExclusive(True)
+        for r, role in (
+            (self.radio_bl, "baseline"),
+            (self.radio_in, "interim"),
+            (self.radio_end, "end"),
+        ):
+            self._role_group.addButton(r)
+            r.setEnabled(False)
+            r.toggled.connect(lambda on, role=role: on and self.role_requested.emit(role))
 
         self.chk_native = QCheckBox("本底 mask")
         self.chk_mapped = QCheckBox("映射 mask")
@@ -236,6 +260,10 @@ class OrthoViewer(QWidget):
         slice_row.addWidget(self.radio_fusion)
         slice_row.addWidget(self.radio_ct)
         slice_row.addWidget(self.radio_pet)
+        slice_row.addWidget(QLabel("查看"))
+        slice_row.addWidget(self.radio_bl)
+        slice_row.addWidget(self.radio_in)
+        slice_row.addWidget(self.radio_end)
 
         tools = QGridLayout()
         tools.setContentsMargins(0, 0, 0, 0)
@@ -275,6 +303,18 @@ class OrthoViewer(QWidget):
         layout.addLayout(views, 1)
         layout.addLayout(slice_row)
         layout.addLayout(tools)
+
+    def set_role_buttons(self, available: dict[str, bool], current: str | None) -> None:
+        mapping = {
+            "baseline": self.radio_bl,
+            "interim": self.radio_in,
+            "end": self.radio_end,
+        }
+        for role, btn in mapping.items():
+            btn.blockSignals(True)
+            btn.setEnabled(bool(available.get(role)))
+            btn.setChecked(role == current and bool(available.get(role)))
+            btn.blockSignals(False)
 
     def display_mode(self) -> str:
         if self.radio_ct.isChecked():

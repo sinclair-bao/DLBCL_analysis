@@ -147,6 +147,7 @@ class MainWindow(QMainWindow):
         self.ortho.chk_native.toggled.connect(self._refresh_evolution)
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
         self.ortho.mask_changed.connect(self._refresh_lesion_table)
+        self.ortho.role_requested.connect(self._on_role_view)
         self.edit_panel.segment_requested.connect(self._on_segment)
         self.edit_panel.morph_requested.connect(self._on_morph)
         self.edit_panel.relabel_requested.connect(self._on_relabel)
@@ -308,8 +309,10 @@ class MainWindow(QMainWindow):
             vol.role = role
         self.ortho.set_volumes(vol)
         self._refresh_lesion_table()
+        self._sync_role_buttons()
         if self.act_auto_hide.isChecked():
             self._set_browser_visible(False)
+        self._refresh_evolution()
         assets = self.catalog.get_study(patient_id, study_date)
         if assets is not None and assets.working_lesion is None:
             self.status.showMessage(
@@ -350,7 +353,36 @@ class MainWindow(QMainWindow):
             suv_max=float(self.ortho.spin_suv.value()),
             show_native=self.ortho.chk_native.isChecked(),
             show_mapped=self.ortho.chk_mapped.isChecked(),
+            highlight_role=session.role_of(self.current_date) if self.current_date else None,
         )
+
+    def _sync_role_buttons(self) -> None:
+        session = self._session()
+        if session is None and self.current_patient:
+            session = load_session(self.catalog.processed_root, self.current_patient)
+        if session is None:
+            self.ortho.set_role_buttons(
+                {"baseline": False, "interim": False, "end": False}, None
+            )
+            return
+        current = session.role_of(self.current_date) if self.current_date else None
+        self.ortho.set_role_buttons(
+            {
+                "baseline": bool(session.baseline),
+                "interim": bool(session.interim),
+                "end": bool(session.end),
+            },
+            current,
+        )
+
+    def _on_role_view(self, role: str) -> None:
+        if not self.current_patient:
+            return
+        session = self._session() or load_session(self.catalog.processed_root, self.current_patient)
+        date = getattr(session, role, None)
+        if not date:
+            return
+        self._on_study(self.current_patient, date)
 
     def _run_mapping(self) -> None:
         if not self.current_patient:
@@ -567,7 +599,7 @@ class MainWindow(QMainWindow):
             self,
             "关于",
             "DLBCL 纵向 PET/CT 分析软件\n"
-            "四种分割入口打开 3×3 编辑窗（CT/PET/融合 × 轴/冠/矢），一格绘制同步全部。\n"
+            "四种分割入口打开 CT/PET/融合三格编辑窗，点选轴/冠/矢平面。\n"
             "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
             "显示：仅 CT / 仅 PET（灰度）/ PET-CT；十字线与患者列表可隐藏（F2）。\n"
             "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"

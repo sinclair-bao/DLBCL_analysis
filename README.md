@@ -178,7 +178,7 @@ DLBCL/
 │   │   ├── patient_browser.py       # 患者树与完整性状态灯
 │   │   ├── timepoint_panel.py       # 三个角色下拉框 + 映射按钮
 │   │   ├── edit_panel.py            # AutoPET / 阈值 / 空白 / 载入 mask
-│   │   ├── segment_editor.py        # 3×3 CT/PET/融合 × 轴/冠/矢 编辑弹窗
+│   │   ├── segment_editor.py        # CT/PET/融合三格；轴冠矢点选平面
 │   │   ├── mask_ops.py              # 连通域编号、二维画笔、膨胀腐蚀
 │   │   ├── display_utils.py         # CT/PET/融合、窗宽窗位、显示坐标
 │   │   ├── volume_io.py             # 读入编号 mask；另存 lesion_edited
@@ -659,7 +659,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 - 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
 - 无 mask 时：右侧 **AutoPET 分割**、**SUV 阈值分割**、**空白手动分割**，或 **其他（载入已有 mask）**
-- 四种入口都会打开 **3×3 编辑窗**（行：CT / PET / 融合；列：轴 / 冠 / 矢）。任一格左涂右擦，mask 实时同步到其余格
+- 四种入口都会打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
 - **保存并关闭** 写入 sidecar `{ID}_{Date}_lesion_edited.nii.gz`；取消不改主窗口
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，作用于当前层或三维、当前灶或全部
 - 连通域自动编号，列表显示体素 / 体积 / SUVmax；可按体积重新编号
@@ -667,7 +667,9 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **显示：**
 
 - 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 为 **灰度**（按 SUV 窗），mask 仍为红/黄/青
-- CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（可关）
+- 主界面可点选 **查看基线 / 中期 / 末期**（需先在右侧指定角色）
+- CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（刷新不带动画面跳动）
+- 冠状 MIP **等比例**显示，三列统一缩放，不横向拉扁
 - 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动
 - **患者列表**：F2 或工具栏「患者」手动显隐；默认在选中一次检查后自动隐藏
 
@@ -923,12 +925,12 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 | 项目 | 说明 |
 |------|------|
-| 技术 | PySide6 + pyqtgraph（切片）+ matplotlib（MIP / 折线） |
+| 技术 | PySide6 + pyqtgraph（切片 / MIP）+ matplotlib（折线） |
 | 入口 | `python scripts/gui/app.py` |
 | 交互 | 选患者 → 指定时间点 → 分割/微调 → 映射到随访 → MIP 与特征表 |
 | Overlay | 红 = 本底 mask；黄 = 当前灶；青 = 映射的基线病灶床 |
-| 分割 | AutoPET / SUV 阈值 / 空白 / 载入已有 mask；3×3 弹窗画笔同步；另存 edited |
-| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；十字线；窗宽窗位、SUV 窗、缩放；窗口按屏适配 |
+| 分割 | AutoPET / SUV 阈值 / 空白 / 载入 mask；CT/PET/融合三格弹窗；平面点选轴冠矢 |
+| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；查看基线/中期/末期；十字线不跳动；MIP 等比例 |
 | 患者栏 | F2 /「患者」按钮显隐；选中检查后可自动隐藏 |
 | 后台线程 | `MappingWorker` / `FeatureWorker` / `SegmentWorker` |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |

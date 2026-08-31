@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""3×3 分割编辑弹窗：行=CT/PET/融合，列=轴/冠/矢；一格绘制同步全部。"""
+"""分割编辑弹窗：CT / PET / 融合三格；轴/冠/矢由用户点选。"""
 
 from __future__ import annotations
 
@@ -9,16 +9,17 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
+    QRadioButton,
     QSlider,
     QSpinBox,
     QTableWidget,
@@ -48,7 +49,6 @@ from ortho_viewer import _RgbView
 from volume_io import VolumeSet
 
 _MODES = ("ct", "pet", "fusion")
-_PLANES = ("axial", "coronal", "sagittal")
 _MODE_LABEL = {"ct": "CT", "pet": "PET", "fusion": "融合"}
 _PLANE_LABEL = {"axial": "轴位", "coronal": "冠状", "sagittal": "矢状"}
 _SLICE_FN = {"axial": slice_axial, "coronal": slice_coronal, "sagittal": slice_sagittal}
@@ -59,7 +59,6 @@ class SegmentEditorDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"分割编辑  {vol.patient_id}  {vol.study_date}")
         self.setModal(True)
-        self._source = vol
         self._vol = VolumeSet(
             ct=vol.ct,
             pet=vol.pet,
@@ -75,32 +74,31 @@ class SegmentEditorDialog(QDialog):
         self.current_label = 1
         self.highlight_label = 0
         self.brush_radius = 5
+        self.plane = "axial"
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(2)
-        grid.setVerticalSpacing(2)
-        self._cells: dict[tuple[str, str], _RgbView] = {}
-        for r, mode in enumerate(_MODES):
-            grid.addWidget(QLabel(_MODE_LABEL[mode]), r + 1, 0)
-            for c, plane in enumerate(_PLANES):
-                if r == 0:
-                    grid.addWidget(QLabel(_PLANE_LABEL[plane]), 0, c + 1, alignment=Qt.AlignmentFlag.AlignCenter)
-                view = _RgbView(f"{_MODE_LABEL[mode]} {_PLANE_LABEL[plane]}", plane)
-                view.setMinimumHeight(90)
-                view.item.edit_mode = True
-                view.item.clicked_xy.connect(
-                    lambda x, y, p=plane: self._click(p, x, y)
-                )
-                view.item.paint_at.connect(
-                    lambda x, y, er, p=plane: self._paint(p, x, y, er)
-                )
-                view.item.stroke_finished.connect(self._end_stroke)
-                self._cells[(mode, plane)] = view
-                grid.addWidget(view, r + 1, c + 1)
+        views_row = QHBoxLayout()
+        self._cells: dict[str, _RgbView] = {}
+        for mode in _MODES:
+            view = _RgbView(_MODE_LABEL[mode], "axial")
+            view.setMinimumHeight(160)
+            view.item.edit_mode = True
+            view.item.clicked_xy.connect(lambda x, y: self._click(x, y))
+            view.item.paint_at.connect(lambda x, y, er: self._paint(x, y, er))
+            view.item.stroke_finished.connect(self._end_stroke)
+            self._cells[mode] = view
+            views_row.addWidget(view, 1)
+
+        self.radio_ax = QRadioButton("轴位")
+        self.radio_co = QRadioButton("冠状")
+        self.radio_sa = QRadioButton("矢状")
+        self.radio_ax.setChecked(True)
+        self._plane_group = QButtonGroup(self)
+        for r, plane in ((self.radio_ax, "axial"), (self.radio_co, "coronal"), (self.radio_sa, "sagittal")):
+            self._plane_group.addButton(r)
+            r.toggled.connect(lambda on, p=plane: on and self._set_plane(p))
 
         self.slider_k = QSlider(Qt.Orientation.Horizontal)
         self.slider_j = QSlider(Qt.Orientation.Horizontal)
@@ -116,7 +114,7 @@ class SegmentEditorDialog(QDialog):
 
         self.chk_crosshair = QCheckBox("十字线")
         self.chk_crosshair.setChecked(True)
-        self.chk_crosshair.toggled.connect(self.refresh)
+        self.chk_crosshair.toggled.connect(lambda _: self.refresh(False))
         self.spin_brush = QSpinBox()
         self.spin_brush.setRange(3, 15)
         self.spin_brush.setValue(5)
@@ -138,14 +136,23 @@ class SegmentEditorDialog(QDialog):
         self.spin_alpha.setSingleStep(0.05)
         self.spin_alpha.setValue(0.55)
         for w in (self.spin_wl, self.spin_ww, self.spin_suv_min, self.spin_suv_max, self.spin_alpha):
-            w.valueChanged.connect(self.refresh)
+            w.valueChanged.connect(lambda _: self.refresh(False))
 
         self.lbl_pos = QLabel("—")
 
+        plane_row = QHBoxLayout()
+        plane_row.addWidget(QLabel("平面"))
+        plane_row.addWidget(self.radio_ax)
+        plane_row.addWidget(self.radio_co)
+        plane_row.addWidget(self.radio_sa)
+        plane_row.addWidget(QLabel("轴位"))
+        plane_row.addWidget(self.slider_k, 1)
+        plane_row.addWidget(QLabel("冠状"))
+        plane_row.addWidget(self.slider_j, 1)
+        plane_row.addWidget(QLabel("矢状"))
+        plane_row.addWidget(self.slider_i, 1)
+
         ctrl = QHBoxLayout()
-        for label, sl in (("轴位", self.slider_k), ("冠状", self.slider_j), ("矢状", self.slider_i)):
-            ctrl.addWidget(QLabel(label))
-            ctrl.addWidget(sl, 1)
         ctrl.addWidget(self.chk_crosshair)
         ctrl.addWidget(QLabel("笔刷"))
         ctrl.addWidget(self.spin_brush)
@@ -201,11 +208,12 @@ class SegmentEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        hint = QLabel("左键涂抹、右键擦除；在任一格绘制，CT / PET / 融合与三平面叠加同时更新。")
+        hint = QLabel("点选轴位/冠状/矢状后，三格显示该平面的 CT、PET、融合。左键涂抹、右键擦除，三格 mask 同步。")
         hint.setWordWrap(True)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(grid, 1)
+        layout.addLayout(views_row, 1)
+        layout.addLayout(plane_row)
         layout.addLayout(ctrl)
         layout.addLayout(morph)
         layout.addWidget(self.table)
@@ -213,34 +221,40 @@ class SegmentEditorDialog(QDialog):
         layout.addWidget(buttons)
 
         self._fit_to_screen()
-        self.refresh()
+        self.refresh(update_table=True)
 
     def _fit_to_screen(self) -> None:
         screen = QApplication.primaryScreen()
         if screen is None:
-            self.resize(1400, 900)
+            self.resize(1400, 800)
             return
         geo = screen.availableGeometry()
         w = min(geo.width(), max(int(geo.width() * 0.94), 1100))
-        h = min(geo.height(), max(int(geo.height() * 0.94), 700))
+        h = min(geo.height(), max(int(geo.height() * 0.92), 680))
         self.resize(w, h)
         self.move(geo.x() + (geo.width() - w) // 2, geo.y() + (geo.height() - h) // 2)
 
     def edited_mask(self) -> np.ndarray:
         return self._vol.native
 
+    def _set_plane(self, plane: str) -> None:
+        self.plane = plane
+        self.active_view = plane
+        for view in self._cells.values():
+            view.view_name = plane
+        self.refresh(update_table=False)
+
     def _sliders_changed(self) -> None:
         self._i = self.slider_i.value()
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
-        self.refresh()
+        self.refresh(update_table=False)
 
-    def _click(self, which: str, x: float, y: float) -> None:
+    def _click(self, x: float, y: float) -> None:
         from display_utils import display_to_voxel
 
-        self.active_view = which
         ii, jj, kk = display_to_voxel(
-            which, x, y, self._i, self._j, self._k, self._vol.ct.shape
+            self.plane, x, y, self._i, self._j, self._k, self._vol.ct.shape
         )
         self.slider_i.setValue(ii)
         self.slider_j.setValue(jj)
@@ -256,10 +270,9 @@ class SegmentEditorDialog(QDialog):
             return
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
-        self.refresh()
+        self.refresh(update_table=True)
 
-    def _paint(self, which: str, x: float, y: float, erase: bool) -> None:
-        self.active_view = which
+    def _paint(self, x: float, y: float, erase: bool) -> None:
         if not self._stroke:
             self._push_undo()
             self._stroke = True
@@ -267,7 +280,7 @@ class SegmentEditorDialog(QDialog):
         label = 0 if erase else max(int(self.current_label), 1)
         paint_disk(
             self._vol.native,
-            which,
+            self.plane,
             self._i,
             self._j,
             self._k,
@@ -277,27 +290,27 @@ class SegmentEditorDialog(QDialog):
             label,
         )
         self._vol.dirty = True
-        self.refresh()
+        self.refresh(update_table=False)
 
     def _end_stroke(self) -> None:
         if self._stroke and not self._stroke_erase and self._vol._undo:
             promote_new_islands(self._vol.native, self._vol._undo[-1])
         self._stroke = False
-        self.refresh()
+        self.refresh(update_table=True)
 
     def _morph(self, op: str) -> None:
         radius = int(self.spin_radius.value())
         scope = self.combo_scope.currentData()
         target = self.combo_target.currentData()
         label = int(self.current_label) if target == "current" else 0
-        plane = self.active_view if scope == "slice" else None
+        plane = self.plane if scope == "slice" else None
         ijk = (self._i, self._j, self._k) if plane else None
         self._push_undo()
         self._vol.native = morph_labels(
             self._vol.native, op, radius, label=label, plane=plane, ijk=ijk
         )
         self._vol.dirty = True
-        self.refresh()
+        self.refresh(update_table=True)
 
     def _relabel(self) -> None:
         self._push_undo()
@@ -305,7 +318,7 @@ class SegmentEditorDialog(QDialog):
         self.current_label = 1
         self.highlight_label = 1
         self._vol.dirty = True
-        self.refresh()
+        self.refresh(update_table=True)
 
     def _on_row(self) -> None:
         items = self.table.selectedItems()
@@ -320,7 +333,7 @@ class SegmentEditorDialog(QDialog):
             if lid > 0:
                 self.current_label = lid
                 self.highlight_label = lid
-        self.refresh()
+        self.refresh(update_table=False)
 
     def _voxel_ml(self) -> float:
         if self._vol.affine is None:
@@ -342,10 +355,13 @@ class SegmentEditorDialog(QDialog):
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
 
-    def refresh(self) -> None:
+    def refresh(self, update_table: bool = True) -> None:
         vol = self._vol
         native = vol.native
         mapped = vol.mapped
+        plane = self.plane
+        fn = _SLICE_FN[plane]
+        sl = {"axial": self._k, "coronal": self._j, "sagittal": self._i}[plane]
         args_base = dict(
             pet_alpha=float(self.spin_alpha.value()),
             suv_min=float(self.spin_suv_min.value()),
@@ -355,12 +371,9 @@ class SegmentEditorDialog(QDialog):
             show_mapped=False,
             highlight_label=int(self.highlight_label),
         )
-        idx = {"axial": self._k, "coronal": self._j, "sagittal": self._i}
         on = self.chk_crosshair.isChecked()
-        shape = vol.ct.shape
-        for (mode, plane), view in self._cells.items():
-            fn = _SLICE_FN[plane]
-            sl = idx[plane]
+        col, row = voxel_to_display(plane, self._i, self._j, self._k, vol.ct.shape)
+        for mode, view in self._cells.items():
             view.set_rgb(
                 compose_rgb(
                     fn(vol.ct, sl),
@@ -373,13 +386,14 @@ class SegmentEditorDialog(QDialog):
             )
             view.set_crosshair_visible(on)
             if on:
-                col, row = voxel_to_display(plane, self._i, self._j, self._k, shape)
                 view.set_crosshair(col, row)
         suv = float(vol.pet[self._i, self._j, self._k])
         hu = float(vol.ct[self._i, self._j, self._k])
         lid = int(native[self._i, self._j, self._k])
         extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
-            f"ijk=({self._i},{self._j},{self._k})  HU={hu:.0f}  SUV={suv:.2f}{extra}"
+            f"{_PLANE_LABEL[plane]}  ijk=({self._i},{self._j},{self._k})  "
+            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
         )
-        self._refresh_table()
+        if update_table:
+            self._refresh_table()
