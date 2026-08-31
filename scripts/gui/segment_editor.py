@@ -242,6 +242,7 @@ class SegmentEditorDialog(QDialog):
         self.active_view = plane
         for view in self._cells.values():
             view.view_name = plane
+            view.set_laterality(plane)
         self.refresh(update_table=False)
 
     def _sliders_changed(self) -> None:
@@ -305,10 +306,18 @@ class SegmentEditorDialog(QDialog):
         label = int(self.current_label) if target == "current" else 0
         plane = self.plane if scope == "slice" else None
         ijk = (self._i, self._j, self._k) if plane else None
+        waiting = plane is None
+        if waiting:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
         self._push_undo()
-        self._vol.native = morph_labels(
-            self._vol.native, op, radius, label=label, plane=plane, ijk=ijk
-        )
+        try:
+            self._vol.native = morph_labels(
+                self._vol.native, op, radius, label=label, plane=plane, ijk=ijk
+            )
+        finally:
+            if waiting:
+                QApplication.restoreOverrideCursor()
         self._vol.dirty = True
         self.refresh(update_table=True)
 

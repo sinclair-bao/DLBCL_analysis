@@ -16,12 +16,13 @@ from PySide6.QtWidgets import (
 )
 
 from display_utils import MAPPED_RGB, NATIVE_RGB, apply_pet_gray, coronal_mip
+from ortho_viewer import _LateralityMixin
 from volume_io import VolumeSet
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
 
-class _MipView(pg.GraphicsLayoutWidget):
+class _MipView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
         self.setMinimumHeight(120)
@@ -33,6 +34,11 @@ class _MipView(pg.GraphicsLayoutWidget):
         self.box.addItem(self.item)
         self._label = pg.LabelItem(title, color="#dddddd")
         self.addItem(self._label, row=1, col=0)
+        self._init_laterality("coronal")
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._place_laterality()
 
     def set_title(self, text: str, *, highlight: bool = False) -> None:
         color = "#ffd24a" if highlight else "#dddddd"

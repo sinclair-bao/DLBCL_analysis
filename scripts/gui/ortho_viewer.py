@@ -40,6 +40,45 @@ from volume_io import VolumeSet
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
+_LAT_STYLE = (
+    "QLabel { color: #f2f2f2; background: rgba(10, 10, 10, 165); "
+    "padding: 1px 6px; border-radius: 3px; font-weight: 600; font-size: 12px; }"
+)
+
+
+class _LateralityMixin:
+    """视口左右标记：轴位/冠状/MIP 为 R·L，矢状为 P·A。贴在屏幕边，不随缩放走。"""
+
+    def _init_laterality(self, view_name: str) -> None:
+        self._lat_left = QLabel(self)
+        self._lat_right = QLabel(self)
+        for lbl in (self._lat_left, self._lat_right):
+            lbl.setStyleSheet(_LAT_STYLE)
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.set_laterality(view_name)
+
+    def set_laterality(self, view_name: str) -> None:
+        left, right = ("P", "A") if view_name == "sagittal" else ("R", "L")
+        self._lat_left.setText(left)
+        self._lat_right.setText(right)
+        self._lat_left.adjustSize()
+        self._lat_right.adjustSize()
+        self._place_laterality()
+
+    def _place_laterality(self) -> None:
+        if not hasattr(self, "_lat_left"):
+            return
+        margin = 8
+        title_h = 22
+        area_h = max(self.height() - title_h, 1)
+        y = max(margin, area_h // 2 - self._lat_left.height() // 2)
+        self._lat_left.move(margin, y)
+        self._lat_right.move(
+            max(margin, self.width() - self._lat_right.width() - margin), y
+        )
+        self._lat_left.raise_()
+        self._lat_right.raise_()
+
 
 class _PaintItem(pg.ImageItem):
     paint_at = Signal(float, float, bool)
@@ -73,7 +112,7 @@ class _PaintItem(pg.ImageItem):
         ev.accept()
 
 
-class _RgbView(pg.GraphicsLayoutWidget):
+class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def __init__(self, title: str, view_name: str) -> None:
         super().__init__()
         self.view_name = view_name
@@ -93,6 +132,11 @@ class _RgbView(pg.GraphicsLayoutWidget):
         self.box.addItem(self.vline)
         self.box.addItem(self.hline)
         self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
+        self._init_laterality(view_name)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._place_laterality()
 
     def set_crosshair(self, col: float, row: float) -> None:
         pos = (float(col), float(row))

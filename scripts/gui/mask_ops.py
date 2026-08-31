@@ -141,27 +141,82 @@ def morph_labels(
 ) -> np.ndarray:
     """
     op: dilate / erode / open / close
-    label=0 表示全部病灶（按二值做完再写回各编号：膨胀出的新体素归最近灶）。
+    label=0 表示全部病灶（膨胀出的新体素归该编号，不覆盖其它灶）。
     plane 为 axial/coronal/sagittal 时只改当前层。
     """
     out = np.array(mask, copy=True, dtype=np.uint16)
     r = max(int(radius), 1)
+    if plane and ijk is not None:
+        _morph_labels_2d(out, op, r, label, plane, ijk)
+    else:
+        _morph_labels_3d(out, op, r, label)
+    return out
+
+
+def _slice_view(
+    mask: np.ndarray, plane: str, ijk: tuple[int, int, int]
+) -> np.ndarray:
+    i, j, k = ijk
+    if plane == "axial":
+        return mask[:, :, k]
+    if plane == "coronal":
+        return mask[:, j, :]
+    return mask[i, :, :]
+
+
+def _morph_labels_2d(
+    out: np.ndarray,
+    op: str,
+    radius: int,
+    label: int,
+    plane: str,
+    ijk: tuple[int, int, int],
+) -> None:
+    sl = _slice_view(out, plane, ijk)
+    ids = [int(v) for v in np.unique(sl) if v > 0]
+    targets = [label] if label > 0 else ids
+    struct = ndimage.generate_binary_structure(2, 1)
+    work = sl.copy()
+    for lid in targets:
+        binary = sl == lid
+        if not np.any(binary):
+            continue
+        morphed = _morph_2d_slice(binary, op, radius, struct)
+        work[work == lid] = 0
+        grow = morphed & (work == 0)
+        work[grow] = np.uint16(lid)
+    sl[:] = work
+
+
+def _bbox_slices(binary: np.ndarray, pad: int) -> Optional[tuple[slice, ...]]:
+    coords = np.nonzero(binary)
+    if coords[0].size == 0:
+        return None
+    box = []
+    for axis, idx in enumerate(coords):
+        lo = max(int(idx.min()) - pad, 0)
+        hi = min(int(idx.max()) + pad + 1, binary.shape[axis])
+        box.append(slice(lo, hi))
+    return tuple(box)
+
+
+def _morph_labels_3d(out: np.ndarray, op: str, radius: int, label: int) -> None:
     struct = ndimage.generate_binary_structure(3, 1)
     ids = [int(v) for v in np.unique(out) if v > 0]
     targets = [label] if label > 0 else ids
-
     for lid in targets:
         binary = out == lid
-        if not np.any(binary) and label != lid:
+        if not np.any(binary):
             continue
-        if plane and ijk is not None:
-            binary = _morph_2d(binary, op, r, plane, ijk)
-        else:
-            binary = _morph_3d(binary, op, r, struct)
-        out[out == lid] = 0
-        grow = binary & (out == 0)
-        out[grow] = np.uint16(lid)
-    return out
+        box = _bbox_slices(binary, radius)
+        if box is None:
+            continue
+        crop = binary[box]
+        morphed = _morph_3d(crop, op, radius, struct)
+        region = out[box]
+        region[region == lid] = 0
+        grow = morphed & (region == 0)
+        region[grow] = np.uint16(lid)
 
 
 def _morph_3d(binary: np.ndarray, op: str, radius: int, struct) -> np.ndarray:
@@ -173,28 +228,6 @@ def _morph_3d(binary: np.ndarray, op: str, radius: int, struct) -> np.ndarray:
     if op == "open":
         return ndimage.binary_opening(binary, structure=struct, iterations=iters)
     return ndimage.binary_closing(binary, structure=struct, iterations=iters)
-
-
-def _morph_2d(
-    binary: np.ndarray,
-    op: str,
-    radius: int,
-    plane: str,
-    ijk: tuple[int, int, int],
-) -> np.ndarray:
-    i, j, k = ijk
-    out = binary.copy()
-    struct = ndimage.generate_binary_structure(2, 1)
-    if plane == "axial":
-        sl = out[:, :, k]
-        sl[:] = _morph_2d_slice(sl, op, radius, struct)
-    elif plane == "coronal":
-        sl = out[:, j, :]
-        sl[:] = _morph_2d_slice(sl, op, radius, struct)
-    else:
-        sl = out[i, :, :]
-        sl[:] = _morph_2d_slice(sl, op, radius, struct)
-    return out
 
 
 def _morph_2d_slice(sl: np.ndarray, op: str, radius: int, struct) -> np.ndarray:

@@ -38,17 +38,30 @@ class MappingWorker(QThread):
         try:
             from interscan_register import InterscanRegistrar
 
-            self.progress.emit(f"开始将基线病灶映射到随访 {self._patient_id} …")
+            self.progress.emit("正在配准 CT（约数分钟，请勿关闭）…")
             registrar = InterscanRegistrar(
                 self._catalog, overwrite=self._overwrite
             )
             results = registrar.map_session(self._patient_id)
-            errors = [r for r in results if r.status == "error"]
-            if errors:
-                self.failed.emit("; ".join(r.message for r in errors))
+            if not results:
+                self.failed.emit("没有映射任务")
                 return
-            n_ok = sum(1 for r in results if r.status in ("ok", "skipped"))
-            self.finished_ok.emit(f"{self._patient_id}: {n_ok} 个随访映射完成")
+            ok = [r for r in results if r.status in ("ok", "skipped")]
+            errors = [r for r in results if r.status == "error"]
+            parts: list[str] = []
+            if ok:
+                parts.append(f"{len(ok)} 个随访映射完成")
+            if errors:
+                detail = "; ".join(
+                    f"{r.study_date}: {r.message}" if r.study_date else r.message
+                    for r in errors
+                )
+                parts.append(f"失败: {detail}")
+            msg = f"{self._patient_id}: " + "；".join(parts)
+            if ok:
+                self.finished_ok.emit(msg)
+                return
+            self.failed.emit(msg)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
 

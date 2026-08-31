@@ -384,14 +384,77 @@ class MainWindow(QMainWindow):
             return
         self._on_study(self.current_patient, date)
 
+    def _dirty_volumes(self) -> list:
+        seen: set[int] = set()
+        out = []
+        vol = self.ortho.volumes()
+        if vol is not None and vol.dirty:
+            out.append(vol)
+            seen.add(id(vol))
+        pid = self.current_patient
+        for cached in self._vol_cache.values():
+            if (
+                cached is not None
+                and cached.dirty
+                and id(cached) not in seen
+                and (not pid or cached.patient_id == pid)
+            ):
+                out.append(cached)
+                seen.add(id(cached))
+        return out
+
+    def _write_edited_mask(self, vol) -> None:
+        assets = self.catalog.get_study(vol.patient_id, vol.study_date)
+        if assets is None:
+            return
+        save_edited_mask(vol, assets.edited_mask_path())
+        vol.dirty = False
+
     def _run_mapping(self) -> None:
         if not self.current_patient:
             return
         session = self.timepoints.current_session(self.current_patient)
-        save_session(self.catalog.processed_root, session)
+        rec = self.catalog.get_patient(self.current_patient)
+        dates = rec.study_dates() if rec else []
+        issues = session.validate(dates)
+        if issues:
+            QMessageBox.warning(self, "映射", "时间点无效：\n" + "\n".join(issues))
+            return
         if not session.can_map():
             QMessageBox.information(self, "映射", "请先指定 baseline 以及至少一个随访时间点。")
             return
+        dirty = self._dirty_volumes()
+        if dirty:
+            ans = QMessageBox.question(
+                self,
+                "映射",
+                "有未保存的 mask 调整。映射使用磁盘上的基线 mask，是否先保存再映射？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            for vol in dirty:
+                self._write_edited_mask(vol)
+            self.catalog.refresh()
+        bl = self.catalog.get_study(self.current_patient, session.baseline)
+        missing: list[str] = []
+        if bl is None:
+            missing.append(f"基线检查 {session.baseline}")
+        else:
+            if bl.working_ct is None:
+                missing.append("基线 2 mm CT")
+            if bl.working_lesion is None:
+                missing.append("基线病灶 mask（请先分割或载入）")
+        for role, fu_date in session.followups():
+            fu = self.catalog.get_study(self.current_patient, fu_date)
+            if fu is None:
+                missing.append(f"{role} 检查 {fu_date}")
+            elif fu.working_ct is None:
+                missing.append(f"{role} 2 mm CT")
+        if missing:
+            QMessageBox.warning(self, "映射", "无法开始映射：\n" + "\n".join(missing))
+            return
+        save_session(self.catalog.processed_root, session)
         self.timepoints.btn_map.setEnabled(False)
         self.edit_panel.set_busy(True)
         self._map_worker = MappingWorker(self.catalog, self.current_patient, overwrite=True)
@@ -406,12 +469,21 @@ class MainWindow(QMainWindow):
         self._vol_cache.clear()
         self.catalog.refresh()
         self.browser.populate(self.catalog)
+        hint = "  已切换到随访，青色 = 基线病灶床"
         if self.current_patient:
             self.browser.select_patient(self.current_patient)
-            if self.current_date:
-                self._on_study(self.current_patient, self.current_date)
+            session = self._session() or load_session(
+                self.catalog.processed_root, self.current_patient
+            )
+            assigned = session.assigned()
+            target = assigned.get("interim") or assigned.get("end") or self.current_date
+            self.ortho.chk_mapped.setChecked(True)
+            if target:
+                self._on_study(self.current_patient, target)
             self._refresh_evolution()
-        self.status.showMessage(msg)
+        self.status.showMessage(msg + hint)
+        if "失败" in msg:
+            QMessageBox.information(self, "映射部分完成", msg)
 
     def _run_features(self) -> None:
         if not self.current_patient:
@@ -564,10 +636,18 @@ class MainWindow(QMainWindow):
         label = int(self.ortho.current_label) if target == "current" else 0
         plane = self.ortho.active_view if scope == "slice" else None
         ijk = self.ortho.ijk() if plane else None
-        new_mask = morph_labels(
-            vol.native, op, radius, label=label, plane=plane, ijk=ijk
-        )
-        self.ortho.apply_mask(new_mask)
+        waiting = plane is None
+        if waiting:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()
+        try:
+            new_mask = morph_labels(
+                vol.native, op, radius, label=label, plane=plane, ijk=ijk
+            )
+            self.ortho.apply_mask(new_mask)
+        finally:
+            if waiting:
+                QApplication.restoreOverrideCursor()
 
     def _on_relabel(self) -> None:
         vol = self.ortho.volumes()
@@ -581,18 +661,15 @@ class MainWindow(QMainWindow):
         vol = self.ortho.volumes()
         if vol is None or not self.current_patient or not self.current_date:
             return
-        assets = self.catalog.get_study(self.current_patient, self.current_date)
-        if assets is None:
-            return
-        path = assets.edited_mask_path()
-        save_edited_mask(vol, path)
-        vol.dirty = False
+        self._write_edited_mask(vol)
         self.catalog.refresh()
         self._vol_cache.clear()
         self.browser.populate(self.catalog)
         if self.current_patient:
             self.browser.select_patient(self.current_patient)
-        self.status.showMessage(f"已保存 {path.name}（未覆盖 nnU-Net 原 mask）")
+        assets = self.catalog.get_study(self.current_patient, self.current_date)
+        name = assets.edited_mask_path().name if assets is not None else "lesion_edited.nii.gz"
+        self.status.showMessage(f"已保存 {name}（未覆盖 nnU-Net 原 mask）")
 
     def _about(self) -> None:
         QMessageBox.information(
@@ -601,7 +678,8 @@ class MainWindow(QMainWindow):
             "DLBCL 纵向 PET/CT 分析软件\n"
             "四种分割入口打开 CT/PET/融合三格编辑窗，点选轴/冠/矢平面。\n"
             "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
-            "显示：仅 CT / 仅 PET（灰度）/ PET-CT；十字线与患者列表可隐藏（F2）。\n"
+            "显示：仅 CT / 仅 PET（灰度）/ PET-CT；轴冠 MIP 标 R/L，矢状标 P/A。\n"
+            "十字线与患者列表可隐藏（F2）。\n"
             "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"
             "红 = 本底 mask，黄 = 当前选中灶，青 = 映射的基线病灶床。",
         )
