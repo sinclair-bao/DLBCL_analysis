@@ -139,7 +139,7 @@ class InterscanRegistrar:
 
         fixed_ct = followup.working_ct
         moving_ct = baseline.working_ct
-        moving_mask = baseline.lesion_mask
+        moving_mask = baseline.working_lesion
         if fixed_ct is None:
             return StageResult(
                 STAGE_NAME, patient_id, followup_date, "error", str(out_dir),

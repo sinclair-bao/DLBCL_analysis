@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import nibabel as nib
@@ -12,16 +12,21 @@ import numpy as np
 from nibabel.processing import resample_from_to
 
 from catalog import StudyAssets
+from mask_ops import ensure_labeled
 
 
 @dataclass
 class VolumeSet:
     ct: np.ndarray
     pet: np.ndarray
-    native: Optional[np.ndarray]
+    native: np.ndarray
     mapped: Optional[np.ndarray]
     study_date: str
+    patient_id: str = ""
+    affine: Optional[np.ndarray] = None
     role: str = ""
+    dirty: bool = False
+    _undo: list = field(default_factory=list, repr=False)
 
 
 def _to_ref(
@@ -44,18 +49,33 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
     ref = nib.load(str(assets.working_ct))
     ct = np.asanyarray(ref.dataobj, dtype=np.float32)
     pet = _to_ref(assets.working_pet, ref, order=1, dtype=np.float32)
-    native = None
-    if assets.lesion_mask is not None:
-        native = _to_ref(assets.lesion_mask, ref, order=0, dtype=np.uint8)
+    native = np.zeros(ct.shape, dtype=np.uint16)
+    if assets.working_lesion is not None:
+        raw = _to_ref(assets.working_lesion, ref, order=0, dtype=np.uint16)
+        native = ensure_labeled(raw)
     mapped = None
     if baseline_date:
         wp = assets.warped_baseline_mask(baseline_date)
         if wp is not None:
-            mapped = _to_ref(wp, ref, order=0, dtype=np.uint8)
+            mapped = _to_ref(wp, ref, order=0, dtype=np.uint16)
     return VolumeSet(
         ct=ct,
         pet=pet,
         native=native,
         mapped=mapped,
         study_date=assets.study_date,
+        patient_id=assets.patient_id,
+        affine=np.asarray(ref.affine),
     )
+
+
+def save_edited_mask(vol: VolumeSet, out_path) -> None:
+    """把当前编号 mask 写成 uint16 NIfTI，仿射与工作 CT 一致。"""
+    from pathlib import Path
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    affine = vol.affine if vol.affine is not None else np.eye(4)
+    img = nib.Nifti1Image(np.asarray(vol.native, dtype=np.uint16), affine)
+    img.header.set_data_dtype(np.uint16)
+    nib.save(img, str(out_path))

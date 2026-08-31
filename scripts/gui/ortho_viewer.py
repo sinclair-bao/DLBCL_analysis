@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""轴 / 冠 / 矢 联动三视图：CT + PET 融合 + 本底/映射 mask。"""
+"""轴 / 冠 / 矢 联动三视图：显示模式、窗宽窗位、缩放、二维画笔。"""
 
 from __future__ import annotations
 
@@ -10,58 +10,117 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
+    QRadioButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from display_utils import compose_rgb, slice_axial, slice_coronal, slice_sagittal
+from display_utils import (
+    DEFAULT_WL,
+    DEFAULT_WW,
+    compose_rgb,
+    ct_window_from_wl,
+    slice_axial,
+    slice_coronal,
+    slice_sagittal,
+)
+from mask_ops import paint_disk, promote_new_islands
 from volume_io import VolumeSet
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
 
-class _RgbView(pg.GraphicsLayoutWidget):
-    clicked = Signal(float, float)
+class _PaintItem(pg.ImageItem):
+    paint_at = Signal(float, float, bool)
+    clicked_xy = Signal(float, float)
+    stroke_finished = Signal()
 
-    def __init__(self, title: str) -> None:
+    def __init__(self) -> None:
         super().__init__()
+        self.edit_mode = False
+
+    def mouseClickEvent(self, ev) -> None:
+        pos = ev.pos()
+        if self.edit_mode:
+            erase = ev.button() == Qt.MouseButton.RightButton
+            self.paint_at.emit(float(pos.x()), float(pos.y()), erase)
+            self.stroke_finished.emit()
+            ev.accept()
+            return
+        self.clicked_xy.emit(float(pos.x()), float(pos.y()))
+        ev.accept()
+
+    def mouseDragEvent(self, ev) -> None:
+        if not self.edit_mode:
+            ev.ignore()
+            return
+        pos = ev.pos()
+        erase = ev.button() == Qt.MouseButton.RightButton
+        self.paint_at.emit(float(pos.x()), float(pos.y()), erase)
+        if ev.isFinish():
+            self.stroke_finished.emit()
+        ev.accept()
+
+
+class _RgbView(pg.GraphicsLayoutWidget):
+    def __init__(self, title: str, view_name: str) -> None:
+        super().__init__()
+        self.view_name = view_name
         self.setMinimumHeight(180)
-        self.view = self.addViewBox(lockAspect=True, invertY=True)
-        self.view.setMenuEnabled(False)
-        self.item = pg.ImageItem()
-        self.view.addItem(self.item)
-        self.label = pg.LabelItem(title, color="#dddddd")
-        self.addItem(self.label, row=1, col=0)
-        self.scene().sigMouseClicked.connect(self._on_click)
+        self.box = self.addViewBox(lockAspect=True, invertY=True)
+        self.box.setMenuEnabled(False)
+        self.box.disableAutoRange()
+        self.item = _PaintItem()
+        self.box.addItem(self.item)
+        self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
 
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         self.item.setImage(img, autoLevels=False)
 
-    def _on_click(self, ev) -> None:
+    def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
             return
-        pos = self.item.mapFromScene(ev.scenePos())
-        self.clicked.emit(float(pos.x()), float(pos.y()))
+        h, w = self.item.image.shape[:2]
+        scale = max(percent, 10) / 100.0
+        half_w = (w / 2.0) / scale
+        half_h = (h / 2.0) / scale
+        self.box.setRange(
+            xRange=(w / 2.0 - half_w, w / 2.0 + half_w),
+            yRange=(h / 2.0 - half_h, h / 2.0 + half_h),
+            padding=0,
+        )
 
 
 class OrthoViewer(QWidget):
+    mask_changed = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._vol: Optional[VolumeSet] = None
         self._i = self._j = self._k = 0
+        self.highlight_label = 0
+        self.current_label = 1
+        self.brush_radius = 5
+        self.active_view = "axial"
+        self._stroke = False
+        self._stroke_erase = False
 
-        self.axial = _RgbView("Axial")
-        self.coronal = _RgbView("Coronal")
-        self.sagittal = _RgbView("Sagittal")
-        self.axial.clicked.connect(lambda x, y: self._click("axial", x, y))
-        self.coronal.clicked.connect(lambda x, y: self._click("coronal", x, y))
-        self.sagittal.clicked.connect(lambda x, y: self._click("sagittal", x, y))
+        self.axial = _RgbView("Axial", "axial")
+        self.coronal = _RgbView("Coronal", "coronal")
+        self.sagittal = _RgbView("Sagittal", "sagittal")
+        for v in (self.axial, self.coronal, self.sagittal):
+            v.item.clicked_xy.connect(lambda x, y, vv=v: self._click(vv.view_name, x, y))
+            v.item.paint_at.connect(lambda x, y, er, vv=v: self._paint(vv.view_name, x, y, er))
+            v.item.stroke_finished.connect(self._end_stroke)
 
         views = QHBoxLayout()
         views.addWidget(self.axial, 1)
@@ -74,12 +133,23 @@ class OrthoViewer(QWidget):
         for sl in (self.slider_k, self.slider_j, self.slider_i):
             sl.valueChanged.connect(self._sliders_changed)
 
+        self.radio_fusion = QRadioButton("PET/CT")
+        self.radio_ct = QRadioButton("仅 CT")
+        self.radio_pet = QRadioButton("仅 PET")
+        self.radio_fusion.setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        for r in (self.radio_fusion, self.radio_ct, self.radio_pet):
+            self._mode_group.addButton(r)
+            r.toggled.connect(self.refresh)
+
         self.chk_native = QCheckBox("本底 mask")
         self.chk_mapped = QCheckBox("映射 mask")
+        self.chk_edit = QCheckBox("编辑 mask")
         self.chk_native.setChecked(True)
         self.chk_mapped.setChecked(True)
         self.chk_native.toggled.connect(self.refresh)
         self.chk_mapped.toggled.connect(self.refresh)
+        self.chk_edit.toggled.connect(self._toggle_edit)
 
         self.spin_alpha = QDoubleSpinBox()
         self.spin_alpha.setRange(0.0, 1.0)
@@ -87,33 +157,87 @@ class OrthoViewer(QWidget):
         self.spin_alpha.setValue(0.55)
         self.spin_alpha.valueChanged.connect(self.refresh)
 
-        self.spin_suv = QDoubleSpinBox()
-        self.spin_suv.setRange(1.0, 30.0)
-        self.spin_suv.setSingleStep(0.5)
-        self.spin_suv.setValue(6.0)
-        self.spin_suv.valueChanged.connect(self.refresh)
+        self.spin_suv_min = QDoubleSpinBox()
+        self.spin_suv_min.setRange(0.0, 20.0)
+        self.spin_suv_min.setValue(0.0)
+        self.spin_suv_max = QDoubleSpinBox()
+        self.spin_suv_max.setRange(0.5, 40.0)
+        self.spin_suv_max.setValue(6.0)
+        self.spin_suv_min.valueChanged.connect(self.refresh)
+        self.spin_suv_max.valueChanged.connect(self.refresh)
+        self.spin_suv = self.spin_suv_max
+
+        self.spin_wl = QSpinBox()
+        self.spin_wl.setRange(-1000, 3000)
+        self.spin_wl.setValue(int(DEFAULT_WL))
+        self.spin_ww = QSpinBox()
+        self.spin_ww.setRange(1, 4000)
+        self.spin_ww.setValue(int(DEFAULT_WW))
+        self.spin_wl.valueChanged.connect(self.refresh)
+        self.spin_ww.valueChanged.connect(self.refresh)
+
+        self.spin_zoom = QSpinBox()
+        self.spin_zoom.setRange(50, 400)
+        self.spin_zoom.setValue(100)
+        self.spin_zoom.setSuffix("%")
+        self.spin_zoom.valueChanged.connect(self._apply_zoom)
+        self.btn_zoom_reset = QPushButton("复位")
+        self.btn_zoom_reset.clicked.connect(lambda: self.spin_zoom.setValue(100))
+
+        self.spin_brush = QSpinBox()
+        self.spin_brush.setRange(3, 15)
+        self.spin_brush.setValue(5)
+        self.spin_brush.valueChanged.connect(lambda v: setattr(self, "brush_radius", int(v)))
 
         self.lbl_pos = QLabel("—")
 
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel("轴位"))
-        controls.addWidget(self.slider_k, 1)
-        controls.addWidget(QLabel("冠状"))
-        controls.addWidget(self.slider_j, 1)
-        controls.addWidget(QLabel("矢状"))
-        controls.addWidget(self.slider_i, 1)
-        controls.addWidget(self.chk_native)
-        controls.addWidget(self.chk_mapped)
-        controls.addWidget(QLabel("PET 透明度"))
-        controls.addWidget(self.spin_alpha)
-        controls.addWidget(QLabel("SUV 上限"))
-        controls.addWidget(self.spin_suv)
-        controls.addWidget(self.lbl_pos)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("轴位"))
+        row1.addWidget(self.slider_k, 1)
+        row1.addWidget(QLabel("冠状"))
+        row1.addWidget(self.slider_j, 1)
+        row1.addWidget(QLabel("矢状"))
+        row1.addWidget(self.slider_i, 1)
+        row1.addWidget(self.radio_fusion)
+        row1.addWidget(self.radio_ct)
+        row1.addWidget(self.radio_pet)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(self.chk_native)
+        row2.addWidget(self.chk_mapped)
+        row2.addWidget(self.chk_edit)
+        row2.addWidget(QLabel("笔刷"))
+        row2.addWidget(self.spin_brush)
+        row2.addWidget(QLabel("窗位"))
+        row2.addWidget(self.spin_wl)
+        row2.addWidget(QLabel("窗宽"))
+        row2.addWidget(self.spin_ww)
+        row2.addWidget(QLabel("SUV"))
+        row2.addWidget(self.spin_suv_min)
+        row2.addWidget(self.spin_suv_max)
+        row2.addWidget(QLabel("融合"))
+        row2.addWidget(self.spin_alpha)
+        row2.addWidget(QLabel("缩放"))
+        row2.addWidget(self.spin_zoom)
+        row2.addWidget(self.btn_zoom_reset)
+        row2.addWidget(self.lbl_pos, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(views, 1)
-        layout.addLayout(controls)
+        layout.addLayout(row1)
+        layout.addLayout(row2)
+
+    def display_mode(self) -> str:
+        if self.radio_ct.isChecked():
+            return "ct"
+        if self.radio_pet.isChecked():
+            return "pet"
+        return "fusion"
+
+    def _toggle_edit(self, on: bool) -> None:
+        for v in (self.axial, self.coronal, self.sagittal):
+            v.item.edit_mode = bool(on)
 
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
@@ -137,6 +261,10 @@ class OrthoViewer(QWidget):
         self.slider_j.blockSignals(False)
         self.slider_k.blockSignals(False)
         self.refresh()
+        self._apply_zoom(self.spin_zoom.value())
+
+    def volumes(self) -> Optional[VolumeSet]:
+        return self._vol
 
     def _sliders_changed(self) -> None:
         self._i = self.slider_i.value()
@@ -145,56 +273,132 @@ class OrthoViewer(QWidget):
         self.refresh()
 
     def _click(self, which: str, x: float, y: float) -> None:
+        self.active_view = which
         if self._vol is None:
             return
-        # 点击坐标是显示图的列/行，与 orient_* 输出一致；只作粗略跳层。
-        if which == "axial":
-            self.slider_k.setValue(self._k)
-        elif which == "coronal":
-            ny = self._vol.ct.shape[1]
-            self.slider_j.setValue(int(np.clip(ny - 1 - y, 0, ny - 1)))
-        else:
-            nx = self._vol.ct.shape[0]
-            self.slider_i.setValue(int(np.clip(x, 0, nx - 1)))
+        from display_utils import display_to_voxel
+
+        ii, jj, kk = display_to_voxel(
+            which, x, y, self._i, self._j, self._k, self._vol.ct.shape
+        )
+        self.slider_i.setValue(ii)
+        self.slider_j.setValue(jj)
+        self.slider_k.setValue(kk)
+
+    def _push_undo(self) -> None:
+        if self._vol is None:
+            return
+        self._vol._undo.append(self._vol.native.copy())
+        if len(self._vol._undo) > 20:
+            self._vol._undo.pop(0)
+
+    def undo(self) -> None:
+        if self._vol is None or not self._vol._undo:
+            return
+        self._vol.native = self._vol._undo.pop()
+        self._vol.dirty = True
+        self.refresh()
+        self.mask_changed.emit()
+
+    def _paint(self, which: str, x: float, y: float, erase: bool) -> None:
+        vol = self._vol
+        if vol is None:
+            return
+        self.active_view = which
+        if vol.native is None:
+            vol.native = np.zeros(vol.ct.shape, dtype=np.uint16)
+        if not self._stroke:
+            self._push_undo()
+            self._stroke = True
+            self._stroke_erase = bool(erase)
+        label = 0 if erase else max(int(self.current_label), 1)
+        paint_disk(
+            vol.native,
+            which,
+            self._i,
+            self._j,
+            self._k,
+            x,
+            y,
+            self.brush_radius,
+            label,
+        )
+        vol.dirty = True
+        self.refresh()
+
+    def _end_stroke(self) -> None:
+        vol = self._vol
+        if vol is not None and self._stroke and not self._stroke_erase and vol._undo:
+            promote_new_islands(vol.native, vol._undo[-1])
+            self.refresh()
+        self._stroke = False
+        self.mask_changed.emit()
+
+    def apply_mask(self, mask: np.ndarray, *, undo: bool = True) -> None:
+        if self._vol is None:
+            return
+        if undo:
+            self._push_undo()
+        self._vol.native = np.asarray(mask, dtype=np.uint16)
+        self._vol.dirty = True
+        self.refresh()
+        self.mask_changed.emit()
+
+    def ijk(self) -> tuple[int, int, int]:
+        return self._i, self._j, self._k
+
+    def _apply_zoom(self, percent: int) -> None:
+        for v in (self.axial, self.coronal, self.sagittal):
+            v.set_zoom(int(percent))
 
     def refresh(self) -> None:
         vol = self._vol
         if vol is None:
             return
         args = dict(
+            mode=self.display_mode(),
             pet_alpha=float(self.spin_alpha.value()),
-            suv_max=float(self.spin_suv.value()),
+            suv_min=float(self.spin_suv_min.value()),
+            suv_max=float(self.spin_suv_max.value()),
+            ct_window=ct_window_from_wl(float(self.spin_wl.value()), float(self.spin_ww.value())),
             show_native=self.chk_native.isChecked(),
             show_mapped=self.chk_mapped.isChecked(),
+            highlight_label=int(self.highlight_label),
         )
         native = vol.native
         mapped = vol.mapped
-        ax = compose_rgb(
-            slice_axial(vol.ct, self._k),
-            slice_axial(vol.pet, self._k),
-            slice_axial(native, self._k) if native is not None else None,
-            slice_axial(mapped, self._k) if mapped is not None else None,
-            **args,
+        self.axial.set_rgb(
+            compose_rgb(
+                slice_axial(vol.ct, self._k),
+                slice_axial(vol.pet, self._k),
+                slice_axial(native, self._k) if native is not None else None,
+                slice_axial(mapped, self._k) if mapped is not None else None,
+                **args,
+            )
         )
-        co = compose_rgb(
-            slice_coronal(vol.ct, self._j),
-            slice_coronal(vol.pet, self._j),
-            slice_coronal(native, self._j) if native is not None else None,
-            slice_coronal(mapped, self._j) if mapped is not None else None,
-            **args,
+        self.coronal.set_rgb(
+            compose_rgb(
+                slice_coronal(vol.ct, self._j),
+                slice_coronal(vol.pet, self._j),
+                slice_coronal(native, self._j) if native is not None else None,
+                slice_coronal(mapped, self._j) if mapped is not None else None,
+                **args,
+            )
         )
-        sa = compose_rgb(
-            slice_sagittal(vol.ct, self._i),
-            slice_sagittal(vol.pet, self._i),
-            slice_sagittal(native, self._i) if native is not None else None,
-            slice_sagittal(mapped, self._i) if mapped is not None else None,
-            **args,
+        self.sagittal.set_rgb(
+            compose_rgb(
+                slice_sagittal(vol.ct, self._i),
+                slice_sagittal(vol.pet, self._i),
+                slice_sagittal(native, self._i) if native is not None else None,
+                slice_sagittal(mapped, self._i) if mapped is not None else None,
+                **args,
+            )
         )
-        self.axial.set_rgb(ax)
-        self.coronal.set_rgb(co)
-        self.sagittal.set_rgb(sa)
         suv = float(vol.pet[self._i, self._j, self._k])
         hu = float(vol.ct[self._i, self._j, self._k])
+        lid = int(native[self._i, self._j, self._k]) if native is not None else 0
+        extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
-            f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  HU={hu:.0f}  SUV={suv:.2f}"
+            f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  "
+            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
         )

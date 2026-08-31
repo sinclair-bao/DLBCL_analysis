@@ -33,13 +33,15 @@ for _p in (str(_LONG), str(_COMMON), str(_SCRIPTS / "gui"), str(_SCRIPTS)):
 from catalog import DataCatalog  # noqa: E402
 from session import load_session, save_session  # noqa: E402
 
+from edit_panel import EditPanel  # noqa: E402
 from evolution_strip import EvolutionStrip  # noqa: E402
 from feature_panel import FeaturePanel  # noqa: E402
+from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume  # noqa: E402
 from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
-from volume_io import load_volume_set  # noqa: E402
-from workers import FeatureWorker, MappingWorker  # noqa: E402
+from volume_io import load_volume_set, save_edited_mask  # noqa: E402
+from workers import FeatureWorker, MappingWorker, SegmentWorker  # noqa: E402
 
 STYLESHEET = """
 QMainWindow, QWidget { background: #161616; color: #e8e8e8; }
@@ -74,10 +76,12 @@ class MainWindow(QMainWindow):
         self.current_date: Optional[str] = None
         self._map_worker: Optional[MappingWorker] = None
         self._feat_worker: Optional[FeatureWorker] = None
+        self._seg_worker: Optional[SegmentWorker] = None
         self._vol_cache: dict[tuple[str, str, str], object] = {}
 
         self.browser = PatientBrowser()
         self.timepoints = TimepointPanel()
+        self.edit_panel = EditPanel()
         self.ortho = OrthoViewer()
         self.evolution = EvolutionStrip()
         self.features = FeaturePanel()
@@ -92,6 +96,7 @@ class MainWindow(QMainWindow):
         right_l = QVBoxLayout(right)
         right_l.setContentsMargins(4, 4, 4, 4)
         right_l.addWidget(self.timepoints)
+        right_l.addWidget(self.edit_panel)
         right_l.addWidget(self.features, 1)
 
         center = QSplitter(Qt.Orientation.Vertical)
@@ -125,6 +130,13 @@ class MainWindow(QMainWindow):
         self.timepoints.features_requested.connect(self._run_features)
         self.ortho.chk_native.toggled.connect(self._refresh_evolution)
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
+        self.ortho.mask_changed.connect(self._refresh_lesion_table)
+        self.edit_panel.segment_requested.connect(self._on_segment)
+        self.edit_panel.morph_requested.connect(self._on_morph)
+        self.edit_panel.relabel_requested.connect(self._on_relabel)
+        self.edit_panel.undo_requested.connect(self.ortho.undo)
+        self.edit_panel.save_requested.connect(self._save_edited)
+        self.edit_panel.lesion_selected.connect(self._on_lesion_selected)
 
         self.browser.populate(self.catalog)
         n = len(self.catalog.patient_ids())
@@ -203,6 +215,12 @@ class MainWindow(QMainWindow):
         if role:
             vol.role = role
         self.ortho.set_volumes(vol)
+        self._refresh_lesion_table()
+        assets = self.catalog.get_study(patient_id, study_date)
+        if assets is not None and assets.working_lesion is None:
+            self.status.showMessage(
+                f"{patient_id}/{study_date} 尚无病灶 mask，可用 AutoPET / 阈值 / 空白手动分割"
+            )
 
     def _on_session_edit(self) -> None:
         if not self.current_patient:
@@ -249,7 +267,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "映射", "请先指定 baseline 以及至少一个随访时间点。")
             return
         self.timepoints.btn_map.setEnabled(False)
-        self._map_worker = MappingWorker(self.catalog, self.current_patient, overwrite=False)
+        self.edit_panel.set_busy(True)
+        self._map_worker = MappingWorker(self.catalog, self.current_patient, overwrite=True)
         self._map_worker.progress.connect(self.status.showMessage)
         self._map_worker.failed.connect(self._on_worker_fail)
         self._map_worker.finished_ok.connect(self._on_map_done)
@@ -257,6 +276,7 @@ class MainWindow(QMainWindow):
 
     def _on_map_done(self, msg: str) -> None:
         self.timepoints.btn_map.setEnabled(True)
+        self.edit_panel.set_busy(False)
         self._vol_cache.clear()
         self.catalog.refresh()
         self.browser.populate(self.catalog)
@@ -276,6 +296,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "特征", "请先指定至少一个时间点。")
             return
         self.timepoints.btn_feat.setEnabled(False)
+        self.edit_panel.set_busy(True)
         self._feat_worker = FeatureWorker(self.catalog, self.current_patient, include_radiomics=True)
         self._feat_worker.progress.connect(self.status.showMessage)
         self._feat_worker.failed.connect(self._on_worker_fail)
@@ -284,14 +305,135 @@ class MainWindow(QMainWindow):
 
     def _on_feat_done(self, csv_path: str) -> None:
         self.timepoints.btn_feat.setEnabled(True)
+        self.edit_panel.set_busy(False)
         self.features.load_csv(Path(csv_path))
         self.status.showMessage(f"特征已写入 {csv_path}")
 
     def _on_worker_fail(self, msg: str) -> None:
         self.timepoints.btn_map.setEnabled(True)
         self.timepoints.btn_feat.setEnabled(True)
+        self.edit_panel.set_busy(False)
         QMessageBox.warning(self, "任务失败", msg)
         self.status.showMessage(msg)
+
+    def _voxel_ml(self) -> float:
+        import numpy as np
+
+        vol = self.ortho.volumes()
+        if vol is None or vol.affine is None:
+            return 0.008
+        return abs(float(np.linalg.det(vol.affine[:3, :3]))) / 1000.0
+
+    def _refresh_lesion_table(self) -> None:
+        vol = self.ortho.volumes()
+        if vol is None:
+            self.edit_panel.set_lesions([])
+            return
+        rows = lesion_stats(vol.native, vol.pet, self._voxel_ml())
+        self.edit_panel.set_lesions(rows, selected=self.ortho.current_label)
+
+    def _on_lesion_selected(self, lid: int) -> None:
+        vol = self.ortho.volumes()
+        if lid > 0:
+            self.ortho.current_label = lid
+            self.ortho.highlight_label = lid
+        else:
+            self.ortho.highlight_label = 0
+            if vol is not None:
+                self.ortho.current_label = next_label(vol.native)
+        self.ortho.refresh()
+
+    def _on_segment(self, method: str) -> None:
+        if not self.current_patient or not self.current_date:
+            return
+        if method == "manual":
+            import numpy as np
+
+            vol = self.ortho.volumes()
+            if vol is None:
+                QMessageBox.information(self, "手动分割", "请先打开一次检查。")
+                return
+            self.ortho.apply_mask(np.zeros(vol.ct.shape, dtype=np.uint16), undo=True)
+            self.ortho.current_label = 1
+            self.ortho.highlight_label = 1
+            self.ortho.chk_edit.setChecked(True)
+            self.status.showMessage("已清空 mask，勾选「编辑 mask」后左键涂抹、右键擦除。")
+            return
+        self.edit_panel.set_busy(True)
+        self.timepoints.btn_map.setEnabled(False)
+        self.timepoints.btn_feat.setEnabled(False)
+        self._seg_worker = SegmentWorker(
+            method, self.current_patient, self.current_date, self.catalog
+        )
+        self._seg_worker.progress.connect(self.status.showMessage)
+        self._seg_worker.failed.connect(self._on_worker_fail)
+        self._seg_worker.finished_ok.connect(self._on_seg_done)
+        self._seg_worker.start()
+
+    def _on_seg_done(self, msg: str) -> None:
+        self.edit_panel.set_busy(False)
+        self.timepoints.btn_map.setEnabled(True)
+        self.timepoints.btn_feat.setEnabled(True)
+        self._vol_cache.clear()
+        self.catalog.refresh()
+        self.browser.populate(self.catalog)
+        if self.current_patient:
+            self.browser.select_patient(self.current_patient)
+            if self.current_date:
+                self._on_study(self.current_patient, self.current_date)
+        self.status.showMessage(msg)
+
+    def _on_morph(self, op: str) -> None:
+        vol = self.ortho.volumes()
+        if vol is None:
+            return
+        radius = int(self.edit_panel.spin_radius.value())
+        scope = self.edit_panel.combo_scope.currentData()
+        target = self.edit_panel.combo_target.currentData()
+        label = int(self.ortho.current_label) if target == "current" else 0
+        plane = self.ortho.active_view if scope == "slice" else None
+        ijk = self.ortho.ijk() if plane else None
+        new_mask = morph_labels(
+            vol.native, op, radius, label=label, plane=plane, ijk=ijk
+        )
+        self.ortho.apply_mask(new_mask)
+
+    def _on_relabel(self) -> None:
+        vol = self.ortho.volumes()
+        if vol is None:
+            return
+        self.ortho.apply_mask(relabel_by_volume(vol.native))
+        self.ortho.current_label = 1
+        self.ortho.highlight_label = 1
+
+    def _save_edited(self) -> None:
+        vol = self.ortho.volumes()
+        if vol is None or not self.current_patient or not self.current_date:
+            return
+        assets = self.catalog.get_study(self.current_patient, self.current_date)
+        if assets is None:
+            return
+        path = assets.edited_mask_path()
+        save_edited_mask(vol, path)
+        vol.dirty = False
+        self.catalog.refresh()
+        self._vol_cache.clear()
+        self.browser.populate(self.catalog)
+        if self.current_patient:
+            self.browser.select_patient(self.current_patient)
+        self.status.showMessage(f"已保存 {path.name}（未覆盖 nnU-Net 原 mask）")
+
+    def _about(self) -> None:
+        QMessageBox.information(
+            self,
+            "关于",
+            "DLBCL 纵向 PET/CT 分析软件\n"
+            "可读取分割；无 mask 时用 AutoPET / SUV 阈值 / 空白手动勾画。\n"
+            "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
+            "显示：仅 CT / 仅 PET / PET-CT；可调窗宽窗位与缩放。\n"
+            "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"
+            "红 = 本底 mask，黄 = 当前选中灶，青 = 映射的基线病灶床。",
+        )
 
     def _refresh(self) -> None:
         self.catalog.refresh()
@@ -327,13 +469,3 @@ class MainWindow(QMainWindow):
         if dest:
             self.features.save_plot_png(Path(dest))
             self.status.showMessage(f"已导出 {dest}")
-
-    def _about(self) -> None:
-        QMessageBox.information(
-            self,
-            "关于",
-            "DLBCL 纵向 PET/CT 分析软件\n"
-            "指定基线/中期/末期 → CT–CT 仿射映射基线病灶床\n"
-            "→ SUVmax / MTV / TLG 与影像组学。\n"
-            "红 = 本底 mask，青 = 映射的基线病灶床。",
-        )

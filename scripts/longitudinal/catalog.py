@@ -67,7 +67,8 @@ class StudyAssets:
     pet_iso: Optional[Path] = None
     pet_aligned: Optional[Path] = None
     ct_reference: Optional[Path] = None
-    lesion_mask: Optional[Path] = None
+    lesion_auto: Optional[Path] = None
+    lesion_edited: Optional[Path] = None
     organs: Optional[Path] = None
     pet_to_ct_mat: Optional[Path] = None
 
@@ -81,6 +82,23 @@ class StudyAssets:
         """影像组学 / 显示用 PET：优先同机刚体对齐后的 SUV，否则 2 mm PET。"""
         return self.pet_aligned or self.pet_iso
 
+    @property
+    def working_lesion(self) -> Optional[Path]:
+        """显示 / 映射 / 特征用 mask：人工调整副本优先。"""
+        return self.lesion_edited or self.lesion_auto
+
+    @property
+    def lesion_mask(self) -> Optional[Path]:
+        """兼容旧调用，等同 working_lesion。"""
+        return self.working_lesion
+
+    def edited_mask_path(self) -> Path:
+        return (
+            self.processed_dir
+            / "masks"
+            / f"{self.patient_id}_{self.study_date}_lesion_edited.nii.gz"
+        )
+
     def completeness(self) -> str:
         """
         ok      : 工作 CT + 工作 PET + 病灶 mask 齐全
@@ -89,7 +107,7 @@ class StudyAssets:
         """
         if self.working_ct is None or self.working_pet is None:
             return "missing"
-        if self.lesion_mask is None:
+        if self.working_lesion is None:
             return "partial"
         return "ok"
 
@@ -99,8 +117,10 @@ class StudyAssets:
             missing.append("CT")
         if self.working_pet is None:
             missing.append("PET")
-        if self.lesion_mask is None:
+        if self.working_lesion is None:
             missing.append("lesion")
+        elif self.lesion_edited is not None:
+            missing.append("edited")
         if self.pet_aligned is None:
             missing.append("intra-scan")
         if self.organs is None:
@@ -182,8 +202,11 @@ class DataCatalog:
             pet_iso=_first_glob(study_dir / "preprocessed" / "PET", "*_SUVbw.nii.gz"),
             pet_aligned=_first_glob(reg_dir, "pet_iso_aligned.nii.gz"),
             ct_reference=_first_glob(reg_dir, "ct_iso_reference.nii.gz"),
-            lesion_mask=_first_glob(
+            lesion_auto=_first_glob(
                 processed_dir / "masks", f"{patient_id}_{study_date}_lesion.nii.gz"
+            ),
+            lesion_edited=_first_glob(
+                processed_dir / "masks", f"{patient_id}_{study_date}_lesion_edited.nii.gz"
             ),
             organs=_first_glob(processed_dir / "organs", "organs.nii.gz"),
             pet_to_ct_mat=_first_glob(reg_dir, "pet_to_ct_0GenericAffine.mat"),

@@ -44,7 +44,7 @@ class TimepointPanel(QWidget):
         self.hint = QLabel("打开患者后，为基线/中期/末期各选一次检查。")
         self.hint.setWordWrap(True)
 
-        self.btn_map = QPushButton("计算基线 → 随访映射")
+        self.btn_map = QPushButton("将基线病灶映射到中期/末期")
         self.btn_feat = QPushButton("计算代谢 / 组学特征")
         self.btn_map.clicked.connect(self.map_requested.emit)
         self.btn_feat.clicked.connect(self.features_requested.emit)
@@ -54,7 +54,6 @@ class TimepointPanel(QWidget):
         layout.addWidget(self.hint)
         layout.addWidget(self.btn_map)
         layout.addWidget(self.btn_feat)
-        layout.addStretch(1)
 
     def set_dates(self, dates: list[str], session: LongitudinalSession) -> None:
         self._suppress = True

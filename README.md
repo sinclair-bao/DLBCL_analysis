@@ -176,11 +176,15 @@ DLBCL/
 │   │   ├── app.py                   # 入口：python scripts/gui/app.py
 │   │   ├── main_window.py           # 总布局、菜单导出
 │   │   ├── patient_browser.py       # 患者树与完整性状态灯
-│   │   ├── timepoint_panel.py       # 三个角色下拉框
-│   │   ├── ortho_viewer.py          # 轴/冠/矢 CT+PET 融合
+│   │   ├── timepoint_panel.py       # 三个角色下拉框 + 映射按钮
+│   │   ├── edit_panel.py            # AutoPET / 阈值 / 画笔形态学 / 病灶表
+│   │   ├── mask_ops.py              # 连通域编号、二维画笔、膨胀腐蚀
+│   │   ├── display_utils.py         # CT/PET/融合、窗宽窗位、显示坐标
+│   │   ├── volume_io.py             # 读入编号 mask；另存 lesion_edited
+│   │   ├── ortho_viewer.py          # 轴/冠/矢 + 窗宽窗位 + 二维画笔
 │   │   ├── evolution_strip.py       # 三时间点冠状 MIP
 │   │   ├── feature_panel.py         # 特征表与折线
-│   │   └── workers.py               # QThread：映射 / 组学
+│   │   └── workers.py               # QThread：映射 / 组学 / AutoPET
 │   └── analysis/
 │       └── plot_results.py          # 队列特征分布图（占位）
 │
@@ -650,13 +654,29 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 映射与演变至少需要 **baseline + 一个随访**。三个角色不能指向同一检查日期。
 
+**读取与生成分割：**
+
+- 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
+- 无 mask 时：右侧 **AutoPET 分割**（`autopet` 环境，缺 export 会先导出）、**SUV 阈值分割**，或 **空白手动分割**
+- 勾选「编辑 mask」后在当前轴/冠/矢切片上 **左键涂抹、右键擦除**；笔刷半径可调
+- 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，作用于当前层或三维、当前灶或全部
+- 连通域自动编号，列表显示体素 / 体积 / SUVmax；可按体积重新编号
+- **保存调整后的 mask** 写入 sidecar，不覆盖 nnU-Net 原文件
+
+**显示：**
+
+- 单选：仅 CT / 仅 PET / PET-CT 融合
+- CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放
+
 **跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
+
+按钮 **「将基线病灶映射到中期/末期」**。moving mask 为基线 `working_lesion`（edited 优先）。
 
 DLBCL 病灶会消退或进展，强变形容易把病灶床拉碎，因此只用刚体+仿射把基线解剖位置对到随访 CT。
 
 - 工作网格：2 mm 各向同性 CT（`ct_iso_reference.nii.gz` 优先，否则 `preprocessed/CT`）
 - fixed = 随访 CT，moving = 基线 CT；`Rigid[0.1]` 再 `Affine[0.1]`，度量 MI
-- `antsApplyTransforms -n GenericLabel` 把基线 `*_lesion.nii.gz` 拉到随访网格
+- `antsApplyTransforms -n GenericLabel` 把基线病灶 mask 拉到随访网格
 - ANTs 子进程单线程（`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1`），信号崩溃时自动降尺度重试
 
 ```
@@ -671,7 +691,7 @@ data/processed/<ID>/<FollowupDate>/longitudinal/
 
 | ROI | 含义 |
 |-----|------|
-| `native_lesion` | 该次检查 nnU-Net 病灶（当时肿瘤负荷） |
+| `native_lesion` | 该次检查工作 mask（edited 优先，否则 nnU-Net / 阈值） |
 | `baseline_mapped` | 基线病灶床映射到该次检查（仅随访；用于看原病灶床内残留摄取） |
 
 | 参数 | 说明 |
@@ -688,21 +708,21 @@ data/processed/<ID>/<FollowupDate>/longitudinal/
 
 ```
 ┌────────────┬──────────────────────────────┬─────────────────┐
-│ 患者列表    │ 当前检查 轴/冠/矢 三视图       │ 时间点指定       │
-│ 绿/黄/红灯  │ CT 灰阶 + PET 伪彩 + mask     │ Baseline/Interim│
-│            │ 层厚滑条、融合透明度、SUV 上限  │ /End 下拉框      │
+│ 患者列表    │ 当前检查 轴/冠/矢 三视图       │ 时间点 / 分割    │
+│ 绿/黄/红灯  │ CT / PET / 融合 + 窗宽窗位    │ 画笔 / 形态学    │
+│            │ 编辑 mask：左涂右擦            │ 病灶编号表       │
 ├────────────┼──────────────────────────────┼─────────────────┤
 │            │ 最多三列冠状 MIP 演变条         │ 特征表 + 折线    │
-│            │ 本底 mask / 映射 mask 开关     │ SUVmax/MTV/TLG  │
 └────────────┴──────────────────────────────┴─────────────────┘
 ```
 
 | Overlay | 颜色 | 含义 |
 |---------|------|------|
-| 本底 mask | 红 | 当前检查 nnU-Net 分割 |
+| 本底 mask | 红 | 当前检查分割（nnU-Net / 阈值 / 手动） |
+| 当前选中灶 | 黄 | 编号列表中选中的病灶 |
 | 映射 mask | 青 | 基线病灶床 warp 到当前检查 |
 
-二者并存才能对比「旧病灶消退 vs 新病灶出现」。映射与组学在 `QThread` 中运行，不卡住界面。菜单可导出特征 CSV、MIP PNG、折线 PNG。
+二者并存才能对比「旧病灶消退 vs 新病灶出现」。分割、映射与组学在 `QThread` 中运行。菜单可导出特征 CSV、MIP PNG、折线 PNG。
 
 同机 PET–CT 配准不在 GUI 内重算；缺 `pet_iso_aligned.nii.gz` 时 PET 回退到 `preprocessed/PET`。患者树状态灯：绿 = CT+PET+lesion 齐全，黄 = 缺 mask 或同机配准，红 = 缺 CT 或 PET。
 
@@ -723,7 +743,7 @@ python scripts/longitudinal/features.py --patient-id 00136597
 python scripts/longitudinal/features.py --no-radiomics   # 只要代谢参数
 ```
 
-一期不做：SyN 变形、跨时间点病灶 instance 匹配、GUI 内调用 nnU-Net / TotalSegmentator、自动 Deauville / Lugano 分期。
+一期不做：三维画笔、层间插值、SyN 变形、覆盖原始 nnU-Net 文件、自动 Deauville / Lugano 分期。
 
 ---
 
@@ -887,10 +907,10 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 
 | 模块 | 说明 |
 |------|------|
-| `catalog.py` | 索引 2 mm CT/PET、同机配准、lesion/器官 mask；缺文件用状态灯表示 |
+| `catalog.py` | 索引 2 mm CT/PET、同机配准、lesion / lesion_edited、器官 mask |
 | `session.py` | `longitudinal_session.json`：baseline / interim / end |
 | `ants_runner.py` | ANTs 单线程 env + 负退出码检测，供跨检查配准复用 |
-| `interscan_register.py` | 基线 CT → 随访 CT 刚体+仿射，GenericLabel 映射 mask |
+| `interscan_register.py` | 基线 CT → 随访 CT 刚体+仿射；mask 用 working_lesion（edited 优先） |
 | `features.py` | SUVmax / SUVpeak / MTV / TLG + 肝脾参考 + pyradiomics |
 | `radiomics_params.yaml` | 组学：Original + shape/firstorder/GLCM |
 
@@ -902,9 +922,11 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 |------|------|
 | 技术 | PySide6 + pyqtgraph（切片）+ matplotlib（MIP / 折线） |
 | 入口 | `python scripts/gui/app.py` |
-| 交互 | 选患者 → 指定时间点 → 计算映射 → 正交浏览 / MIP 演变 → 特征表 |
-| Overlay | 红 = 本底 nnU-Net mask；青 = 映射的基线病灶床 |
-| 后台线程 | `MappingWorker` / `FeatureWorker`，避免 ANTs 与组学卡住 UI |
+| 交互 | 选患者 → 指定时间点 → 分割/微调 → 映射到随访 → MIP 与特征表 |
+| Overlay | 红 = 本底 mask；黄 = 当前灶；青 = 映射的基线病灶床 |
+| 分割 | AutoPET / SUV 阈值 / 空白手动；画笔 + 膨胀腐蚀；另存 edited |
+| 显示 | 仅 CT / 仅 PET / 融合；窗宽窗位、SUV 窗、缩放 |
+| 后台线程 | `MappingWorker` / `FeatureWorker` / `SegmentWorker` |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |
 
 ---
