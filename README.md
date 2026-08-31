@@ -177,11 +177,12 @@ DLBCL/
 │   │   ├── main_window.py           # 总布局、菜单导出
 │   │   ├── patient_browser.py       # 患者树与完整性状态灯
 │   │   ├── timepoint_panel.py       # 三个角色下拉框 + 映射按钮
-│   │   ├── edit_panel.py            # AutoPET / 阈值 / 画笔形态学 / 病灶表
+│   │   ├── edit_panel.py            # AutoPET / 阈值 / 空白 / 载入 mask
+│   │   ├── segment_editor.py        # 3×3 CT/PET/融合 × 轴/冠/矢 编辑弹窗
 │   │   ├── mask_ops.py              # 连通域编号、二维画笔、膨胀腐蚀
 │   │   ├── display_utils.py         # CT/PET/融合、窗宽窗位、显示坐标
 │   │   ├── volume_io.py             # 读入编号 mask；另存 lesion_edited
-│   │   ├── ortho_viewer.py          # 轴/冠/矢 + 窗宽窗位 + 二维画笔
+│   │   ├── ortho_viewer.py          # 轴/冠/矢 + 窗宽窗位 + 十字线 + 画笔
 │   │   ├── evolution_strip.py       # 三时间点冠状 MIP
 │   │   ├── feature_panel.py         # 特征表与折线
 │   │   └── workers.py               # QThread：映射 / 组学 / AutoPET
@@ -657,17 +658,18 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **读取与生成分割：**
 
 - 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
-- 无 mask 时：右侧 **AutoPET 分割**（`autopet` 环境，缺 export 会先导出）、**SUV 阈值分割**，或 **空白手动分割**
-- 勾选「编辑 mask」后在当前轴/冠/矢切片上 **左键涂抹、右键擦除**；笔刷半径可调
+- 无 mask 时：右侧 **AutoPET 分割**、**SUV 阈值分割**、**空白手动分割**，或 **其他（载入已有 mask）**
+- 四种入口都会打开 **3×3 编辑窗**（行：CT / PET / 融合；列：轴 / 冠 / 矢）。任一格左涂右擦，mask 实时同步到其余格
+- **保存并关闭** 写入 sidecar `{ID}_{Date}_lesion_edited.nii.gz`；取消不改主窗口
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，作用于当前层或三维、当前灶或全部
 - 连通域自动编号，列表显示体素 / 体积 / SUVmax；可按体积重新编号
-- **保存调整后的 mask** 写入 sidecar，不覆盖 nnU-Net 原文件
 
 **显示：**
 
 - 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 为 **灰度**（按 SUV 窗），mask 仍为红/黄/青
-- CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放
-- 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动以免裁切控件
+- CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（可关）
+- 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动
+- **患者列表**：F2 或工具栏「患者」手动显隐；默认在选中一次检查后自动隐藏
 
 **跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
 
@@ -925,8 +927,9 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 | 入口 | `python scripts/gui/app.py` |
 | 交互 | 选患者 → 指定时间点 → 分割/微调 → 映射到随访 → MIP 与特征表 |
 | Overlay | 红 = 本底 mask；黄 = 当前灶；青 = 映射的基线病灶床 |
-| 分割 | AutoPET / SUV 阈值 / 空白手动；画笔 + 膨胀腐蚀；另存 edited |
-| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；窗宽窗位、SUV 窗、缩放；窗口按显示器适配 |
+| 分割 | AutoPET / SUV 阈值 / 空白 / 载入已有 mask；3×3 弹窗画笔同步；另存 edited |
+| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；十字线；窗宽窗位、SUV 窗、缩放；窗口按屏适配 |
+| 患者栏 | F2 /「患者」按钮显隐；选中检查后可自动隐藏 |
 | 后台线程 | `MappingWorker` / `FeatureWorker` / `SegmentWorker` |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |
 

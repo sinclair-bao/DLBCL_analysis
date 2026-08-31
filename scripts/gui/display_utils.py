@@ -122,6 +122,22 @@ def display_to_voxel(
     )
 
 
+def voxel_to_display(
+    view: str,
+    i: int,
+    j: int,
+    k: int,
+    shape: tuple[int, int, int],
+) -> tuple[float, float]:
+    """RAS 体素 (i, j, k) → 显示图 (col, row)。"""
+    nx, ny, nz = shape
+    if view == "axial":
+        return float(nx - 1 - i), float(j)
+    if view == "coronal":
+        return float(nx - 1 - i), float(nz - 1 - k)
+    return float(j), float(nz - 1 - k)
+
+
 def _blend(rgb: np.ndarray, hit: np.ndarray, color: np.ndarray, alpha: float) -> None:
     if not np.any(hit):
         return

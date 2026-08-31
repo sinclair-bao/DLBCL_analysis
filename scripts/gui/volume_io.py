@@ -69,6 +69,15 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
     )
 
 
+def load_mask_from_path(path, vol: VolumeSet) -> np.ndarray:
+    """把任意 NIfTI mask 最近邻重采样到工作 CT 网格并编号。"""
+    if vol.affine is None:
+        raise ValueError("体积缺少仿射，无法重采样 mask")
+    ref = nib.Nifti1Image(np.zeros(vol.ct.shape, dtype=np.uint16), vol.affine)
+    raw = _to_ref(path, ref, order=0, dtype=np.uint16)
+    return ensure_labeled(raw)
+
+
 def save_edited_mask(vol: VolumeSet, out_path) -> None:
     """把当前编号 mask 写成 uint16 NIfTI，仿射与工作 CT 一致。"""
     from pathlib import Path

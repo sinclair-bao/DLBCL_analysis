@@ -19,9 +19,11 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSplitter,
     QStatusBar,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -43,7 +45,7 @@ from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume  
 from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
-from volume_io import load_volume_set, save_edited_mask  # noqa: E402
+from volume_io import load_mask_from_path, load_volume_set, save_edited_mask  # noqa: E402
 from workers import FeatureWorker, MappingWorker, SegmentWorker  # noqa: E402
 
 STYLESHEET = """
@@ -81,6 +83,8 @@ class MainWindow(QMainWindow):
         self._feat_worker: Optional[FeatureWorker] = None
         self._seg_worker: Optional[SegmentWorker] = None
         self._vol_cache: dict[tuple[str, str, str], object] = {}
+        self._browser_width = 0
+        self._open_editor_after_seg = False
 
         self.browser = PatientBrowser()
         self.timepoints = TimepointPanel()
@@ -90,6 +94,7 @@ class MainWindow(QMainWindow):
         self.features = FeaturePanel()
 
         left = QWidget()
+        self._left_panel = left
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(4, 4, 4, 4)
         left_l.addWidget(QLabel("患者"))
@@ -130,6 +135,7 @@ class MainWindow(QMainWindow):
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self._build_toolbar()
         self._build_menu()
         self._fit_to_screen()
 
@@ -176,10 +182,63 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
+        view_menu = self.menuBar().addMenu("视图")
+        self.act_show_browser = QAction("显示患者列表", self)
+        self.act_show_browser.setCheckable(True)
+        self.act_show_browser.setChecked(True)
+        self.act_show_browser.setShortcut(QKeySequence("F2"))
+        self.act_show_browser.toggled.connect(self._set_browser_visible)
+        view_menu.addAction(self.act_show_browser)
+
+        self.act_auto_hide = QAction("选择检查后自动隐藏患者列表", self)
+        self.act_auto_hide.setCheckable(True)
+        self.act_auto_hide.setChecked(True)
+        view_menu.addAction(self.act_auto_hide)
+
         help_menu = self.menuBar().addMenu("帮助")
         act_about = QAction("关于", self)
         act_about.triggered.connect(self._about)
         help_menu.addAction(act_about)
+
+    def _build_toolbar(self) -> None:
+        tb = QToolBar("视图")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        self.btn_patients = QPushButton("患者")
+        self.btn_patients.setCheckable(True)
+        self.btn_patients.setChecked(True)
+        self.btn_patients.setToolTip("显示 / 隐藏患者列表（F2）")
+        self.btn_patients.clicked.connect(self._set_browser_visible)
+        tb.addWidget(self.btn_patients)
+
+    def _set_browser_visible(self, visible: bool) -> None:
+        sizes = self._main_split.sizes()
+        total = max(sum(sizes), 1)
+        currently = sizes[0] > 12
+        if bool(visible) == currently:
+            self.act_show_browser.blockSignals(True)
+            self.act_show_browser.setChecked(bool(visible))
+            self.act_show_browser.blockSignals(False)
+            self.btn_patients.blockSignals(True)
+            self.btn_patients.setChecked(bool(visible))
+            self.btn_patients.blockSignals(False)
+            return
+        if visible:
+            left = self._browser_width or max(int(total * 0.18), 180)
+            rest = max(total - left, 1)
+            mid = int(rest * 0.70)
+            right = rest - mid
+            self._main_split.setSizes([left, mid, right])
+        else:
+            if sizes[0] > 12:
+                self._browser_width = sizes[0]
+            self._main_split.setSizes([0, sizes[0] + sizes[1], sizes[2]])
+        self.act_show_browser.blockSignals(True)
+        self.act_show_browser.setChecked(bool(visible))
+        self.act_show_browser.blockSignals(False)
+        self.btn_patients.blockSignals(True)
+        self.btn_patients.setChecked(bool(visible))
+        self.btn_patients.blockSignals(False)
 
     def _fit_to_screen(self) -> None:
         """按当前显示器可用区域缩放窗口，并设置分栏比例。"""
@@ -249,6 +308,8 @@ class MainWindow(QMainWindow):
             vol.role = role
         self.ortho.set_volumes(vol)
         self._refresh_lesion_table()
+        if self.act_auto_hide.isChecked():
+            self._set_browser_visible(False)
         assets = self.catalog.get_study(patient_id, study_date)
         if assets is not None and assets.working_lesion is None:
             self.status.showMessage(
@@ -348,6 +409,7 @@ class MainWindow(QMainWindow):
         self.edit_panel.set_busy(False)
         QMessageBox.warning(self, "任务失败", msg)
         self.status.showMessage(msg)
+        self._open_editor_after_seg = False
 
     def _voxel_ml(self) -> float:
         import numpy as np
@@ -379,22 +441,23 @@ class MainWindow(QMainWindow):
     def _on_segment(self, method: str) -> None:
         if not self.current_patient or not self.current_date:
             return
+        vol = self.ortho.volumes()
+        if vol is None:
+            QMessageBox.information(self, "分割", "请先打开一次检查。")
+            return
         if method == "manual":
             import numpy as np
 
-            vol = self.ortho.volumes()
-            if vol is None:
-                QMessageBox.information(self, "手动分割", "请先打开一次检查。")
-                return
-            self.ortho.apply_mask(np.zeros(vol.ct.shape, dtype=np.uint16), undo=True)
-            self.ortho.current_label = 1
-            self.ortho.highlight_label = 1
-            self.ortho.chk_edit.setChecked(True)
-            self.status.showMessage("已清空 mask，勾选「编辑 mask」后左键涂抹、右键擦除。")
+            start = np.zeros(vol.ct.shape, dtype=np.uint16)
+            self._open_segment_editor(start)
+            return
+        if method == "other":
+            self._load_other_mask()
             return
         self.edit_panel.set_busy(True)
         self.timepoints.btn_map.setEnabled(False)
         self.timepoints.btn_feat.setEnabled(False)
+        self._open_editor_after_seg = True
         self._seg_worker = SegmentWorker(
             method, self.current_patient, self.current_date, self.catalog
         )
@@ -402,6 +465,46 @@ class MainWindow(QMainWindow):
         self._seg_worker.failed.connect(self._on_worker_fail)
         self._seg_worker.finished_ok.connect(self._on_seg_done)
         self._seg_worker.start()
+
+    def _load_other_mask(self) -> None:
+        vol = self.ortho.volumes()
+        if vol is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "载入已有 mask",
+            str(self.catalog.processed_root / self.current_patient / self.current_date / "masks"),
+            "NIfTI (*.nii.gz *.nii)",
+        )
+        if not path:
+            return
+        try:
+            mask = load_mask_from_path(path, vol)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "载入 mask", f"无法重采样到当前 CT 网格：\n{exc}")
+            return
+        self._open_segment_editor(mask)
+
+    def _open_segment_editor(self, mask=None) -> None:
+        from dataclasses import replace
+
+        import numpy as np
+
+        from segment_editor import SegmentEditorDialog
+
+        vol = self.ortho.volumes()
+        if vol is None:
+            return
+        native = np.asarray(mask if mask is not None else vol.native, dtype=np.uint16).copy()
+        work = replace(vol, native=native, dirty=False, _undo=[])
+        dlg = SegmentEditorDialog(work, self)
+        if dlg.exec() != SegmentEditorDialog.DialogCode.Accepted:
+            return
+        vol.native = np.array(dlg.edited_mask(), copy=True, dtype=np.uint16)
+        vol.dirty = True
+        self.ortho.refresh()
+        self._save_edited()
+        self._refresh_lesion_table()
 
     def _on_seg_done(self, msg: str) -> None:
         self.edit_panel.set_busy(False)
@@ -415,6 +518,9 @@ class MainWindow(QMainWindow):
             if self.current_date:
                 self._on_study(self.current_patient, self.current_date)
         self.status.showMessage(msg)
+        if self._open_editor_after_seg:
+            self._open_editor_after_seg = False
+            self._open_segment_editor()
 
     def _on_morph(self, op: str) -> None:
         vol = self.ortho.volumes()
@@ -461,9 +567,9 @@ class MainWindow(QMainWindow):
             self,
             "关于",
             "DLBCL 纵向 PET/CT 分析软件\n"
-            "可读取分割；无 mask 时用 AutoPET / SUV 阈值 / 空白手动勾画。\n"
+            "四种分割入口打开 3×3 编辑窗（CT/PET/融合 × 轴/冠/矢），一格绘制同步全部。\n"
             "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
-            "显示：仅 CT / 仅 PET（灰度）/ PET-CT；可调窗宽窗位与缩放；窗口按显示器适配。\n"
+            "显示：仅 CT / 仅 PET（灰度）/ PET-CT；十字线与患者列表可隐藏（F2）。\n"
             "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"
             "红 = 本底 mask，黄 = 当前选中灶，青 = 映射的基线病灶床。",
         )

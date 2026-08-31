@@ -37,13 +37,16 @@ class EditPanel(QWidget):
         self.btn_autopet = QPushButton("AutoPET 分割")
         self.btn_threshold = QPushButton("SUV 阈值分割")
         self.btn_manual = QPushButton("空白手动分割")
+        self.btn_other = QPushButton("其他（载入 mask）")
         self.btn_autopet.clicked.connect(lambda: self.segment_requested.emit("autopet"))
         self.btn_threshold.clicked.connect(lambda: self.segment_requested.emit("threshold"))
         self.btn_manual.clicked.connect(lambda: self.segment_requested.emit("manual"))
+        self.btn_other.clicked.connect(lambda: self.segment_requested.emit("other"))
         seg_l.addWidget(self.btn_autopet)
         seg_l.addWidget(self.btn_threshold)
         seg_l.addWidget(self.btn_manual)
-        self.lbl_seg = QLabel("有 mask 时可微调；无 mask 请先分割或空白勾画。")
+        seg_l.addWidget(self.btn_other)
+        self.lbl_seg = QLabel("四种入口都会打开 3×3 编辑窗（CT/PET/融合 × 轴/冠/矢）。")
         self.lbl_seg.setWordWrap(True)
         seg_l.addWidget(self.lbl_seg)
         seg_box.setLayout(seg_l)
@@ -114,6 +117,7 @@ class EditPanel(QWidget):
             self.btn_autopet,
             self.btn_threshold,
             self.btn_manual,
+            self.btn_other,
             self.btn_dilate,
             self.btn_erode,
             self.btn_open,

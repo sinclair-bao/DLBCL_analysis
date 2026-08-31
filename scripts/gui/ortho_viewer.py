@@ -33,6 +33,7 @@ from display_utils import (
     slice_axial,
     slice_coronal,
     slice_sagittal,
+    voxel_to_display,
 )
 from mask_ops import paint_disk, promote_new_islands
 from volume_io import VolumeSet
@@ -82,7 +83,24 @@ class _RgbView(pg.GraphicsLayoutWidget):
         self.box.disableAutoRange()
         self.item = _PaintItem()
         self.box.addItem(self.item)
+        pen = pg.mkPen("#00e5ff", width=1)
+        self.vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+        self.hline = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+        self.vline.setZValue(10)
+        self.hline.setZValue(10)
+        self.vline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.hline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.box.addItem(self.vline)
+        self.box.addItem(self.hline)
         self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
+
+    def set_crosshair(self, col: float, row: float) -> None:
+        self.vline.setPos(col)
+        self.hline.setPos(row)
+
+    def set_crosshair_visible(self, on: bool) -> None:
+        self.vline.setVisible(on)
+        self.hline.setVisible(on)
 
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
@@ -147,11 +165,14 @@ class OrthoViewer(QWidget):
         self.chk_native = QCheckBox("本底 mask")
         self.chk_mapped = QCheckBox("映射 mask")
         self.chk_edit = QCheckBox("编辑 mask")
+        self.chk_crosshair = QCheckBox("十字线")
         self.chk_native.setChecked(True)
         self.chk_mapped.setChecked(True)
+        self.chk_crosshair.setChecked(True)
         self.chk_native.toggled.connect(self.refresh)
         self.chk_mapped.toggled.connect(self.refresh)
         self.chk_edit.toggled.connect(self._toggle_edit)
+        self.chk_crosshair.toggled.connect(self.refresh)
 
         self.spin_alpha = QDoubleSpinBox()
         self.spin_alpha.setRange(0.0, 1.0)
@@ -224,6 +245,7 @@ class OrthoViewer(QWidget):
             self.chk_native,
             self.chk_mapped,
             self.chk_edit,
+            self.chk_crosshair,
             QLabel("笔刷"),
             self.spin_brush,
             QLabel("窗位"),
@@ -271,6 +293,7 @@ class OrthoViewer(QWidget):
             self.lbl_pos.setText("无图像")
             for view in (self.axial, self.coronal, self.sagittal):
                 view.item.clear()
+                view.set_crosshair_visible(False)
             return
         nx, ny, nz = vol.ct.shape
         self.slider_i.blockSignals(True)
@@ -428,3 +451,17 @@ class OrthoViewer(QWidget):
             f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  "
             f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
         )
+        self._update_crosshairs()
+
+    def _update_crosshairs(self) -> None:
+        vol = self._vol
+        views = (self.axial, self.coronal, self.sagittal)
+        on = self.chk_crosshair.isChecked()
+        for v in views:
+            v.set_crosshair_visible(on)
+        if vol is None or not on:
+            return
+        shape = vol.ct.shape
+        for v in views:
+            col, row = voxel_to_display(v.view_name, self._i, self._j, self._k, shape)
+            v.set_crosshair(col, row)
