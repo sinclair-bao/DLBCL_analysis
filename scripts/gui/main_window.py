@@ -12,11 +12,14 @@ from typing import Optional
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -51,7 +54,7 @@ QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: 
 QPushButton { background: #2b4c7e; border: none; padding: 6px 10px; border-radius: 3px; }
 QPushButton:hover { background: #3a64a8; }
 QPushButton:disabled { background: #333; color: #777; }
-QComboBox, QDoubleSpinBox { background: #222; border: 1px solid #444; padding: 2px 6px; }
+QComboBox, QDoubleSpinBox, QSpinBox { background: #222; border: 1px solid #444; padding: 2px 6px; }
 QHeaderView::section { background: #2a2a2a; color: #ddd; padding: 4px; border: 0; }
 QStatusBar { background: #111; color: #aaa; }
 QMenuBar { background: #1a1a1a; color: #ddd; }
@@ -68,8 +71,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("DLBCL 纵向 PET/CT 分析")
-        self.resize(1600, 980)
         self.setStyleSheet(STYLESHEET)
+        self.setMinimumSize(1100, 680)
 
         self.catalog = DataCatalog(interim_root, processed_root)
         self.current_patient: Optional[str] = None
@@ -92,36 +95,43 @@ class MainWindow(QMainWindow):
         left_l.addWidget(QLabel("患者"))
         left_l.addWidget(self.browser, 1)
 
-        right = QWidget()
-        right_l = QVBoxLayout(right)
+        right_inner = QWidget()
+        right_l = QVBoxLayout(right_inner)
         right_l.setContentsMargins(4, 4, 4, 4)
         right_l.addWidget(self.timepoints)
         right_l.addWidget(self.edit_panel)
         right_l.addWidget(self.features, 1)
 
-        center = QSplitter(Qt.Orientation.Vertical)
-        center.addWidget(self.ortho)
-        center.addWidget(self.evolution)
-        center.setStretchFactor(0, 3)
-        center.setStretchFactor(1, 1)
+        right = QScrollArea()
+        right.setWidgetResizable(True)
+        right.setFrameShape(QFrame.Shape.NoFrame)
+        right.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right.setWidget(right_inner)
 
-        split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(left)
-        split.addWidget(center)
-        split.addWidget(right)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 4)
-        split.setStretchFactor(2, 2)
+        self._center_split = QSplitter(Qt.Orientation.Vertical)
+        self._center_split.addWidget(self.ortho)
+        self._center_split.addWidget(self.evolution)
+        self._center_split.setStretchFactor(0, 3)
+        self._center_split.setStretchFactor(1, 1)
+
+        self._main_split = QSplitter(Qt.Orientation.Horizontal)
+        self._main_split.addWidget(left)
+        self._main_split.addWidget(self._center_split)
+        self._main_split.addWidget(right)
+        self._main_split.setStretchFactor(0, 1)
+        self._main_split.setStretchFactor(1, 4)
+        self._main_split.setStretchFactor(2, 2)
 
         wrapper = QWidget()
         wrap_l = QHBoxLayout(wrapper)
         wrap_l.setContentsMargins(0, 0, 0, 0)
-        wrap_l.addWidget(split)
+        wrap_l.addWidget(self._main_split)
         self.setCentralWidget(wrapper)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self._build_menu()
+        self._fit_to_screen()
 
         self.browser.patient_selected.connect(self._on_patient)
         self.browser.study_selected.connect(self._on_study)
@@ -170,6 +180,29 @@ class MainWindow(QMainWindow):
         act_about = QAction("关于", self)
         act_about.triggered.connect(self._about)
         help_menu.addAction(act_about)
+
+    def _fit_to_screen(self) -> None:
+        """按当前显示器可用区域缩放窗口，并设置分栏比例。"""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1600, 980)
+            w, h = 1600, 980
+        else:
+            geo = screen.availableGeometry()
+            if geo.height() < 900 or geo.width() < 1400:
+                self.setGeometry(geo)
+                self.showMaximized()
+                w, h = geo.width(), geo.height()
+            else:
+                w = min(geo.width(), max(int(geo.width() * 0.94), 1200))
+                h = min(geo.height(), max(int(geo.height() * 0.94), 720))
+                self.resize(w, h)
+                self.move(
+                    geo.x() + (geo.width() - w) // 2,
+                    geo.y() + (geo.height() - h) // 2,
+                )
+        self._main_split.setSizes([int(w * 0.18), int(w * 0.58), int(w * 0.24)])
+        self._center_split.setSizes([int(h * 0.78), int(h * 0.22)])
 
     def _session(self):
         if not self.current_patient:
@@ -430,7 +463,7 @@ class MainWindow(QMainWindow):
             "DLBCL 纵向 PET/CT 分析软件\n"
             "可读取分割；无 mask 时用 AutoPET / SUV 阈值 / 空白手动勾画。\n"
             "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
-            "显示：仅 CT / 仅 PET / PET-CT；可调窗宽窗位与缩放。\n"
+            "显示：仅 CT / 仅 PET（灰度）/ PET-CT；可调窗宽窗位与缩放；窗口按显示器适配。\n"
             "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"
             "红 = 本底 mask，黄 = 当前选中灶，青 = 映射的基线病灶床。",
         )

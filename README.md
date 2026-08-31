@@ -665,8 +665,9 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 **显示：**
 
-- 单选：仅 CT / 仅 PET / PET-CT 融合
+- 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 为 **灰度**（按 SUV 窗），mask 仍为红/黄/青
 - CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放
+- 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动以免裁切控件
 
 **跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
 
@@ -925,7 +926,7 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 | 交互 | 选患者 → 指定时间点 → 分割/微调 → 映射到随访 → MIP 与特征表 |
 | Overlay | 红 = 本底 mask；黄 = 当前灶；青 = 映射的基线病灶床 |
 | 分割 | AutoPET / SUV 阈值 / 空白手动；画笔 + 膨胀腐蚀；另存 edited |
-| 显示 | 仅 CT / 仅 PET / 融合；窗宽窗位、SUV 窗、缩放 |
+| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；窗宽窗位、SUV 窗、缩放；窗口按显示器适配 |
 | 后台线程 | `MappingWorker` / `FeatureWorker` / `SegmentWorker` |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |
 

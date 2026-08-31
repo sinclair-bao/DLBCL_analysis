@@ -13,10 +13,12 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDoubleSpinBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -74,7 +76,7 @@ class _RgbView(pg.GraphicsLayoutWidget):
     def __init__(self, title: str, view_name: str) -> None:
         super().__init__()
         self.view_name = view_name
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(120)
         self.box = self.addViewBox(lockAspect=True, invertY=True)
         self.box.setMenuEnabled(False)
         self.box.disableAutoRange()
@@ -190,43 +192,67 @@ class OrthoViewer(QWidget):
         self.spin_brush.valueChanged.connect(lambda v: setattr(self, "brush_radius", int(v)))
 
         self.lbl_pos = QLabel("—")
+        self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        for spin in (
+            self.spin_alpha,
+            self.spin_suv_min,
+            self.spin_suv_max,
+            self.spin_wl,
+            self.spin_ww,
+            self.spin_zoom,
+            self.spin_brush,
+        ):
+            spin.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            spin.setMaximumWidth(90)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("轴位"))
-        row1.addWidget(self.slider_k, 1)
-        row1.addWidget(QLabel("冠状"))
-        row1.addWidget(self.slider_j, 1)
-        row1.addWidget(QLabel("矢状"))
-        row1.addWidget(self.slider_i, 1)
-        row1.addWidget(self.radio_fusion)
-        row1.addWidget(self.radio_ct)
-        row1.addWidget(self.radio_pet)
+        slice_row = QHBoxLayout()
+        slice_row.addWidget(QLabel("轴位"))
+        slice_row.addWidget(self.slider_k, 1)
+        slice_row.addWidget(QLabel("冠状"))
+        slice_row.addWidget(self.slider_j, 1)
+        slice_row.addWidget(QLabel("矢状"))
+        slice_row.addWidget(self.slider_i, 1)
+        slice_row.addWidget(self.radio_fusion)
+        slice_row.addWidget(self.radio_ct)
+        slice_row.addWidget(self.radio_pet)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(self.chk_native)
-        row2.addWidget(self.chk_mapped)
-        row2.addWidget(self.chk_edit)
-        row2.addWidget(QLabel("笔刷"))
-        row2.addWidget(self.spin_brush)
-        row2.addWidget(QLabel("窗位"))
-        row2.addWidget(self.spin_wl)
-        row2.addWidget(QLabel("窗宽"))
-        row2.addWidget(self.spin_ww)
-        row2.addWidget(QLabel("SUV"))
-        row2.addWidget(self.spin_suv_min)
-        row2.addWidget(self.spin_suv_max)
-        row2.addWidget(QLabel("融合"))
-        row2.addWidget(self.spin_alpha)
-        row2.addWidget(QLabel("缩放"))
-        row2.addWidget(self.spin_zoom)
-        row2.addWidget(self.btn_zoom_reset)
-        row2.addWidget(self.lbl_pos, 1)
+        tools = QGridLayout()
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setHorizontalSpacing(6)
+        tools.setVerticalSpacing(4)
+        r1 = [
+            self.chk_native,
+            self.chk_mapped,
+            self.chk_edit,
+            QLabel("笔刷"),
+            self.spin_brush,
+            QLabel("窗位"),
+            self.spin_wl,
+            QLabel("窗宽"),
+            self.spin_ww,
+        ]
+        r2 = [
+            QLabel("SUV"),
+            self.spin_suv_min,
+            self.spin_suv_max,
+            QLabel("融合"),
+            self.spin_alpha,
+            QLabel("缩放"),
+            self.spin_zoom,
+            self.btn_zoom_reset,
+            self.lbl_pos,
+        ]
+        for col, w in enumerate(r1):
+            tools.addWidget(w, 0, col)
+        for col, w in enumerate(r2):
+            tools.addWidget(w, 1, col)
+        tools.setColumnStretch(8, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(views, 1)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
+        layout.addLayout(slice_row)
+        layout.addLayout(tools)
 
     def display_mode(self) -> str:
         if self.radio_ct.isChecked():

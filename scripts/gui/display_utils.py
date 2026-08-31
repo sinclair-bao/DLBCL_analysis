@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""切片方向、PET 伪彩、窗宽窗位与显示坐标 ↔ 体素。"""
+"""切片方向、PET 灰度、窗宽窗位与显示坐标 ↔ 体素。"""
 
 from __future__ import annotations
 
@@ -51,6 +51,13 @@ def apply_pet_cmap(values: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> 
     denom = max(vmax - vmin, 1e-6)
     idx = np.clip((values - vmin) / denom, 0.0, 1.0)
     return PET_LUT[(idx * (len(PET_LUT) - 1)).astype(np.int32)]
+
+
+def apply_pet_gray(values: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> np.ndarray:
+    """按 SUV 窗归一化后复制到 RGB 三通道，供 GUI 显示。"""
+    denom = max(vmax - vmin, 1e-6)
+    n = np.clip((np.asarray(values, dtype=np.float32) - vmin) / denom, 0.0, 1.0)
+    return np.stack([n, n, n], axis=-1)
 
 
 def normalize_ct(ct: np.ndarray, window: tuple[float, float] = CT_WINDOW) -> np.ndarray:
@@ -140,7 +147,7 @@ def compose_rgb(
     """mode: ct / pet / fusion。返回 (H, W, 3) float32。"""
     ct_n = normalize_ct(ct_sl, ct_window)
     gray = np.stack([ct_n, ct_n, ct_n], axis=-1)
-    pet_rgb = apply_pet_cmap(pet_sl, suv_min, suv_max)
+    pet_rgb = apply_pet_gray(pet_sl, suv_min, suv_max)
     if mode == "ct":
         rgb = gray
     elif mode == "pet":

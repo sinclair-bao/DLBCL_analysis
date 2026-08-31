@@ -11,7 +11,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from display_utils import MAPPED_RGB, NATIVE_RGB, apply_pet_cmap, coronal_mip
+from display_utils import MAPPED_RGB, NATIVE_RGB, apply_pet_gray, coronal_mip
 from volume_io import VolumeSet
 
 
@@ -23,7 +23,7 @@ class EvolutionStrip(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(140)
 
     def clear(self) -> None:
         self.fig.clear()
@@ -52,7 +52,7 @@ class EvolutionStrip(QWidget):
         for ax, (title, vol) in zip(axes, items):
             ax.set_facecolor("#000000")
             pet_mip = coronal_mip(np.clip(vol.pet, 0.0, suv_max))
-            rgb = apply_pet_cmap(pet_mip, 0.0, suv_max)
+            rgb = apply_pet_gray(pet_mip, 0.0, suv_max)
             if show_native and vol.native is not None:
                 rgb = _blend_mask(rgb, coronal_mip(vol.native.astype(np.float32)), NATIVE_RGB)
             if show_mapped and vol.mapped is not None:
