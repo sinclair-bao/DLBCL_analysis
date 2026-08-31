@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""切片方向、PET 灰度、窗宽窗位与显示坐标 ↔ 体素。"""
+"""切片方向、PET 配色、窗宽窗位与显示坐标 ↔ 体素。"""
 
 from __future__ import annotations
 
@@ -41,16 +41,84 @@ def pet_lut(n: int = 256) -> np.ndarray:
 
 PET_LUT = pet_lut()
 
+_HOT_STOPS = np.array(
+    [
+        [0.00, 0.00, 0.00, 0.00],
+        [0.33, 1.00, 0.00, 0.00],
+        [0.66, 1.00, 1.00, 0.00],
+        [1.00, 1.00, 1.00, 1.00],
+    ],
+    dtype=np.float32,
+)
+_JET_STOPS = np.array(
+    [
+        [0.00, 0.00, 0.00, 0.50],
+        [0.11, 0.00, 0.00, 1.00],
+        [0.35, 0.00, 1.00, 1.00],
+        [0.50, 0.00, 1.00, 0.00],
+        [0.65, 1.00, 1.00, 0.00],
+        [0.89, 1.00, 0.00, 0.00],
+        [1.00, 0.50, 0.00, 0.00],
+    ],
+    dtype=np.float32,
+)
+_INFERNO_STOPS = np.array(
+    [
+        [0.00, 0.00, 0.00, 0.02],
+        [0.25, 0.34, 0.06, 0.43],
+        [0.50, 0.74, 0.22, 0.33],
+        [0.75, 0.98, 0.55, 0.04],
+        [1.00, 0.99, 1.00, 0.64],
+    ],
+    dtype=np.float32,
+)
+
+
+def _lut_from_stops(stops: np.ndarray, n: int = 256) -> np.ndarray:
+    x = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    t, r, g, b = stops.T
+    return np.stack(
+        [np.interp(x, t, r), np.interp(x, t, g), np.interp(x, t, b)],
+        axis=1,
+    ).astype(np.float32)
+
+
+PET_CMAPS: dict[str, np.ndarray | None] = {
+    "gray": None,
+    "pet": PET_LUT,
+    "hot": _lut_from_stops(_HOT_STOPS),
+    "jet": _lut_from_stops(_JET_STOPS),
+    "inferno": _lut_from_stops(_INFERNO_STOPS),
+}
+
+PET_CMAP_CHOICES: tuple[tuple[str, str], ...] = (
+    ("灰度", "gray"),
+    ("PET 热金", "pet"),
+    ("Hot", "hot"),
+    ("Jet", "jet"),
+    ("Inferno", "inferno"),
+)
+DEFAULT_PET_CMAP = "pet"
+
 
 def ct_window_from_wl(wl: float, ww: float) -> tuple[float, float]:
     half = max(ww, 1.0) / 2.0
     return wl - half, wl + half
 
 
-def apply_pet_cmap(values: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> np.ndarray:
+def apply_pet_cmap(
+    values: np.ndarray,
+    vmin: float = 0.0,
+    vmax: float = 6.0,
+    name: str = DEFAULT_PET_CMAP,
+) -> np.ndarray:
+    """按 SUV 窗上色。name=gray 时为灰度；其余为伪彩色 LUT。"""
+    if name == "gray" or name not in PET_CMAPS or PET_CMAPS[name] is None:
+        return apply_pet_gray(values, vmin, vmax)
+    lut = PET_CMAPS[name]
     denom = max(vmax - vmin, 1e-6)
-    idx = np.clip((values - vmin) / denom, 0.0, 1.0)
-    return PET_LUT[(idx * (len(PET_LUT) - 1)).astype(np.int32)]
+    idx = np.clip((np.asarray(values, dtype=np.float32) - vmin) / denom, 0.0, 1.0)
+    return lut[(idx * (len(lut) - 1)).astype(np.int32)]
 
 
 def apply_pet_gray(values: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> np.ndarray:
@@ -159,11 +227,12 @@ def compose_rgb(
     show_mapped: bool = True,
     mask_alpha: float = 0.45,
     highlight_label: int = 0,
+    pet_cmap: str = DEFAULT_PET_CMAP,
 ) -> np.ndarray:
     """mode: ct / pet / fusion。返回 (H, W, 3) float32。"""
     ct_n = normalize_ct(ct_sl, ct_window)
     gray = np.stack([ct_n, ct_n, ct_n], axis=-1)
-    pet_rgb = apply_pet_gray(pet_sl, suv_min, suv_max)
+    pet_rgb = apply_pet_cmap(pet_sl, suv_min, suv_max, pet_cmap)
     if mode == "ct":
         rgb = gray
     elif mode == "pet":

@@ -41,7 +41,7 @@ from session import load_session, save_session  # noqa: E402
 from edit_panel import EditPanel  # noqa: E402
 from evolution_strip import EvolutionStrip  # noqa: E402
 from feature_panel import FeaturePanel  # noqa: E402
-from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume  # noqa: E402
+from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume, threshold_pet_mask  # noqa: E402
 from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         self.timepoints.features_requested.connect(self._run_features)
         self.ortho.chk_native.toggled.connect(self._refresh_evolution)
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
+        self.ortho.combo_cmap.currentIndexChanged.connect(self._refresh_evolution)
         self.ortho.mask_changed.connect(self._refresh_lesion_table)
         self.ortho.role_requested.connect(self._on_role_view)
         self.edit_panel.segment_requested.connect(self._on_segment)
@@ -354,6 +355,7 @@ class MainWindow(QMainWindow):
             show_native=self.ortho.chk_native.isChecked(),
             show_mapped=self.ortho.chk_mapped.isChecked(),
             highlight_role=session.role_of(self.current_date) if self.current_date else None,
+            pet_cmap=self.ortho.pet_cmap(),
         )
 
     def _sync_role_buttons(self) -> None:
@@ -558,6 +560,10 @@ class MainWindow(QMainWindow):
         if method == "other":
             self._load_other_mask()
             return
+        if method == "threshold":
+            start = threshold_pet_mask(vol.pet, mode="relative", value=0.41)
+            self._open_segment_editor(start)
+            return
         self.edit_panel.set_busy(True)
         self.timepoints.btn_map.setEnabled(False)
         self.timepoints.btn_feat.setEnabled(False)
@@ -601,7 +607,7 @@ class MainWindow(QMainWindow):
             return
         native = np.asarray(mask if mask is not None else vol.native, dtype=np.uint16).copy()
         work = replace(vol, native=native, dirty=False, _undo=[])
-        dlg = SegmentEditorDialog(work, self)
+        dlg = SegmentEditorDialog(work, self, pet_cmap=self.ortho.pet_cmap())
         if dlg.exec() != SegmentEditorDialog.DialogCode.Accepted:
             return
         vol.native = np.array(dlg.edited_mask(), copy=True, dtype=np.uint16)

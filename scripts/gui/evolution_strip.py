@@ -15,7 +15,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from display_utils import MAPPED_RGB, NATIVE_RGB, apply_pet_gray, coronal_mip
+from display_utils import (
+    DEFAULT_PET_CMAP,
+    MAPPED_RGB,
+    NATIVE_RGB,
+    apply_pet_cmap,
+    coronal_mip,
+)
 from ortho_viewer import _LateralityMixin
 from volume_io import VolumeSet
 
@@ -50,11 +56,14 @@ class _MipView(_LateralityMixin, pg.GraphicsLayoutWidget):
             return
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         cur = self.item.image
+        shape_changed = cur is None or cur.shape != img.shape
         if cur is not None and cur.shape == img.shape and cur.dtype == img.dtype:
             np.copyto(cur, img)
             self.item.updateImage()
         else:
             self.item.setImage(img, autoLevels=False)
+        if shape_changed:
+            self.set_zoom(100)
 
     def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
@@ -120,6 +129,7 @@ class EvolutionStrip(QWidget):
         show_native: bool = True,
         show_mapped: bool = True,
         highlight_role: str | None = None,
+        pet_cmap: str = DEFAULT_PET_CMAP,
     ) -> None:
         if highlight_role is not None:
             self._highlight = highlight_role
@@ -133,7 +143,7 @@ class EvolutionStrip(QWidget):
                 continue
             title, vol = items[i]
             pet_mip = coronal_mip(np.clip(vol.pet, 0.0, suv_max))
-            rgb = apply_pet_gray(pet_mip, 0.0, suv_max)
+            rgb = apply_pet_cmap(pet_mip, 0.0, suv_max, pet_cmap)
             if show_native and vol.native is not None:
                 rgb = _blend_mask(rgb, coronal_mip(vol.native.astype(np.float32)), NATIVE_RGB)
             if show_mapped and vol.mapped is not None:

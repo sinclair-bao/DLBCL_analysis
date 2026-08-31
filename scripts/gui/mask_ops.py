@@ -12,6 +12,28 @@ from scipy import ndimage
 from display_utils import display_to_voxel
 
 
+def threshold_pet_mask(
+    pet: np.ndarray,
+    *,
+    mode: str = "absolute",
+    value: float = 2.5,
+) -> np.ndarray:
+    """
+    SUV 阈值 → 编号 mask。
+    absolute: pet >= value；relative: pet >= value * nanmax(pet)（41% 时 value=0.41）。
+    """
+    data = np.asarray(pet, dtype=np.float32)
+    if mode == "relative":
+        peak = float(np.nanmax(data)) if data.size else 0.0
+        thr = float(value) * peak
+    elif mode == "absolute":
+        thr = float(value)
+    else:
+        raise ValueError(f"未知阈值模式: {mode!r}")
+    binary = np.isfinite(data) & (data >= thr)
+    return ensure_labeled(binary.astype(np.uint16))
+
+
 def ensure_labeled(mask: np.ndarray) -> np.ndarray:
     """二值或已编号 mask → uint16 连通域编号（1..N）。"""
     arr = np.asarray(mask)

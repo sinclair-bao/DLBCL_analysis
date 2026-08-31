@@ -28,8 +28,10 @@ from PySide6.QtWidgets import (
 )
 
 from display_utils import (
+    DEFAULT_PET_CMAP,
     DEFAULT_WL,
     DEFAULT_WW,
+    PET_CMAP_CHOICES,
     compose_rgb,
     ct_window_from_wl,
     slice_axial,
@@ -44,6 +46,7 @@ from mask_ops import (
     paint_disk,
     promote_new_islands,
     relabel_by_volume,
+    threshold_pet_mask,
 )
 from ortho_viewer import _RgbView
 from volume_io import VolumeSet
@@ -55,7 +58,7 @@ _SLICE_FN = {"axial": slice_axial, "coronal": slice_coronal, "sagittal": slice_s
 
 
 class SegmentEditorDialog(QDialog):
-    def __init__(self, vol: VolumeSet, parent=None) -> None:
+    def __init__(self, vol: VolumeSet, parent=None, *, pet_cmap: str = DEFAULT_PET_CMAP) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"分割编辑  {vol.patient_id}  {vol.study_date}")
         self.setModal(True)
@@ -78,6 +81,8 @@ class SegmentEditorDialog(QDialog):
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
+        pet = np.asarray(vol.pet, dtype=np.float32)
+        self._pet_peak = float(np.nanmax(pet)) if pet.size else 0.0
 
         views_row = QHBoxLayout()
         self._cells: dict[str, _RgbView] = {}
@@ -135,8 +140,14 @@ class SegmentEditorDialog(QDialog):
         self.spin_alpha.setRange(0.0, 1.0)
         self.spin_alpha.setSingleStep(0.05)
         self.spin_alpha.setValue(0.55)
+        self.combo_cmap = QComboBox()
+        for label, key in PET_CMAP_CHOICES:
+            self.combo_cmap.addItem(label, key)
+        idx = self.combo_cmap.findData(pet_cmap)
+        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
         for w in (self.spin_wl, self.spin_ww, self.spin_suv_min, self.spin_suv_max, self.spin_alpha):
             w.valueChanged.connect(lambda _: self.refresh(False))
+        self.combo_cmap.currentIndexChanged.connect(lambda _: self.refresh(False))
 
         self.lbl_pos = QLabel("—")
 
@@ -165,6 +176,39 @@ class SegmentEditorDialog(QDialog):
         ctrl.addWidget(self.spin_suv_max)
         ctrl.addWidget(QLabel("融合"))
         ctrl.addWidget(self.spin_alpha)
+        ctrl.addWidget(QLabel("配色"))
+        ctrl.addWidget(self.combo_cmap)
+
+        self.radio_thr_rel = QRadioButton("41% SUVmax")
+        self.radio_thr_abs = QRadioButton("固定 SUV")
+        self.radio_thr_rel.setChecked(True)
+        self._thr_group = QButtonGroup(self)
+        self._thr_group.addButton(self.radio_thr_rel)
+        self._thr_group.addButton(self.radio_thr_abs)
+        self.slider_thr = QSlider(Qt.Orientation.Horizontal)
+        self.slider_thr.setRange(5, 150)
+        self.slider_thr.setValue(25)
+        self.spin_thr = QDoubleSpinBox()
+        self.spin_thr.setRange(0.5, 15.0)
+        self.spin_thr.setSingleStep(0.1)
+        self.spin_thr.setDecimals(1)
+        self.spin_thr.setValue(2.5)
+        self.lbl_thr = QLabel("—")
+        self.radio_thr_rel.toggled.connect(lambda on: on and self._on_thr_mode())
+        self.radio_thr_abs.toggled.connect(lambda on: on and self._on_thr_mode())
+        self.slider_thr.valueChanged.connect(self._thr_slider_moved)
+        self.slider_thr.sliderReleased.connect(self._apply_threshold_abs)
+        self.spin_thr.valueChanged.connect(self._thr_spin_moved)
+        self.spin_thr.editingFinished.connect(self._apply_threshold_abs)
+        self._sync_thr_ui()
+
+        thr_row = QHBoxLayout()
+        thr_row.addWidget(QLabel("SUV 阈值"))
+        thr_row.addWidget(self.radio_thr_rel)
+        thr_row.addWidget(self.radio_thr_abs)
+        thr_row.addWidget(self.slider_thr, 1)
+        thr_row.addWidget(self.spin_thr)
+        thr_row.addWidget(self.lbl_thr, 1)
 
         morph = QHBoxLayout()
         self.spin_radius = QSpinBox()
@@ -208,13 +252,17 @@ class SegmentEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-        hint = QLabel("点选轴位/冠状/矢状后，三格显示该平面的 CT、PET、融合。左键涂抹、右键擦除，三格 mask 同步。")
+        hint = QLabel(
+            "点选轴位/冠状/矢状后，三格显示该平面的 CT、PET、融合。"
+            "左键涂抹、右键擦除。切换阈值模式或松开滑杆会重算 mask。"
+        )
         hint.setWordWrap(True)
 
         layout = QVBoxLayout(self)
         layout.addLayout(views_row, 1)
         layout.addLayout(plane_row)
         layout.addLayout(ctrl)
+        layout.addLayout(thr_row)
         layout.addLayout(morph)
         layout.addWidget(self.table)
         layout.addWidget(hint)
@@ -234,8 +282,71 @@ class SegmentEditorDialog(QDialog):
         self.resize(w, h)
         self.move(geo.x() + (geo.width() - w) // 2, geo.y() + (geo.height() - h) // 2)
 
+    def showEvent(self, ev) -> None:
+        super().showEvent(ev)
+        for view in self._cells.values():
+            view.set_zoom(100)
+
     def edited_mask(self) -> np.ndarray:
         return self._vol.native
+
+    def _pet_cmap(self) -> str:
+        data = self.combo_cmap.currentData()
+        return str(data) if data else DEFAULT_PET_CMAP
+
+    def _sync_thr_ui(self) -> None:
+        rel = self.radio_thr_rel.isChecked()
+        self.slider_thr.setEnabled(not rel)
+        self.spin_thr.setEnabled(not rel)
+        peak = self._pet_peak
+        if rel:
+            self.lbl_thr.setText(f"0.41 × SUVmax {peak:.2f} = {0.41 * peak:.2f}")
+        else:
+            self.lbl_thr.setText(f"SUV ≥ {float(self.spin_thr.value()):.2f}")
+
+    def _on_thr_mode(self) -> None:
+        self._sync_thr_ui()
+        self._apply_threshold()
+
+    def _thr_slider_moved(self, raw: int) -> None:
+        val = max(raw, 5) / 10.0
+        self.spin_thr.blockSignals(True)
+        self.spin_thr.setValue(val)
+        self.spin_thr.blockSignals(False)
+        self._sync_thr_ui()
+
+    def _thr_spin_moved(self, val: float) -> None:
+        self.slider_thr.blockSignals(True)
+        self.slider_thr.setValue(int(round(float(val) * 10)))
+        self.slider_thr.blockSignals(False)
+        self._sync_thr_ui()
+
+    def _apply_threshold_abs(self) -> None:
+        if self.radio_thr_rel.isChecked():
+            return
+        self._apply_threshold()
+
+    def _apply_threshold(self) -> None:
+        if self.radio_thr_abs.isChecked() and self.slider_thr.isSliderDown():
+            return
+        self._sync_thr_ui()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        self._push_undo()
+        try:
+            if self.radio_thr_rel.isChecked():
+                mask = threshold_pet_mask(self._vol.pet, mode="relative", value=0.41)
+            else:
+                mask = threshold_pet_mask(
+                    self._vol.pet, mode="absolute", value=float(self.spin_thr.value())
+                )
+            self._vol.native = mask
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._vol.dirty = True
+        self.current_label = 1
+        self.highlight_label = 0
+        self.refresh(update_table=True)
 
     def _set_plane(self, plane: str) -> None:
         self.plane = plane
@@ -379,6 +490,7 @@ class SegmentEditorDialog(QDialog):
             show_native=True,
             show_mapped=False,
             highlight_label=int(self.highlight_label),
+            pet_cmap=self._pet_cmap(),
         )
         on = self.chk_crosshair.isChecked()
         col, row = voxel_to_display(plane, self._i, self._j, self._k, vol.ct.shape)

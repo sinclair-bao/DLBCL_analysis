@@ -174,13 +174,14 @@ DLBCL/
 │   │   └── radiomics_params.yaml    # 组学：shape / firstorder / GLCM
 │   ├── gui/                         # PySide6 纵向浏览软件
 │   │   ├── app.py                   # 入口：python scripts/gui/app.py
+│   │   ├── README.md                # GUI 使用说明与 Todo
 │   │   ├── main_window.py           # 总布局、菜单导出
 │   │   ├── patient_browser.py       # 患者树与完整性状态灯
 │   │   ├── timepoint_panel.py       # 三个角色下拉框 + 映射按钮
 │   │   ├── edit_panel.py            # AutoPET / 阈值 / 空白 / 载入 mask
-│   │   ├── segment_editor.py        # CT/PET/融合三格；轴冠矢点选平面
-│   │   ├── mask_ops.py              # 连通域编号、二维画笔、膨胀腐蚀
-│   │   ├── display_utils.py         # CT/PET/融合、窗宽窗位、显示坐标
+│   │   ├── segment_editor.py        # CT/PET/融合三格；阈值滑杆；轴冠矢
+│   │   ├── mask_ops.py              # 连通域编号、二维画笔、膨胀腐蚀、阈值
+│   │   ├── display_utils.py         # CT/PET 配色 LUT、窗宽窗位、显示坐标
 │   │   ├── volume_io.py             # 读入编号 mask；另存 lesion_edited
 │   │   ├── ortho_viewer.py          # 轴/冠/矢 + 窗宽窗位 + 十字线 + R/L
 │   │   ├── evolution_strip.py       # 三时间点冠状 MIP
@@ -647,7 +648,8 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 **后端：** `scripts/longitudinal/`  
 **GUI：** `scripts/gui/app.py`（PySide6 + pyqtgraph）  
-**环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）
+**环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）  
+**使用说明：** 脚本职责、操作步骤与后续 Todo 见 [`scripts/gui/README.md`](scripts/gui/README.md)。
 
 时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**（可只选 1–3 个），写入
 
@@ -659,6 +661,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 - 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
 - 无 mask 时：右侧 **AutoPET 分割**、**SUV 阈值分割**、**空白手动分割**，或 **其他（载入已有 mask）**
+- SUV 阈值在内存中计算（默认 **41% SUVmax**），编辑窗内可改为固定 SUV 滑杆（0.5–15）；不走后台 CLI
 - 四种入口都会打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
 - **保存并关闭** 写入 sidecar `{ID}_{Date}_lesion_edited.nii.gz`；取消不改主窗口
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，当前层或三维、当前灶或全部。**当前层只改该切片**；三维在病灶边界盒内运算（避免整本体膨胀卡顿）
@@ -666,7 +669,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 **显示：**
 
-- 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 为 **灰度**（按 SUV 窗），mask 仍为红/黄/青
+- 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 默认 **PET 热金** 伪彩色（下拉可选灰度 / Hot / Jet / Inferno），mask 仍为红/黄/青
 - 主界面可点选 **查看基线 / 中期 / 末期**（需先在右侧指定角色）
 - CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（刷新不带动画面跳动）
 - 冠状 MIP **等比例**显示，三列统一缩放，不横向拉扁
@@ -932,8 +935,8 @@ SUVbw = ActivityConcentration(Bq/mL) × BodyWeight(g) / InjectedDose(Bq)
 | 入口 | `python scripts/gui/app.py` |
 | 交互 | 选患者 → 指定时间点 → 分割/微调 → 映射到随访 → MIP 与特征表 |
 | Overlay | 红 = 本底 mask；黄 = 当前灶；青 = 映射的基线病灶床 |
-| 分割 | AutoPET / SUV 阈值 / 空白 / 载入 mask；CT/PET/融合三格弹窗；平面点选轴冠矢 |
-| 显示 | 仅 CT / 仅 PET（灰度）/ 融合；查看基线/中期/末期；十字线不跳动；MIP 等比例；轴冠 MIP 标 R/L，矢状标 P/A |
+| 分割 | AutoPET / SUV 阈值（41% 或滑杆）/ 空白 / 载入 mask；CT/PET/融合三格弹窗；平面点选轴冠矢 |
+| 显示 | 仅 CT / 仅 PET / 融合；PET 配色下拉（默认热金）；查看基线/中期/末期；十字线不跳动；MIP 等比例；轴冠 MIP 标 R/L，矢状标 P/A |
 | 患者栏 | F2 /「患者」按钮显隐；选中检查后可自动隐藏 |
 | 后台线程 | `MappingWorker` / `FeatureWorker` / `SegmentWorker` |
 | 导出 | 特征 CSV、MIP PNG、折线 PNG |

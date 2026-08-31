@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QHBoxLayout,
@@ -26,8 +27,10 @@ from PySide6.QtWidgets import (
 )
 
 from display_utils import (
+    DEFAULT_PET_CMAP,
     DEFAULT_WL,
     DEFAULT_WW,
+    PET_CMAP_CHOICES,
     compose_rgb,
     ct_window_from_wl,
     slice_axial,
@@ -153,11 +156,14 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         cur = self.item.image
+        shape_changed = cur is None or cur.shape != img.shape
         if cur is not None and cur.shape == img.shape and cur.dtype == img.dtype:
             np.copyto(cur, img)
             self.item.updateImage()
         else:
             self.item.setImage(img, autoLevels=False)
+        if shape_changed:
+            self.set_zoom(100)
 
     def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
@@ -280,6 +286,13 @@ class OrthoViewer(QWidget):
         self.spin_brush.setValue(5)
         self.spin_brush.valueChanged.connect(lambda v: setattr(self, "brush_radius", int(v)))
 
+        self.combo_cmap = QComboBox()
+        for label, key in PET_CMAP_CHOICES:
+            self.combo_cmap.addItem(label, key)
+        idx = self.combo_cmap.findData(DEFAULT_PET_CMAP)
+        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
+        self.combo_cmap.currentIndexChanged.connect(self.refresh)
+
         self.lbl_pos = QLabel("—")
         self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         for spin in (
@@ -329,6 +342,8 @@ class OrthoViewer(QWidget):
             QLabel("SUV"),
             self.spin_suv_min,
             self.spin_suv_max,
+            QLabel("配色"),
+            self.combo_cmap,
             QLabel("融合"),
             self.spin_alpha,
             QLabel("缩放"),
@@ -340,7 +355,7 @@ class OrthoViewer(QWidget):
             tools.addWidget(w, 0, col)
         for col, w in enumerate(r2):
             tools.addWidget(w, 1, col)
-        tools.setColumnStretch(8, 1)
+        tools.setColumnStretch(10, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -359,6 +374,10 @@ class OrthoViewer(QWidget):
             btn.setEnabled(bool(available.get(role)))
             btn.setChecked(role == current and bool(available.get(role)))
             btn.blockSignals(False)
+
+    def pet_cmap(self) -> str:
+        data = self.combo_cmap.currentData()
+        return str(data) if data else DEFAULT_PET_CMAP
 
     def display_mode(self) -> str:
         if self.radio_ct.isChecked():
@@ -497,6 +516,7 @@ class OrthoViewer(QWidget):
             show_native=self.chk_native.isChecked(),
             show_mapped=self.chk_mapped.isChecked(),
             highlight_label=int(self.highlight_label),
+            pet_cmap=self.pet_cmap(),
         )
         native = vol.native
         mapped = vol.mapped

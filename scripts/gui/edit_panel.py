@@ -46,7 +46,7 @@ class EditPanel(QWidget):
         seg_l.addWidget(self.btn_threshold)
         seg_l.addWidget(self.btn_manual)
         seg_l.addWidget(self.btn_other)
-        self.lbl_seg = QLabel("四种入口打开 CT/PET/融合编辑窗；点选轴位/冠状/矢状切换平面。")
+        self.lbl_seg = QLabel("四种入口打开编辑窗。SUV 阈值：41% SUVmax 或滑杆固定值，可在窗内再调。")
         self.lbl_seg.setWordWrap(True)
         seg_l.addWidget(self.lbl_seg)
         seg_box.setLayout(seg_l)
