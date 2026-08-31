@@ -670,6 +670,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **显示：**
 
 - 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 默认 **PET 热金** 伪彩色（下拉可选灰度 / Hot / Jet / Inferno），mask 仍为红/黄/青
+- **渲染** 下拉 CPU / GPU：GPU 用可选 CuPy 整本上传后切片合成，无 CUDA 时禁用并回退 CPU（`pip install cupy-cuda12x`，按本机 CUDA）
 - 主界面可点选 **查看基线 / 中期 / 末期**（需先在右侧指定角色）
 - CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（刷新不带动画面跳动）
 - 冠状 MIP **等比例**显示，三列统一缩放，不横向拉扁

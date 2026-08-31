@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,8 @@ from timepoint_panel import TimepointPanel  # noqa: E402
 from volume_io import load_mask_from_path, load_volume_set, save_edited_mask  # noqa: E402
 from workers import FeatureWorker, MappingWorker, SegmentWorker  # noqa: E402
 
+_VOL_CACHE_CAP = 6
+
 STYLESHEET = """
 QMainWindow, QWidget { background: #161616; color: #e8e8e8; }
 QTreeWidget { background: #1e1e1e; alternate-background-color: #252525; border: 1px solid #333; }
@@ -82,7 +85,7 @@ class MainWindow(QMainWindow):
         self._map_worker: Optional[MappingWorker] = None
         self._feat_worker: Optional[FeatureWorker] = None
         self._seg_worker: Optional[SegmentWorker] = None
-        self._vol_cache: dict[tuple[str, str, str], object] = {}
+        self._vol_cache: OrderedDict[tuple[str, str, str], object] = OrderedDict()
         self._browser_width = 0
         self._open_editor_after_seg = False
 
@@ -272,19 +275,40 @@ class MainWindow(QMainWindow):
 
     def _load_vol(self, patient_id: str, study_date: str, baseline_date: Optional[str]):
         key = (patient_id, study_date, baseline_date or "")
-        if key not in self._vol_cache:
-            assets = self.catalog.get_study(patient_id, study_date)
-            if assets is None:
-                self._vol_cache[key] = None
-            else:
-                self._vol_cache[key] = load_volume_set(assets, baseline_date)
-        return self._vol_cache[key]
+        if key in self._vol_cache:
+            self._vol_cache.move_to_end(key)
+            return self._vol_cache[key]
+        assets = self.catalog.get_study(patient_id, study_date)
+        vol = None if assets is None else load_volume_set(assets, baseline_date)
+        self._vol_cache[key] = vol
+        self._vol_cache.move_to_end(key)
+        self._evict_vol_cache()
+        return vol
+
+    def _evict_vol_cache(self) -> None:
+        while len(self._vol_cache) > _VOL_CACHE_CAP:
+            victim = None
+            for key, cached in self._vol_cache.items():
+                if cached is None or not getattr(cached, "dirty", False):
+                    victim = key
+                    break
+            if victim is None:
+                break
+            del self._vol_cache[victim]
+
+    def _drop_cached(self, *, patient_id: str, study_date: Optional[str] = None) -> None:
+        drop = [
+            key
+            for key in self._vol_cache
+            if key[0] == patient_id and (study_date is None or key[1] == study_date)
+        ]
+        for key in drop:
+            del self._vol_cache[key]
 
     def _on_patient(self, patient_id: str) -> None:
         if patient_id == self.current_patient:
             return
         self.current_patient = patient_id
-        self._vol_cache.clear()
         rec = self.catalog.get_patient(patient_id)
         session = load_session(self.catalog.processed_root, patient_id)
         dates = rec.study_dates() if rec else []
@@ -468,7 +492,8 @@ class MainWindow(QMainWindow):
     def _on_map_done(self, msg: str) -> None:
         self.timepoints.btn_map.setEnabled(True)
         self.edit_panel.set_busy(False)
-        self._vol_cache.clear()
+        if self.current_patient:
+            self._drop_cached(patient_id=self.current_patient)
         self.catalog.refresh()
         self.browser.populate(self.catalog)
         hint = "  已切换到随访，青色 = 基线病灶床"
@@ -607,11 +632,17 @@ class MainWindow(QMainWindow):
             return
         native = np.asarray(mask if mask is not None else vol.native, dtype=np.uint16).copy()
         work = replace(vol, native=native, dirty=False, _undo=[])
-        dlg = SegmentEditorDialog(work, self, pet_cmap=self.ortho.pet_cmap())
+        dlg = SegmentEditorDialog(
+            work,
+            self,
+            pet_cmap=self.ortho.pet_cmap(),
+            render_device=self.ortho.render_device(),
+        )
         if dlg.exec() != SegmentEditorDialog.DialogCode.Accepted:
             return
         vol.native = np.array(dlg.edited_mask(), copy=True, dtype=np.uint16)
         vol.dirty = True
+        self.ortho.mark_masks_dirty()
         self.ortho.refresh()
         self._save_edited()
         self._refresh_lesion_table()
@@ -620,7 +651,8 @@ class MainWindow(QMainWindow):
         self.edit_panel.set_busy(False)
         self.timepoints.btn_map.setEnabled(True)
         self.timepoints.btn_feat.setEnabled(True)
-        self._vol_cache.clear()
+        if self.current_patient:
+            self._drop_cached(patient_id=self.current_patient, study_date=self.current_date)
         self.catalog.refresh()
         self.browser.populate(self.catalog)
         if self.current_patient:
@@ -669,7 +701,6 @@ class MainWindow(QMainWindow):
             return
         self._write_edited_mask(vol)
         self.catalog.refresh()
-        self._vol_cache.clear()
         self.browser.populate(self.catalog)
         if self.current_patient:
             self.browser.select_patient(self.current_patient)

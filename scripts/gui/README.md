@@ -8,7 +8,7 @@
 
 ## 1. 启动
 
-**环境：** `data-analysis`（PySide6、pyqtgraph、nibabel、scipy）。AutoPET 推理另用 `autopet` 环境，由后台线程调用。
+**环境：** `data-analysis`（PySide6、pyqtgraph、nibabel、scipy）。AutoPET 推理另用 `autopet` 环境，由后台线程调用。GPU 切片合成为可选：`pip install cupy-cuda12x`（按本机 CUDA 版本选 `cupy-cuda11x` / `cupy-cuda12x`）；未安装时「渲染」下拉的 GPU 项禁用并回退 CPU。不把 CuPy 装进默认环境。
 
 ```bash
 conda activate data-analysis
@@ -63,6 +63,7 @@ python scripts/gui/app.py \
 │ F2 显隐    │ CT / PET / 融合、窗宽窗位      │ 映射 / 特征按钮  │
 │            │ 本底 / 映射 / 编辑 mask        │ 分割四种入口     │
 │            │ 十字线、缩放、笔刷、PET 配色    │ 形态学 + 病灶表  │
+│            │ 渲染 CPU / GPU                │                 │
 ├────────────┼──────────────────────────────┼─────────────────┤
 │            │ 最多三列冠状 MIP（基线/中/末）  │ 特征表 + 折线    │
 └────────────┴──────────────────────────────┴─────────────────┘
@@ -92,7 +93,7 @@ python scripts/gui/app.py \
 | 当前选中灶 | 黄 | 编号表里选中的连通域 |
 | 映射 mask | 青 | 基线病灶床 warp 到**当前随访** |
 
-PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。
+PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。工具栏 **渲染** 可在 CPU / GPU 间切换：仍画到现有 pyqtgraph `ImageItem`；GPU 用 CuPy 把整本 CT/PET/mask 留在设备上，滚层只改切片下标，合成 RGB 后再下载。无 CuPy/CUDA 时 GPU 项禁用，旁注「无 CUDA」。
 
 朝向为放射科惯例（RAS 体积，画面左 = 患者右）：
 
@@ -121,7 +122,7 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 | 文件 | 作用 |
 |------|------|
 | [`app.py`](app.py) | 程序入口。在导入 matplotlib 画布前设置 `QtAgg`，检查 PySide6/pyqtgraph，解析 `--interim-root` / `--processed-root`，创建 `QApplication` 与 `MainWindow`。 |
-| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存在 `_vol_cache`。 |
+| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存 `_vol_cache` 为上限 6 套的 LRU（换患者不整表清空；映射按患者失效，AutoPET 按检查失效）。 |
 | [`__init__.py`](__init__.py) | 包标记，无逻辑。 |
 
 ### 4.2 面板（左右栏）
@@ -137,16 +138,17 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 
 | 文件 | 作用 |
 |------|------|
-| [`ortho_viewer.py`](ortho_viewer.py) | 轴/冠/矢三视图。显示模式（仅 CT / 仅 PET / 融合）、窗位窗宽（默认 40/400）、SUV 窗、**PET 配色**下拉、融合透明度、缩放、十字线、本底/映射/编辑勾选、查看基线/中期/末期。`_RgbView` 负责 RGB 图、十字线、视口 L/R（矢状 P/A）；首次设图或尺寸变化时自动 fit 视野。勾选编辑后二维画笔。 |
+| [`ortho_viewer.py`](ortho_viewer.py) | 轴/冠/矢三视图。显示模式（仅 CT / 仅 PET / 融合）、窗位窗宽（默认 40/400）、SUV 窗、**PET 配色**下拉、**渲染** CPU/GPU、融合透明度、缩放、十字线、本底/映射/编辑勾选、查看基线/中期/末期。`_RgbView` 负责 RGB 图、十字线、视口 L/R（矢状 P/A）；首次设图或尺寸变化时自动 fit 视野。勾选编辑后二维画笔。 |
 | [`evolution_strip.py`](evolution_strip.py) | 下方最多三列冠状 MIP，等比例、统一缩放。可叠本底（红）与映射（青）。`_MipView` 同样标 R/L。 |
-| [`segment_editor.py`](segment_editor.py) | 模态分割编辑窗：三格 CT/PET/融合，平面由轴/冠/矢单选切换；SUV 阈值滑杆/41%；PET 配色；画笔、形态学、撤销、重编号、病灶表。确定后把 mask 交回主窗并保存 sidecar。取消不改主窗口。切平面时调用 `set_laterality` 并重新 fit 视野。 |
+| [`segment_editor.py`](segment_editor.py) | 模态分割编辑窗：三格 CT/PET/融合，平面由轴/冠/矢单选切换；SUV 阈值滑杆/41%；PET 配色；渲染 CPU/GPU（打开时跟主窗）；画笔、形态学、撤销、重编号、病灶表。确定后把 mask 交回主窗并保存 sidecar。取消不改主窗口。切平面时调用 `set_laterality` 并重新 fit 视野。 |
 
 ### 4.4 显示与 mask 算法
 
 | 文件 | 作用 |
 |------|------|
 | [`display_utils.py`](display_utils.py) | 切片朝向（`orient_*` / `slice_*`）、冠状 MIP、PET 配色 LUT（灰度/热金/Hot/Jet/Inferno）、CT 窗、`compose_rgb` 叠红/黄/青。`display_to_voxel` / `voxel_to_display` 把点击映回 RAS 体素。 |
-| [`mask_ops.py`](mask_ops.py) | 连通域编号、`paint_disk`、新岛提升编号、`morph_labels`（2D 只改当前层，3D 用 bounding box）、`threshold_pet_mask`、`lesion_stats`、按体积重编号。 |
+| [`render_backend.py`](render_backend.py) | CPU/GPU 合成入口。`gpu_available()` 检测 CuPy+CUDA；GPU 把整本体积上传后切片+伪彩+融合，下载 RGB 给 pyqtgraph。失败回退 CPU。 |
+| [`mask_ops.py`](mask_ops.py) | 连通域编号、`paint_disk`、新岛提升编号、`morph_labels`（2D 只改当前层，3D 用 bounding box）、`threshold_pet_mask`、`lesion_stats`（`unique` + `ndimage.maximum`）、按体积重编号。 |
 | [`volume_io.py`](volume_io.py) | `VolumeSet` 数据类；把一次检查的 CT/PET/native/mapped 读到工作 CT 网格；任意 NIfTI mask 最近邻重采样；写出 uint16 `*_lesion_edited.nii.gz`。 |
 
 ### 4.5 后台线程
@@ -241,9 +243,9 @@ DataCatalog 扫描磁盘
 
 ### 显示与性能
 
-- [ ] 形态学后病灶表仍会全体积扫一遍 PET；大体积时表更新仍可能顿一下（运算本身已用切片/bbox）。
-- [ ] 全软件 GPU 渲染（OpenGL 切片纹理 / VisPy）工作量大，目前不划算；若 2D 形态学仍卡再评估。
-- [ ] 换患者时体积缓存策略：现在整表清空，多次来回同一患者会重复读盘。
+- [x] 病灶表：`lesion_stats` 一次 `np.unique` + `ndimage.maximum` 归约，不再对每个编号做 `mask == lid`。
+- [x] 体积缓存：`OrderedDict` LRU，上限 6 套；换患者不清空；保存 edited 只更新当前 `VolumeSet`；映射丢掉该患者键，AutoPET 丢掉该检查键。
+- [x] 渲染 CPU / GPU 二选一（仍画到 pyqtgraph `ImageItem`）。GPU 用可选 CuPy 在设备上切片+伪彩+融合；无 CUDA 时该项禁用并回退 CPU。不换 OpenGL/VisPy。
 
 ### 明确不做（保持现状）
 

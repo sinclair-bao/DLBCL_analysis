@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import numpy as np
@@ -31,17 +32,15 @@ from display_utils import (
     DEFAULT_WL,
     DEFAULT_WW,
     PET_CMAP_CHOICES,
-    compose_rgb,
     ct_window_from_wl,
-    slice_axial,
-    slice_coronal,
-    slice_sagittal,
     voxel_to_display,
 )
 from mask_ops import paint_disk, promote_new_islands
+from render_backend import GpuVolumeCache, compose_plane_cpu, gpu_available
 from volume_io import VolumeSet
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
+_LOG = logging.getLogger(__name__)
 
 _LAT_STYLE = (
     "QLabel { color: #f2f2f2; background: rgba(10, 10, 10, 165); "
@@ -81,6 +80,27 @@ class _LateralityMixin:
         )
         self._lat_left.raise_()
         self._lat_right.raise_()
+
+
+def configure_render_combo(combo: QComboBox, current: str = "cpu") -> QLabel:
+    """CPU / GPU 下拉。无 CUDA 时禁用 GPU 并旁注。"""
+    combo.addItem("CPU", "cpu")
+    combo.addItem("GPU", "gpu")
+    note = QLabel("")
+    want = current if current in ("cpu", "gpu") else "cpu"
+    if not gpu_available():
+        idx = combo.findData("gpu")
+        model = combo.model()
+        getter = getattr(model, "item", None)
+        item = getter(idx) if callable(getter) and idx >= 0 else None
+        if item is not None:
+            item.setEnabled(False)
+        note.setText("无 CUDA")
+        note.setStyleSheet("color: #888;")
+        want = "cpu"
+    idx = combo.findData(want)
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+    return note
 
 
 class _PaintItem(pg.ImageItem):
@@ -193,6 +213,9 @@ class OrthoViewer(QWidget):
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
+        self._gpu = GpuVolumeCache()
+        self._masks_dirty = True
+        self._gpu_failed = False
 
         self.axial = _RgbView("Axial", "axial")
         self.coronal = _RgbView("Coronal", "coronal")
@@ -293,6 +316,10 @@ class OrthoViewer(QWidget):
         self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
         self.combo_cmap.currentIndexChanged.connect(self.refresh)
 
+        self.combo_render = QComboBox()
+        self.lbl_cuda = configure_render_combo(self.combo_render)
+        self.combo_render.currentIndexChanged.connect(self._on_render_device)
+
         self.lbl_pos = QLabel("—")
         self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         for spin in (
@@ -349,13 +376,16 @@ class OrthoViewer(QWidget):
             QLabel("缩放"),
             self.spin_zoom,
             self.btn_zoom_reset,
+            QLabel("渲染"),
+            self.combo_render,
+            self.lbl_cuda,
             self.lbl_pos,
         ]
         for col, w in enumerate(r1):
             tools.addWidget(w, 0, col)
         for col, w in enumerate(r2):
             tools.addWidget(w, 1, col)
-        tools.setColumnStretch(10, 1)
+        tools.setColumnStretch(max(len(r1), len(r2)) - 1, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -379,6 +409,30 @@ class OrthoViewer(QWidget):
         data = self.combo_cmap.currentData()
         return str(data) if data else DEFAULT_PET_CMAP
 
+    def render_device(self) -> str:
+        if self._gpu_failed or not gpu_available():
+            return "cpu"
+        data = self.combo_render.currentData()
+        return str(data) if data else "cpu"
+
+    def mark_masks_dirty(self) -> None:
+        self._masks_dirty = True
+
+    def _on_render_device(self, _index: int = 0) -> None:
+        self._gpu_failed = False
+        self._gpu.clear()
+        self._masks_dirty = True
+        self._bind_gpu()
+        self.refresh()
+
+    def _bind_gpu(self) -> None:
+        vol = self._vol
+        if vol is None or self.render_device() != "gpu":
+            return
+        if self._gpu.bind_volumes(vol):
+            self._gpu.sync_masks(vol)
+            self._masks_dirty = False
+
     def display_mode(self) -> str:
         if self.radio_ct.isChecked():
             return "ct"
@@ -392,12 +446,16 @@ class OrthoViewer(QWidget):
 
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
+        self._gpu.clear()
+        self._gpu_failed = False
+        self._masks_dirty = True
         if vol is None:
             self.lbl_pos.setText("无图像")
             for view in (self.axial, self.coronal, self.sagittal):
                 view.item.clear()
                 view.set_crosshair_visible(False)
             return
+        self._bind_gpu()
         nx, ny, nz = vol.ct.shape
         self.slider_i.blockSignals(True)
         self.slider_j.blockSignals(True)
@@ -449,6 +507,7 @@ class OrthoViewer(QWidget):
             return
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
+        self.mark_masks_dirty()
         self.refresh()
         self.mask_changed.emit()
 
@@ -476,12 +535,14 @@ class OrthoViewer(QWidget):
             label,
         )
         vol.dirty = True
+        self.mark_masks_dirty()
         self.refresh()
 
     def _end_stroke(self) -> None:
         vol = self._vol
         if vol is not None and self._stroke and not self._stroke_erase and vol._undo:
             promote_new_islands(vol.native, vol._undo[-1])
+            self.mark_masks_dirty()
             self.refresh()
         self._stroke = False
         self.mask_changed.emit()
@@ -493,6 +554,7 @@ class OrthoViewer(QWidget):
             self._push_undo()
         self._vol.native = np.asarray(mask, dtype=np.uint16)
         self._vol.dirty = True
+        self.mark_masks_dirty()
         self.refresh()
         self.mask_changed.emit()
 
@@ -519,34 +581,41 @@ class OrthoViewer(QWidget):
             pet_cmap=self.pet_cmap(),
         )
         native = vol.native
-        mapped = vol.mapped
-        self.axial.set_rgb(
-            compose_rgb(
-                slice_axial(vol.ct, self._k),
-                slice_axial(vol.pet, self._k),
-                slice_axial(native, self._k) if native is not None else None,
-                slice_axial(mapped, self._k) if mapped is not None else None,
-                **args,
-            )
+        device = self.render_device()
+        gpu_cache = None
+        if device == "gpu":
+            try:
+                if not self._gpu.bind_volumes(vol):
+                    raise RuntimeError("GPU 不可用")
+                if self._masks_dirty:
+                    self._gpu.sync_masks(vol)
+                    self._masks_dirty = False
+                gpu_cache = self._gpu
+            except Exception:
+                _LOG.exception("GPU 体积上传失败，回退 CPU")
+                self._gpu_failed = True
+                device = "cpu"
+        planes = (
+            (self.axial, "axial"),
+            (self.coronal, "coronal"),
+            (self.sagittal, "sagittal"),
         )
-        self.coronal.set_rgb(
-            compose_rgb(
-                slice_coronal(vol.ct, self._j),
-                slice_coronal(vol.pet, self._j),
-                slice_coronal(native, self._j) if native is not None else None,
-                slice_coronal(mapped, self._j) if mapped is not None else None,
-                **args,
-            )
-        )
-        self.sagittal.set_rgb(
-            compose_rgb(
-                slice_sagittal(vol.ct, self._i),
-                slice_sagittal(vol.pet, self._i),
-                slice_sagittal(native, self._i) if native is not None else None,
-                slice_sagittal(mapped, self._i) if mapped is not None else None,
-                **args,
-            )
-        )
+        used_gpu = device == "gpu" and gpu_cache is not None
+        if used_gpu:
+            try:
+                for view, plane in planes:
+                    view.set_rgb(
+                        gpu_cache.compose_plane(plane, self._i, self._j, self._k, **args)
+                    )
+            except Exception:
+                _LOG.exception("GPU 合成失败，回退 CPU")
+                self._gpu_failed = True
+                used_gpu = False
+        if not used_gpu:
+            for view, plane in planes:
+                view.set_rgb(
+                    compose_plane_cpu(vol, plane, self._i, self._j, self._k, **args)
+                )
         suv = float(vol.pet[self._i, self._j, self._k])
         hu = float(vol.ct[self._i, self._j, self._k])
         lid = int(native[self._i, self._j, self._k]) if native is not None else 0

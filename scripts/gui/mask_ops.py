@@ -91,21 +91,30 @@ def lesion_stats(
     pet: Optional[np.ndarray],
     voxel_ml: float,
 ) -> list[dict]:
+    """编号、体素、体积、SUVmax。一次 unique + ndimage.maximum，不按灶扫 boolean。"""
     labeled = np.asarray(mask, dtype=np.uint16)
-    ids = [int(v) for v in np.unique(labeled) if v > 0]
+    ids, counts = np.unique(labeled, return_counts=True)
+    keep = ids > 0
+    ids = ids[keep]
+    counts = counts[keep]
+    suv_vals: Optional[np.ndarray] = None
+    if pet is not None and ids.size:
+        pet_f = np.asarray(pet, dtype=np.float32)
+        work = np.where(np.isfinite(pet_f), pet_f, np.float32(-np.inf))
+        suv_vals = np.asarray(
+            ndimage.maximum(work, labels=labeled, index=ids), dtype=np.float64
+        )
     rows: list[dict] = []
-    for lid in ids:
-        sel = labeled == lid
-        n = int(sel.sum())
-        suv_max = ""
-        if pet is not None and n:
-            vals = pet[sel]
-            vals = vals[np.isfinite(vals)]
-            if vals.size:
-                suv_max = round(float(np.max(vals)), 3)
+    for i, lid in enumerate(ids):
+        n = int(counts[i])
+        suv_max: float | str = ""
+        if suv_vals is not None:
+            peak = float(suv_vals[i])
+            if np.isfinite(peak):
+                suv_max = round(peak, 3)
         rows.append(
             {
-                "id": lid,
+                "id": int(lid),
                 "n_voxels": n,
                 "volume_ml": round(n * voxel_ml, 3),
                 "suv_max": suv_max,

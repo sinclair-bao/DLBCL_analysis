@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -32,11 +34,7 @@ from display_utils import (
     DEFAULT_WL,
     DEFAULT_WW,
     PET_CMAP_CHOICES,
-    compose_rgb,
     ct_window_from_wl,
-    slice_axial,
-    slice_coronal,
-    slice_sagittal,
     voxel_to_display,
 )
 from mask_ops import (
@@ -48,17 +46,25 @@ from mask_ops import (
     relabel_by_volume,
     threshold_pet_mask,
 )
-from ortho_viewer import _RgbView
+from ortho_viewer import _RgbView, configure_render_combo
+from render_backend import GpuVolumeCache, compose_plane_cpu, gpu_available
 from volume_io import VolumeSet
 
+_LOG = logging.getLogger(__name__)
 _MODES = ("ct", "pet", "fusion")
 _MODE_LABEL = {"ct": "CT", "pet": "PET", "fusion": "融合"}
 _PLANE_LABEL = {"axial": "轴位", "coronal": "冠状", "sagittal": "矢状"}
-_SLICE_FN = {"axial": slice_axial, "coronal": slice_coronal, "sagittal": slice_sagittal}
 
 
 class SegmentEditorDialog(QDialog):
-    def __init__(self, vol: VolumeSet, parent=None, *, pet_cmap: str = DEFAULT_PET_CMAP) -> None:
+    def __init__(
+        self,
+        vol: VolumeSet,
+        parent=None,
+        *,
+        pet_cmap: str = DEFAULT_PET_CMAP,
+        render_device: str = "cpu",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"分割编辑  {vol.patient_id}  {vol.study_date}")
         self.setModal(True)
@@ -81,6 +87,9 @@ class SegmentEditorDialog(QDialog):
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
+        self._gpu = GpuVolumeCache()
+        self._masks_dirty = True
+        self._gpu_failed = False
         pet = np.asarray(vol.pet, dtype=np.float32)
         self._pet_peak = float(np.nanmax(pet)) if pet.size else 0.0
 
@@ -149,6 +158,10 @@ class SegmentEditorDialog(QDialog):
             w.valueChanged.connect(lambda _: self.refresh(False))
         self.combo_cmap.currentIndexChanged.connect(lambda _: self.refresh(False))
 
+        self.combo_render = QComboBox()
+        self.lbl_cuda = configure_render_combo(self.combo_render, render_device)
+        self.combo_render.currentIndexChanged.connect(self._on_render_device)
+
         self.lbl_pos = QLabel("—")
 
         plane_row = QHBoxLayout()
@@ -178,6 +191,9 @@ class SegmentEditorDialog(QDialog):
         ctrl.addWidget(self.spin_alpha)
         ctrl.addWidget(QLabel("配色"))
         ctrl.addWidget(self.combo_cmap)
+        ctrl.addWidget(QLabel("渲染"))
+        ctrl.addWidget(self.combo_render)
+        ctrl.addWidget(self.lbl_cuda)
 
         self.radio_thr_rel = QRadioButton("41% SUVmax")
         self.radio_thr_abs = QRadioButton("固定 SUV")
@@ -269,6 +285,7 @@ class SegmentEditorDialog(QDialog):
         layout.addWidget(buttons)
 
         self._fit_to_screen()
+        self._bind_gpu()
         self.refresh(update_table=True)
 
     def _fit_to_screen(self) -> None:
@@ -293,6 +310,29 @@ class SegmentEditorDialog(QDialog):
     def _pet_cmap(self) -> str:
         data = self.combo_cmap.currentData()
         return str(data) if data else DEFAULT_PET_CMAP
+
+    def render_device(self) -> str:
+        if self._gpu_failed or not gpu_available():
+            return "cpu"
+        data = self.combo_render.currentData()
+        return str(data) if data else "cpu"
+
+    def _mark_masks_dirty(self) -> None:
+        self._masks_dirty = True
+
+    def _on_render_device(self, _index: int = 0) -> None:
+        self._gpu_failed = False
+        self._gpu.clear()
+        self._masks_dirty = True
+        self._bind_gpu()
+        self.refresh(update_table=False)
+
+    def _bind_gpu(self) -> None:
+        if self.render_device() != "gpu":
+            return
+        if self._gpu.bind_volumes(self._vol):
+            self._gpu.sync_masks(self._vol)
+            self._masks_dirty = False
 
     def _sync_thr_ui(self) -> None:
         rel = self.radio_thr_rel.isChecked()
@@ -346,6 +386,7 @@ class SegmentEditorDialog(QDialog):
         self._vol.dirty = True
         self.current_label = 1
         self.highlight_label = 0
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _set_plane(self, plane: str) -> None:
@@ -382,6 +423,7 @@ class SegmentEditorDialog(QDialog):
             return
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _paint(self, x: float, y: float, erase: bool) -> None:
@@ -402,11 +444,13 @@ class SegmentEditorDialog(QDialog):
             label,
         )
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=False)
 
     def _end_stroke(self) -> None:
         if self._stroke and not self._stroke_erase and self._vol._undo:
             promote_new_islands(self._vol.native, self._vol._undo[-1])
+            self._mark_masks_dirty()
         self._stroke = False
         self.refresh(update_table=True)
 
@@ -430,6 +474,7 @@ class SegmentEditorDialog(QDialog):
             if waiting:
                 QApplication.restoreOverrideCursor()
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _relabel(self) -> None:
@@ -438,6 +483,7 @@ class SegmentEditorDialog(QDialog):
         self.current_label = 1
         self.highlight_label = 1
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _on_row(self) -> None:
@@ -478,10 +524,7 @@ class SegmentEditorDialog(QDialog):
     def refresh(self, update_table: bool = True) -> None:
         vol = self._vol
         native = vol.native
-        mapped = vol.mapped
         plane = self.plane
-        fn = _SLICE_FN[plane]
-        sl = {"axial": self._k, "coronal": self._j, "sagittal": self._i}[plane]
         args_base = dict(
             pet_alpha=float(self.spin_alpha.value()),
             suv_min=float(self.spin_suv_min.value()),
@@ -492,19 +535,45 @@ class SegmentEditorDialog(QDialog):
             highlight_label=int(self.highlight_label),
             pet_cmap=self._pet_cmap(),
         )
+        device = self.render_device()
+        gpu_cache = None
+        if device == "gpu":
+            try:
+                if not self._gpu.bind_volumes(vol):
+                    raise RuntimeError("GPU 不可用")
+                if self._masks_dirty:
+                    self._gpu.sync_masks(vol)
+                    self._masks_dirty = False
+                gpu_cache = self._gpu
+            except Exception:
+                _LOG.exception("GPU 体积上传失败，回退 CPU")
+                self._gpu_failed = True
+                device = "cpu"
+        used_gpu = device == "gpu" and gpu_cache is not None
         on = self.chk_crosshair.isChecked()
         col, row = voxel_to_display(plane, self._i, self._j, self._k, vol.ct.shape)
+        rgb_by_mode: dict[str, np.ndarray] | None = None
+        if used_gpu:
+            try:
+                rgb_by_mode = {
+                    mode: gpu_cache.compose_plane(
+                        plane, self._i, self._j, self._k, mode=mode, **args_base
+                    )
+                    for mode in self._cells
+                }
+            except Exception:
+                _LOG.exception("GPU 合成失败，回退 CPU")
+                self._gpu_failed = True
+                used_gpu = False
         for mode, view in self._cells.items():
-            view.set_rgb(
-                compose_rgb(
-                    fn(vol.ct, sl),
-                    fn(vol.pet, sl),
-                    fn(native, sl),
-                    fn(mapped, sl) if mapped is not None else None,
-                    mode=mode,
-                    **args_base,
+            rgb = (
+                rgb_by_mode[mode]
+                if rgb_by_mode is not None
+                else compose_plane_cpu(
+                    vol, plane, self._i, self._j, self._k, mode=mode, **args_base
                 )
             )
+            view.set_rgb(rgb)
             view.set_crosshair_visible(on)
             if on:
                 view.set_crosshair(col, row)
