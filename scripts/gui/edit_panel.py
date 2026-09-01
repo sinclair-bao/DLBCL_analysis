@@ -46,7 +46,10 @@ class EditPanel(QWidget):
         seg_l.addWidget(self.btn_threshold)
         seg_l.addWidget(self.btn_manual)
         seg_l.addWidget(self.btn_other)
-        self.lbl_seg = QLabel("四种入口打开编辑窗。SUV 阈值：41% SUVmax 或滑杆固定值，可在窗内再调。")
+        self.lbl_seg = QLabel(
+            "AutoPET：校验 CT+PET 后在主界面展示。SUV 阈值：先开图像再选手动阈值。"
+            "空白手动 / 载入 mask 打开编辑窗。"
+        )
         self.lbl_seg.setWordWrap(True)
         seg_l.addWidget(self.lbl_seg)
         seg_box.setLayout(seg_l)

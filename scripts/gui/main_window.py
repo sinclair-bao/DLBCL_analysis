@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -39,10 +40,11 @@ for _p in (str(_LONG), str(_COMMON), str(_SCRIPTS / "gui"), str(_SCRIPTS)):
 from catalog import DataCatalog  # noqa: E402
 from session import load_session, save_session  # noqa: E402
 
+from busy import busy_progress, make_progress  # noqa: E402
 from edit_panel import EditPanel  # noqa: E402
 from evolution_strip import EvolutionStrip  # noqa: E402
 from feature_panel import FeaturePanel  # noqa: E402
-from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume, threshold_pet_mask  # noqa: E402
+from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume  # noqa: E402
 from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
@@ -87,7 +89,7 @@ class MainWindow(QMainWindow):
         self._seg_worker: Optional[SegmentWorker] = None
         self._vol_cache: OrderedDict[tuple[str, str, str], object] = OrderedDict()
         self._browser_width = 0
-        self._open_editor_after_seg = False
+        self._busy_dlg: Optional[QProgressDialog] = None
 
         self.browser = PatientBrowser()
         self.timepoints = TimepointPanel()
@@ -272,6 +274,22 @@ class MainWindow(QMainWindow):
         if not self.current_patient:
             return None
         return self.timepoints.current_session(self.current_patient)
+
+    def _show_progress(self, title: str, label: str) -> None:
+        self._close_progress()
+        self._busy_dlg = make_progress(self, title, label)
+        self.status.showMessage(label)
+
+    def _update_progress(self, label: str) -> None:
+        self.status.showMessage(label)
+        if self._busy_dlg is not None:
+            self._busy_dlg.setLabelText(label)
+            QApplication.processEvents()
+
+    def _close_progress(self) -> None:
+        if self._busy_dlg is not None:
+            self._busy_dlg.close()
+            self._busy_dlg = None
 
     def _load_vol(self, patient_id: str, study_date: str, baseline_date: Optional[str]):
         key = (patient_id, study_date, baseline_date or "")
@@ -483,13 +501,15 @@ class MainWindow(QMainWindow):
         save_session(self.catalog.processed_root, session)
         self.timepoints.btn_map.setEnabled(False)
         self.edit_panel.set_busy(True)
+        self._show_progress("映射", "正在配准 CT（约数分钟，请勿关闭）…")
         self._map_worker = MappingWorker(self.catalog, self.current_patient, overwrite=True)
-        self._map_worker.progress.connect(self.status.showMessage)
+        self._map_worker.progress.connect(self._update_progress)
         self._map_worker.failed.connect(self._on_worker_fail)
         self._map_worker.finished_ok.connect(self._on_map_done)
         self._map_worker.start()
 
     def _on_map_done(self, msg: str) -> None:
+        self._close_progress()
         self.timepoints.btn_map.setEnabled(True)
         self.edit_panel.set_busy(False)
         if self.current_patient:
@@ -522,25 +542,27 @@ class MainWindow(QMainWindow):
             return
         self.timepoints.btn_feat.setEnabled(False)
         self.edit_panel.set_busy(True)
+        self._show_progress("特征", "正在提取代谢 / 组学特征…")
         self._feat_worker = FeatureWorker(self.catalog, self.current_patient, include_radiomics=True)
-        self._feat_worker.progress.connect(self.status.showMessage)
+        self._feat_worker.progress.connect(self._update_progress)
         self._feat_worker.failed.connect(self._on_worker_fail)
         self._feat_worker.finished_ok.connect(self._on_feat_done)
         self._feat_worker.start()
 
     def _on_feat_done(self, csv_path: str) -> None:
+        self._close_progress()
         self.timepoints.btn_feat.setEnabled(True)
         self.edit_panel.set_busy(False)
         self.features.load_csv(Path(csv_path))
         self.status.showMessage(f"特征已写入 {csv_path}")
 
     def _on_worker_fail(self, msg: str) -> None:
+        self._close_progress()
         self.timepoints.btn_map.setEnabled(True)
         self.timepoints.btn_feat.setEnabled(True)
         self.edit_panel.set_busy(False)
         QMessageBox.warning(self, "任务失败", msg)
         self.status.showMessage(msg)
-        self._open_editor_after_seg = False
 
     def _voxel_ml(self) -> float:
         import numpy as np
@@ -586,17 +608,35 @@ class MainWindow(QMainWindow):
             self._load_other_mask()
             return
         if method == "threshold":
-            start = threshold_pet_mask(vol.pet, mode="relative", value=0.41)
+            import numpy as np
+
+            start = np.zeros(vol.ct.shape, dtype=np.uint16)
             self._open_segment_editor(start)
+            return
+        assets = self.catalog.get_study(self.current_patient, self.current_date)
+        missing: list[str] = []
+        if assets is None:
+            missing.append("检查目录")
+        else:
+            if assets.working_ct is None:
+                missing.append("CT")
+            if assets.working_pet is None:
+                missing.append("PET")
+        if missing:
+            QMessageBox.warning(
+                self,
+                "AutoPET",
+                "AutoPET 需要成对的 CT 与 PET，当前缺少：\n" + "\n".join(missing),
+            )
             return
         self.edit_panel.set_busy(True)
         self.timepoints.btn_map.setEnabled(False)
         self.timepoints.btn_feat.setEnabled(False)
-        self._open_editor_after_seg = True
+        self._show_progress("AutoPET", "正在准备 AutoPET…")
         self._seg_worker = SegmentWorker(
             method, self.current_patient, self.current_date, self.catalog
         )
-        self._seg_worker.progress.connect(self.status.showMessage)
+        self._seg_worker.progress.connect(self._update_progress)
         self._seg_worker.failed.connect(self._on_worker_fail)
         self._seg_worker.finished_ok.connect(self._on_seg_done)
         self._seg_worker.start()
@@ -648,6 +688,7 @@ class MainWindow(QMainWindow):
         self._refresh_lesion_table()
 
     def _on_seg_done(self, msg: str) -> None:
+        self._close_progress()
         self.edit_panel.set_busy(False)
         self.timepoints.btn_map.setEnabled(True)
         self.timepoints.btn_feat.setEnabled(True)
@@ -659,9 +700,15 @@ class MainWindow(QMainWindow):
             self.browser.select_patient(self.current_patient)
             if self.current_date:
                 self._on_study(self.current_patient, self.current_date)
+        self.ortho.chk_native.setChecked(True)
         self.status.showMessage(msg)
-        if self._open_editor_after_seg:
-            self._open_editor_after_seg = False
+        box = QMessageBox(self)
+        box.setWindowTitle("AutoPET")
+        box.setText("分割已叠加在主界面。若要手动改，可用「其他（载入 mask）」打开编辑窗。")
+        adj = box.addButton("手动调整", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("留在主界面", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() == adj:
             self._open_segment_editor()
 
     def _on_morph(self, op: str) -> None:
@@ -676,16 +723,16 @@ class MainWindow(QMainWindow):
         ijk = self.ortho.ijk() if plane else None
         waiting = plane is None
         if waiting:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
-        try:
+            with busy_progress(self, "形态学", "正在三维形态学运算…"):
+                QApplication.processEvents()
+                new_mask = morph_labels(
+                    vol.native, op, radius, label=label, plane=plane, ijk=ijk
+                )
+        else:
             new_mask = morph_labels(
                 vol.native, op, radius, label=label, plane=plane, ijk=ijk
             )
-            self.ortho.apply_mask(new_mask)
-        finally:
-            if waiting:
-                QApplication.restoreOverrideCursor()
+        self.ortho.apply_mask(new_mask)
 
     def _on_relabel(self) -> None:
         vol = self.ortho.volumes()
@@ -713,7 +760,8 @@ class MainWindow(QMainWindow):
             self,
             "关于",
             "DLBCL 纵向 PET/CT 分析软件\n"
-            "四种分割入口打开 CT/PET/融合三格编辑窗，点选轴/冠/矢平面。\n"
+            "四种分割：AutoPET 校验 CT+PET 后在主界面展示结果；\n"
+            "SUV 阈值 / 空白手动 / 载入 mask 打开 CT/PET/融合编辑窗。\n"
             "二维画笔微调 + 膨胀/腐蚀；编号病灶另存为 *_lesion_edited.nii.gz。\n"
             "显示：仅 CT / 仅 PET（灰度）/ PET-CT；轴冠 MIP 标 R/L，矢状标 P/A。\n"
             "十字线与患者列表可隐藏（F2）。\n"

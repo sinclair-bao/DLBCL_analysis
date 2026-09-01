@@ -46,9 +46,12 @@ python scripts/gui/app.py \
 
 1. 左侧点患者，再点子检查日期。状态灯：绿 = CT+PET+lesion 齐全；黄 = 缺 mask 或同机配准；红 = 缺 CT 或 PET。
 2. 右侧为 **基线 / 中期 / 末期** 各选一个日期（可只选 1–3 个；三个角色不能指向同一天）。写入 `data/processed/<PatientID>/longitudinal_session.json`。
-3. 无 mask 或要改 mask：点 AutoPET / SUV 阈值 / 空白手动 / 载入已有 mask，在弹出的三格编辑窗里涂改，**保存并关闭**。SUV 阈值默认 **41% SUVmax**（内存计算，不开后台任务）；编辑窗内可改成固定 SUV 滑杆（0.5–15）。
+3. 无 mask 或要改 mask：
+   - **AutoPET**：先检查该次检查有 CT 与 PET；有进度条。完成后**回到主界面**看红色 overlay。若要手改，点完成框「手动调整」或「其他（载入 mask）」。
+   - **SUV 阈值**：打开编辑窗**只显示图像**，不预填 41%；选「41% SUVmax」或「固定 SUV」后才算 mask。
+   - **空白手动** / **其他（载入 mask）**：打开三格编辑窗。保存并关闭写入 sidecar。
 4. 映射前必须有基线 mask + 至少一个随访、且随访有 2 mm CT。完成后界面会切到中期（没有则末期），勾上「映射 mask」。**青色只出现在随访上**，停在基线会误以为没映射。
-5. 映射约 1–3 分钟，状态栏会提示请勿关闭。未保存的 mask 会先询问是否存盘。
+5. 映射与 AutoPET、特征提取、三维形态学会弹出进度条（状态栏同时有文案）。未保存的 mask 映射前会先询问是否存盘。
 6. 算特征后，右下角表和折线会刷新；菜单可导出。
 
 主界面上的 **查看 基线 / 中期 / 末期** 只切换当前显示的检查，不负责指定角色。指定角色只用右侧下拉框。
@@ -105,9 +108,9 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 ### 3.3 编辑约定
 
 - 分割编辑窗：并排 CT / PET / 融合；点选轴位 / 冠状 / 矢状。任一格**左键涂、右键擦**，三格 mask 同步。
-- **SUV 阈值**：打开时按全图 SUVmax 的 41% 生成 mask；窗内单选「41% SUVmax / 固定 SUV」，固定模式用滑杆（松开后重算）。切换模式会覆盖当前 mask（可撤销）。
+- **SUV 阈值**：打开时**不算** mask；窗内点选「41% SUVmax / 固定 SUV」后才计算。固定模式用滑杆（松开后重算）。切换模式会覆盖当前 mask（可撤销）。
 - 主窗口勾选「编辑 mask」后也可在当前三视图上涂擦（无三格对照，容易误改）。
-- 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5；范围默认 **当前层 2D**（只改该切片）；**三维**在病灶边界盒内运算。三维时出现等待光标。
+- 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5；范围默认 **当前层 2D**（只改该切片）；**三维**在病灶边界盒内运算，并显示进度条。
 - 保存写入 sidecar `{PatientID}_{StudyDate}_lesion_edited.nii.gz`，**从不覆盖** nnU-Net 的 `*_lesion.nii.gz`。
 - 连通域自动编号；「按体积重新编号」按体素数从大到小变成 1..N。
 
@@ -122,7 +125,7 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 | 文件 | 作用 |
 |------|------|
 | [`app.py`](app.py) | 程序入口。在导入 matplotlib 画布前设置 `QtAgg`，检查 PySide6/pyqtgraph，解析 `--interim-root` / `--processed-root`，创建 `QApplication` 与 `MainWindow`。 |
-| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存 `_vol_cache` 为上限 6 套的 LRU（换患者不整表清空；映射按患者失效，AutoPET 按检查失效）。 |
+| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存 `_vol_cache` 为上限 6 套的 LRU（换患者不整表清空；映射按患者失效，AutoPET 按检查失效）。耗时任务用 `QProgressDialog`。 |
 | [`__init__.py`](__init__.py) | 包标记，无逻辑。 |
 
 ### 4.2 面板（左右栏）
@@ -138,14 +141,15 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 
 | 文件 | 作用 |
 |------|------|
-| [`ortho_viewer.py`](ortho_viewer.py) | 轴/冠/矢三视图。显示模式（仅 CT / 仅 PET / 融合）、窗位窗宽（默认 40/400）、SUV 窗、**PET 配色**下拉、**渲染** CPU/GPU、融合透明度、缩放、十字线、本底/映射/编辑勾选、查看基线/中期/末期。`_RgbView` 负责 RGB 图、十字线、视口 L/R（矢状 P/A）；首次设图或尺寸变化时自动 fit 视野。勾选编辑后二维画笔。 |
+| [`ortho_viewer.py`](ortho_viewer.py) | 轴/冠/矢三视图。点选十字时一次写入 ijk 再刷新，三平面同步；切片未变的平面只挪十字、不重绘、不改缩放。显示模式、窗位窗宽、SUV 窗、PET 配色、渲染 CPU/GPU、融合、十字线、本底/映射/编辑勾选、查看基线/中期/末期。 |
 | [`evolution_strip.py`](evolution_strip.py) | 下方最多三列冠状 MIP，等比例、统一缩放。可叠本底（红）与映射（青）。`_MipView` 同样标 R/L。 |
-| [`segment_editor.py`](segment_editor.py) | 模态分割编辑窗：三格 CT/PET/融合，平面由轴/冠/矢单选切换；SUV 阈值滑杆/41%；PET 配色；渲染 CPU/GPU（打开时跟主窗）；画笔、形态学、撤销、重编号、病灶表。确定后把 mask 交回主窗并保存 sidecar。取消不改主窗口。切平面时调用 `set_laterality` 并重新 fit 视野。 |
+| [`segment_editor.py`](segment_editor.py) | 模态分割编辑窗：三格 CT/PET/融合；SUV 阈值打开时不算默认 mask；PET 配色；渲染 CPU/GPU（打开时跟主窗）；画笔、形态学、撤销、重编号、病灶表。确定后把 mask 交回主窗并保存 sidecar。 |
 
 ### 4.4 显示与 mask 算法
 
 | 文件 | 作用 |
 |------|------|
+| [`busy.py`](busy.py) | `QProgressDialog` 不确定进度条，供 AutoPET / 映射 / 特征 / 三维形态学 / 阈值重算。 |
 | [`display_utils.py`](display_utils.py) | 切片朝向（`orient_*` / `slice_*`）、冠状 MIP、PET 配色 LUT（灰度/热金/Hot/Jet/Inferno）、CT 窗、`compose_rgb` 叠红/黄/青。`display_to_voxel` / `voxel_to_display` 把点击映回 RAS 体素。 |
 | [`render_backend.py`](render_backend.py) | CPU/GPU 合成入口。`gpu_available()` 检测 CuPy+CUDA；GPU 把整本体积上传后切片+伪彩+融合，下载 RGB 给 pyqtgraph。失败回退 CPU。 |
 | [`mask_ops.py`](mask_ops.py) | 连通域编号、`paint_disk`、新岛提升编号、`morph_labels`（2D 只改当前层，3D 用 bounding box）、`threshold_pet_mask`、`lesion_stats`（`unique` + `ndimage.maximum`）、按体积重编号。 |
@@ -159,7 +163,7 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 |----|--------|
 | `MappingWorker` | 调 `InterscanRegistrar.map_session`。进度文案「正在配准 CT（约数分钟，请勿关闭）…」。任一随访成功则 `finished_ok`（可附带失败侧说明）；全部失败才 `failed`。 |
 | `FeatureWorker` | 调 `features.extract_patient_features`，写出 `data/processed/<ID>/longitudinal_features.csv`。 |
-| `SegmentWorker` | 仅 **AutoPET**：`export_nnunet.py` + `infer_nnunet.py`（`autopet` 解释器）。GUI 的 SUV 阈值在内存里算，不走此线程。 |
+| `SegmentWorker` | 仅 **AutoPET**：启动前校验 CT+PET；`export_nnunet.py` + `infer_nnunet.py`（`autopet` 解释器）。完成后回主界面。GUI 的 SUV 阈值在内存里算，不走此线程。 |
 
 ---
 
@@ -206,7 +210,8 @@ DataCatalog 扫描磁盘
         ▼
   TimepointPanel ──► save_session JSON
         │
-        ├── AutoPET / 阈值 / 手动 / 载入 ──► SegmentEditorDialog ──► lesion_edited.nii.gz
+        ├── AutoPET ──► 校验 CT+PET ──► 进度条 ──► 主界面结果（可选手动调整）
+        ├── SUV 阈值 / 空白手动 / 载入 ──► SegmentEditorDialog ──► lesion_edited.nii.gz
         │
         ├── 映射按钮 ──► 预检 ──► MappingWorker ──► ANTs ──► 切到随访 + 青色 overlay
         │

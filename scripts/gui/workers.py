@@ -151,7 +151,9 @@ class SegmentWorker(QThread):
             raise RuntimeError(f"未找到 autopet Python: {AUTOPET_PYTHON}")
         export_root = _PROJECT / "data" / "nnunet_export"
         case = f"{self._patient_id}_{self._study_date}"
-        if not (export_root / f"{case}_0000.nii.gz").is_file():
+        if not (export_root / f"{case}_0000.nii.gz").is_file() or not (
+            export_root / f"{case}_0001.nii.gz"
+        ).is_file():
             self._run_cmd(
                 [
                     str(DA_PYTHON),
@@ -161,7 +163,18 @@ class SegmentWorker(QThread):
                     "--study-date",
                     self._study_date,
                 ],
-                "导出 nnU-Net 格式",
+                "导出 nnU-Net 格式（CT=_0000，PET=_0001）",
+            )
+        ct_nii = export_root / f"{case}_0000.nii.gz"
+        pet_nii = export_root / f"{case}_0001.nii.gz"
+        if not ct_nii.is_file() or not pet_nii.is_file():
+            missing = []
+            if not ct_nii.is_file():
+                missing.append("CT（_0000）")
+            if not pet_nii.is_file():
+                missing.append("PET（_0001）")
+            raise RuntimeError(
+                "AutoPET 需要成对的 CT 与 PET 输入，缺少：" + "、".join(missing)
             )
         self._run_cmd(
             [

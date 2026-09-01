@@ -661,8 +661,9 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 - 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
 - 无 mask 时：右侧 **AutoPET 分割**、**SUV 阈值分割**、**空白手动分割**，或 **其他（载入已有 mask）**
-- SUV 阈值在内存中计算（默认 **41% SUVmax**），编辑窗内可改为固定 SUV 滑杆（0.5–15）；不走后台 CLI
-- 四种入口都会打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
+- AutoPET 先检查该次检查有工作 CT 与 PET；推理完成后回到**主界面**看本底 overlay。需要手改时用「其他（载入 mask）」或完成框「手动调整」
+- SUV 阈值打开编辑窗时**只显示图像**，不预填 41%；用户点选「41% SUVmax」或固定 SUV 后才算 mask（内存计算，不走后台 CLI）
+- **空白手动**与**载入 mask**打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
 - **保存并关闭** 写入 sidecar `{ID}_{Date}_lesion_edited.nii.gz`；取消不改主窗口
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，当前层或三维、当前灶或全部。**当前层只改该切片**；三维在病灶边界盒内运算（避免整本体膨胀卡顿）
 - 连通域自动编号，列表显示体素 / 体积 / SUVmax；可按体积重新编号

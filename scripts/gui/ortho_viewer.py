@@ -176,14 +176,11 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         cur = self.item.image
-        shape_changed = cur is None or cur.shape != img.shape
         if cur is not None and cur.shape == img.shape and cur.dtype == img.dtype:
             np.copyto(cur, img)
             self.item.updateImage()
         else:
             self.item.setImage(img, autoLevels=False)
-        if shape_changed:
-            self.set_zoom(100)
 
     def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
@@ -216,6 +213,7 @@ class OrthoViewer(QWidget):
         self._gpu = GpuVolumeCache()
         self._masks_dirty = True
         self._gpu_failed = False
+        self._shown_ijk: Optional[tuple[int, int, int]] = None
 
         self.axial = _RgbView("Axial", "axial")
         self.coronal = _RgbView("Coronal", "coronal")
@@ -243,7 +241,7 @@ class OrthoViewer(QWidget):
         self._mode_group = QButtonGroup(self)
         for r in (self.radio_fusion, self.radio_ct, self.radio_pet):
             self._mode_group.addButton(r)
-            r.toggled.connect(self.refresh)
+            r.toggled.connect(lambda *_: self.refresh(True))
 
         self.radio_bl = QRadioButton("基线")
         self.radio_in = QRadioButton("中期")
@@ -266,16 +264,16 @@ class OrthoViewer(QWidget):
         self.chk_native.setChecked(True)
         self.chk_mapped.setChecked(True)
         self.chk_crosshair.setChecked(True)
-        self.chk_native.toggled.connect(self.refresh)
-        self.chk_mapped.toggled.connect(self.refresh)
+        self.chk_native.toggled.connect(lambda *_: self.refresh(True))
+        self.chk_mapped.toggled.connect(lambda *_: self.refresh(True))
         self.chk_edit.toggled.connect(self._toggle_edit)
-        self.chk_crosshair.toggled.connect(self.refresh)
+        self.chk_crosshair.toggled.connect(lambda *_: self.refresh(False))
 
         self.spin_alpha = QDoubleSpinBox()
         self.spin_alpha.setRange(0.0, 1.0)
         self.spin_alpha.setSingleStep(0.05)
         self.spin_alpha.setValue(0.55)
-        self.spin_alpha.valueChanged.connect(self.refresh)
+        self.spin_alpha.valueChanged.connect(lambda *_: self.refresh(True))
 
         self.spin_suv_min = QDoubleSpinBox()
         self.spin_suv_min.setRange(0.0, 20.0)
@@ -283,8 +281,8 @@ class OrthoViewer(QWidget):
         self.spin_suv_max = QDoubleSpinBox()
         self.spin_suv_max.setRange(0.5, 40.0)
         self.spin_suv_max.setValue(6.0)
-        self.spin_suv_min.valueChanged.connect(self.refresh)
-        self.spin_suv_max.valueChanged.connect(self.refresh)
+        self.spin_suv_min.valueChanged.connect(lambda *_: self.refresh(True))
+        self.spin_suv_max.valueChanged.connect(lambda *_: self.refresh(True))
         self.spin_suv = self.spin_suv_max
 
         self.spin_wl = QSpinBox()
@@ -293,8 +291,8 @@ class OrthoViewer(QWidget):
         self.spin_ww = QSpinBox()
         self.spin_ww.setRange(1, 4000)
         self.spin_ww.setValue(int(DEFAULT_WW))
-        self.spin_wl.valueChanged.connect(self.refresh)
-        self.spin_ww.valueChanged.connect(self.refresh)
+        self.spin_wl.valueChanged.connect(lambda *_: self.refresh(True))
+        self.spin_ww.valueChanged.connect(lambda *_: self.refresh(True))
 
         self.spin_zoom = QSpinBox()
         self.spin_zoom.setRange(50, 400)
@@ -314,7 +312,7 @@ class OrthoViewer(QWidget):
             self.combo_cmap.addItem(label, key)
         idx = self.combo_cmap.findData(DEFAULT_PET_CMAP)
         self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
-        self.combo_cmap.currentIndexChanged.connect(self.refresh)
+        self.combo_cmap.currentIndexChanged.connect(lambda *_: self.refresh(True))
 
         self.combo_render = QComboBox()
         self.lbl_cuda = configure_render_combo(self.combo_render)
@@ -423,7 +421,7 @@ class OrthoViewer(QWidget):
         self._gpu.clear()
         self._masks_dirty = True
         self._bind_gpu()
-        self.refresh()
+        self.refresh(True)
 
     def _bind_gpu(self) -> None:
         vol = self._vol
@@ -449,6 +447,7 @@ class OrthoViewer(QWidget):
         self._gpu.clear()
         self._gpu_failed = False
         self._masks_dirty = True
+        self._shown_ijk = None
         if vol is None:
             self.lbl_pos.setText("无图像")
             for view in (self.axial, self.coronal, self.sagittal):
@@ -470,17 +469,32 @@ class OrthoViewer(QWidget):
         self.slider_i.blockSignals(False)
         self.slider_j.blockSignals(False)
         self.slider_k.blockSignals(False)
-        self.refresh()
+        self.refresh(True)
         self._apply_zoom(self.spin_zoom.value())
 
     def volumes(self) -> Optional[VolumeSet]:
         return self._vol
 
+    def _set_ijk(self, i: int, j: int, k: int) -> None:
+        self.slider_i.blockSignals(True)
+        self.slider_j.blockSignals(True)
+        self.slider_k.blockSignals(True)
+        self.slider_i.setValue(int(i))
+        self.slider_j.setValue(int(j))
+        self.slider_k.setValue(int(k))
+        self.slider_i.blockSignals(False)
+        self.slider_j.blockSignals(False)
+        self.slider_k.blockSignals(False)
+        self._i = self.slider_i.value()
+        self._j = self.slider_j.value()
+        self._k = self.slider_k.value()
+        self.refresh(False)
+
     def _sliders_changed(self) -> None:
         self._i = self.slider_i.value()
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
-        self.refresh()
+        self.refresh(False)
 
     def _click(self, which: str, x: float, y: float) -> None:
         self.active_view = which
@@ -491,9 +505,7 @@ class OrthoViewer(QWidget):
         ii, jj, kk = display_to_voxel(
             which, x, y, self._i, self._j, self._k, self._vol.ct.shape
         )
-        self.slider_i.setValue(ii)
-        self.slider_j.setValue(jj)
-        self.slider_k.setValue(kk)
+        self._set_ijk(ii, jj, kk)
 
     def _push_undo(self) -> None:
         if self._vol is None:
@@ -508,7 +520,7 @@ class OrthoViewer(QWidget):
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
         self.mark_masks_dirty()
-        self.refresh()
+        self.refresh(True)
         self.mask_changed.emit()
 
     def _paint(self, which: str, x: float, y: float, erase: bool) -> None:
@@ -536,14 +548,14 @@ class OrthoViewer(QWidget):
         )
         vol.dirty = True
         self.mark_masks_dirty()
-        self.refresh()
+        self.refresh(True)
 
     def _end_stroke(self) -> None:
         vol = self._vol
         if vol is not None and self._stroke and not self._stroke_erase and vol._undo:
             promote_new_islands(vol.native, vol._undo[-1])
             self.mark_masks_dirty()
-            self.refresh()
+            self.refresh(True)
         self._stroke = False
         self.mask_changed.emit()
 
@@ -555,7 +567,7 @@ class OrthoViewer(QWidget):
         self._vol.native = np.asarray(mask, dtype=np.uint16)
         self._vol.dirty = True
         self.mark_masks_dirty()
-        self.refresh()
+        self.refresh(True)
         self.mask_changed.emit()
 
     def ijk(self) -> tuple[int, int, int]:
@@ -565,7 +577,7 @@ class OrthoViewer(QWidget):
         for v in (self.axial, self.coronal, self.sagittal):
             v.set_zoom(int(percent))
 
-    def refresh(self) -> None:
+    def refresh(self, force: bool = True) -> None:
         vol = self._vol
         if vol is None:
             return
@@ -581,41 +593,46 @@ class OrthoViewer(QWidget):
             pet_cmap=self.pet_cmap(),
         )
         native = vol.native
-        device = self.render_device()
-        gpu_cache = None
-        if device == "gpu":
-            try:
-                if not self._gpu.bind_volumes(vol):
-                    raise RuntimeError("GPU 不可用")
-                if self._masks_dirty:
-                    self._gpu.sync_masks(vol)
-                    self._masks_dirty = False
-                gpu_cache = self._gpu
-            except Exception:
-                _LOG.exception("GPU 体积上传失败，回退 CPU")
-                self._gpu_failed = True
-                device = "cpu"
-        planes = (
-            (self.axial, "axial"),
-            (self.coronal, "coronal"),
-            (self.sagittal, "sagittal"),
-        )
-        used_gpu = device == "gpu" and gpu_cache is not None
-        if used_gpu:
-            try:
-                for view, plane in planes:
+        prev = self._shown_ijk
+        planes = [
+            (self.axial, "axial", prev is None or force or prev[2] != self._k),
+            (self.coronal, "coronal", prev is None or force or prev[1] != self._j),
+            (self.sagittal, "sagittal", prev is None or force or prev[0] != self._i),
+        ]
+        need = [(view, name) for view, name, yes in planes if yes]
+        if need:
+            device = self.render_device()
+            gpu_cache = None
+            if device == "gpu":
+                try:
+                    if not self._gpu.bind_volumes(vol):
+                        raise RuntimeError("GPU 不可用")
+                    if self._masks_dirty:
+                        self._gpu.sync_masks(vol)
+                        self._masks_dirty = False
+                    gpu_cache = self._gpu
+                except Exception:
+                    _LOG.exception("GPU 体积上传失败，回退 CPU")
+                    self._gpu_failed = True
+                    device = "cpu"
+            used_gpu = device == "gpu" and gpu_cache is not None
+            if used_gpu:
+                try:
+                    for view, plane in need:
+                        view.set_rgb(
+                            gpu_cache.compose_plane(
+                                plane, self._i, self._j, self._k, **args
+                            )
+                        )
+                except Exception:
+                    _LOG.exception("GPU 合成失败，回退 CPU")
+                    self._gpu_failed = True
+                    used_gpu = False
+            if not used_gpu:
+                for view, plane in need:
                     view.set_rgb(
-                        gpu_cache.compose_plane(plane, self._i, self._j, self._k, **args)
+                        compose_plane_cpu(vol, plane, self._i, self._j, self._k, **args)
                     )
-            except Exception:
-                _LOG.exception("GPU 合成失败，回退 CPU")
-                self._gpu_failed = True
-                used_gpu = False
-        if not used_gpu:
-            for view, plane in planes:
-                view.set_rgb(
-                    compose_plane_cpu(vol, plane, self._i, self._j, self._k, **args)
-                )
         suv = float(vol.pet[self._i, self._j, self._k])
         hu = float(vol.ct[self._i, self._j, self._k])
         lid = int(native[self._i, self._j, self._k]) if native is not None else 0
@@ -624,6 +641,7 @@ class OrthoViewer(QWidget):
             f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  "
             f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
         )
+        self._shown_ijk = (self._i, self._j, self._k)
         self._update_crosshairs()
 
     def _update_crosshairs(self) -> None:
