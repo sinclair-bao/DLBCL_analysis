@@ -13,6 +13,7 @@ from nibabel.processing import resample_from_to
 
 from catalog import StudyAssets
 from mask_ops import ensure_labeled
+from quality import fingerprint
 
 
 @dataclass
@@ -26,6 +27,9 @@ class VolumeSet:
     affine: Optional[np.ndarray] = None
     role: str = ""
     dirty: bool = False
+    edited_sha256: Optional[str] = None
+    native_source_path: Optional[str] = None
+    native_source_sha256: Optional[str] = None
     _undo: list = field(default_factory=list, repr=False)
 
 
@@ -46,12 +50,16 @@ def _to_ref(
 def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) -> Optional[VolumeSet]:
     if assets.working_ct is None or assets.working_pet is None:
         return None
-    ref = nib.load(str(assets.working_ct))
+    ref = nib.as_closest_canonical(nib.load(str(assets.working_ct)))
+    if not np.isfinite(ref.affine).all() or abs(np.linalg.det(ref.affine[:3, :3])) < 1e-8:
+        raise ValueError(f"CT 几何信息无效: {assets.working_ct}")
     ct = np.asanyarray(ref.dataobj, dtype=np.float32)
     pet = _to_ref(assets.working_pet, ref, order=1, dtype=np.float32)
     native = np.zeros(ct.shape, dtype=np.uint16)
     if assets.working_lesion is not None:
         raw = _to_ref(assets.working_lesion, ref, order=0, dtype=np.uint16)
+        if not np.any(raw) and np.any(np.asanyarray(nib.load(str(assets.working_lesion)).dataobj)):
+            raise ValueError(f"mask 与 CT 空间不重叠: {assets.working_lesion}")
         native = ensure_labeled(raw)
     mapped = None
     if baseline_date:
@@ -66,6 +74,11 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
         study_date=assets.study_date,
         patient_id=assets.patient_id,
         affine=np.asarray(ref.affine),
+        edited_sha256=(fingerprint(assets.lesion_edited)["sha256"]
+                       if assets.lesion_edited is not None else None),
+        native_source_path=str(assets.working_lesion) if assets.working_lesion else None,
+        native_source_sha256=(fingerprint(assets.working_lesion)["sha256"]
+                              if assets.working_lesion else None),
     )
 
 
@@ -75,6 +88,8 @@ def load_mask_from_path(path, vol: VolumeSet) -> np.ndarray:
         raise ValueError("体积缺少仿射，无法重采样 mask")
     ref = nib.Nifti1Image(np.zeros(vol.ct.shape, dtype=np.uint16), vol.affine)
     raw = _to_ref(path, ref, order=0, dtype=np.uint16)
+    if not np.any(raw) and np.any(np.asanyarray(nib.load(str(path)).dataobj)):
+        raise ValueError(f"导入 mask 与当前 CT 空间不重叠: {path}")
     return ensure_labeled(raw)
 
 
@@ -87,4 +102,6 @@ def save_edited_mask(vol: VolumeSet, out_path) -> None:
     affine = vol.affine if vol.affine is not None else np.eye(4)
     img = nib.Nifti1Image(np.asarray(vol.native, dtype=np.uint16), affine)
     img.header.set_data_dtype(np.uint16)
-    nib.save(img, str(out_path))
+    temp = out_path.with_name(out_path.name + ".tmp.nii.gz")
+    nib.save(img, str(temp))
+    temp.replace(out_path)

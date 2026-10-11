@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ for _p in (_LONG, _COMMON, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-AUTOPET_PYTHON = Path("/home/sun/miniconda3/envs/autopet/bin/python")
+AUTOPET_PYTHON = Path(os.environ.get("AUTOPET_PYTHON", "/home/sun/miniconda3/envs/autopet/bin/python"))
 DA_PYTHON = Path(sys.executable)
 
 
@@ -76,11 +77,13 @@ class FeatureWorker(QThread):
         catalog,
         patient_id: str,
         include_radiomics: bool = True,
+        per_lesion: bool = False,
     ) -> None:
         super().__init__()
         self._catalog = catalog
         self._patient_id = patient_id
         self._include_radiomics = include_radiomics
+        self._per_lesion = per_lesion
 
     def run(self) -> None:
         try:
@@ -93,6 +96,8 @@ class FeatureWorker(QThread):
                 self._catalog,
                 session,
                 include_radiomics=self._include_radiomics,
+                require_qc=True,
+                per_lesion=self._per_lesion,
             )
             if not rows:
                 self.failed.emit("没有特征行：请先指定时间点并完成基线映射。")

@@ -41,6 +41,7 @@ from ants_runner import (  # noqa: E402
     run_ants,
 )
 from catalog import DataCatalog, StudyAssets  # noqa: E402
+from quality import mapping_status, write_mapping_manifest  # noqa: E402
 from session import load_session  # noqa: E402
 
 logger = logging.getLogger("interscan_register")
@@ -131,6 +132,7 @@ class InterscanRegistrar:
             not self.overwrite
             and mat.is_file()
             and warped_mask.is_file()
+            and mapping_status(baseline, followup) in ("pending", "approved", "rejected")
         ):
             return StageResult(
                 STAGE_NAME, patient_id, followup_date, "skipped", str(warped_mask),
@@ -160,6 +162,7 @@ class InterscanRegistrar:
         try:
             self._register_ct_ct(fixed_ct, moving_ct, out_dir, baseline_date)
             self._warp_mask(moving_mask, fixed_ct, mat, warped_mask)
+            write_mapping_manifest(baseline, followup, warped_mask)
         except Exception as exc:
             logger.exception("跨检查配准失败: %s %s → %s", patient_id, baseline_date, followup_date)
             return StageResult(
@@ -277,6 +280,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--interim-root", type=Path, default=DEFAULT_INTERIM_ROOT)
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT)
+    parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--ants-bin", type=Path, default=DEFAULT_ANTS_BIN)
     parser.add_argument("--patient-id", default=None, help="只处理该患者")
@@ -291,7 +295,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     setup_logging(args.verbose)
-    catalog = DataCatalog(args.interim_root, args.processed_root)
+    catalog = DataCatalog(args.interim_root, args.processed_root, args.manifest)
     try:
         registrar = InterscanRegistrar(catalog, ants_bin=args.ants_bin, overwrite=args.overwrite)
     except RuntimeError as exc:

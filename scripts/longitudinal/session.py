@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -27,14 +27,17 @@ class LongitudinalSession:
     baseline: Optional[str] = None
     interim: Optional[str] = None
     end: Optional[str] = None
+    extra_dates: list[str] = field(default_factory=list)
 
-    def as_dict(self) -> dict[str, Optional[str]]:
+    def as_dict(self) -> dict:
         return asdict(self)
 
     def role_of(self, study_date: str) -> Optional[str]:
         for role in ROLES:
             if getattr(self, role) == study_date:
                 return role
+        if study_date in self.extra_dates:
+            return f"followup_{self.extra_dates.index(study_date) + 1}"
         return None
 
     def assigned(self) -> dict[str, str]:
@@ -44,6 +47,8 @@ class LongitudinalSession:
             value = getattr(self, role)
             if value:
                 out[role] = value
+        for index, date in enumerate(self.extra_dates, 1):
+            out[f"followup_{index}"] = date
         return out
 
     def followups(self) -> list[tuple[str, str]]:
@@ -53,8 +58,10 @@ class LongitudinalSession:
         return items
 
     def dates_in_order(self) -> list[tuple[str, str]]:
-        """按临床角色顺序：baseline → interim → end。"""
-        return [(r, self.assigned()[r]) for r in ROLES if r in self.assigned()]
+        """基线在前，其余已选检查按日期排序。"""
+        assigned = self.assigned()
+        result = [("baseline", assigned["baseline"])] if "baseline" in assigned else []
+        return result + sorted(((r, d) for r, d in assigned.items() if r != "baseline"), key=lambda x: x[1])
 
     def can_map(self) -> bool:
         return bool(self.baseline) and bool(self.followups())
@@ -87,6 +94,7 @@ def load_session(processed_root: Path, patient_id: str) -> LongitudinalSession:
         baseline=_empty_to_none(raw.get("baseline")),
         interim=_empty_to_none(raw.get("interim")),
         end=_empty_to_none(raw.get("end")),
+        extra_dates=[str(v) for v in raw.get("extra_dates", []) if v],
     )
 
 

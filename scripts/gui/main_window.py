@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import shutil
+import csv
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -15,6 +16,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QInputDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -38,6 +40,8 @@ for _p in (str(_LONG), str(_COMMON), str(_SCRIPTS / "gui"), str(_SCRIPTS)):
         sys.path.insert(0, _p)
 
 from catalog import DataCatalog  # noqa: E402
+from quality import (archive_existing_mask, fingerprint, mapping_status, mask_review_status,
+                     record_lesion_link, record_mask_version, review_mapping, review_mask)  # noqa: E402
 from session import load_session, save_session  # noqa: E402
 
 from busy import busy_progress, make_progress  # noqa: E402
@@ -47,6 +51,7 @@ from feature_panel import FeaturePanel  # noqa: E402
 from mask_ops import lesion_stats, morph_labels, next_label, relabel_by_volume  # noqa: E402
 from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
+from review_dialog import QualityReviewDialog  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
 from volume_io import load_mask_from_path, load_volume_set, save_edited_mask  # noqa: E402
 from workers import FeatureWorker, MappingWorker, SegmentWorker  # noqa: E402
@@ -75,13 +80,14 @@ class MainWindow(QMainWindow):
         interim_root: Path,
         processed_root: Path,
         parent=None,
+        manifest_path: Path | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("DLBCL 纵向 PET/CT 分析")
+        self.setWindowTitle("纵向 PET/CT 分析与质控")
         self.setStyleSheet(STYLESHEET)
         self.setMinimumSize(1100, 680)
 
-        self.catalog = DataCatalog(interim_root, processed_root)
+        self.catalog = DataCatalog(interim_root, processed_root, manifest_path)
         self.current_patient: Optional[str] = None
         self.current_date: Optional[str] = None
         self._map_worker: Optional[MappingWorker] = None
@@ -149,6 +155,7 @@ class MainWindow(QMainWindow):
         self.timepoints.session_changed.connect(self._on_session_edit)
         self.timepoints.map_requested.connect(self._run_mapping)
         self.timepoints.features_requested.connect(self._run_features)
+        self.timepoints.review_mapping_requested.connect(self._review_mapping)
         self.ortho.chk_native.toggled.connect(self._refresh_evolution)
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
         self.ortho.combo_cmap.currentIndexChanged.connect(self._refresh_evolution)
@@ -159,6 +166,8 @@ class MainWindow(QMainWindow):
         self.edit_panel.relabel_requested.connect(self._on_relabel)
         self.edit_panel.undo_requested.connect(self.ortho.undo)
         self.edit_panel.save_requested.connect(self._save_edited)
+        self.edit_panel.review_requested.connect(self._review_mask)
+        self.edit_panel.link_requested.connect(self._link_lesion)
         self.edit_panel.lesion_selected.connect(self._on_lesion_selected)
 
         self.browser.populate(self.catalog)
@@ -291,6 +300,15 @@ class MainWindow(QMainWindow):
             self._busy_dlg.close()
             self._busy_dlg = None
 
+    def _set_work_busy(self, busy: bool) -> None:
+        self.edit_panel.set_busy(busy)
+        for button in (self.timepoints.btn_map, self.timepoints.btn_feat,
+                       self.timepoints.btn_review_map):
+            button.setEnabled(not busy)
+        if busy:
+            self.ortho.chk_edit.setChecked(False)
+        self.ortho.chk_edit.setEnabled(not busy)
+
     def _load_vol(self, patient_id: str, study_date: str, baseline_date: Optional[str]):
         key = (patient_id, study_date, baseline_date or "")
         if key in self._vol_cache:
@@ -326,19 +344,73 @@ class MainWindow(QMainWindow):
     def _on_patient(self, patient_id: str) -> None:
         if patient_id == self.current_patient:
             return
+        if self.current_patient and not self._confirm_navigation():
+            self.browser.select_patient(self.current_patient)
+            return
+        self.catalog.refresh()
         self.current_patient = patient_id
         rec = self.catalog.get_patient(patient_id)
         session = load_session(self.catalog.processed_root, patient_id)
         dates = rec.study_dates() if rec else []
         self.timepoints.set_dates(dates, session)
         feat_csv = self.catalog.processed_root / patient_id / "longitudinal_features.csv"
-        self.features.load_csv(feat_csv)
+        if self._feature_csv_current(feat_csv, patient_id, session):
+            self.features.load_csv(feat_csv)
+        else:
+            self.features.clear("历史特征缺少质控或输入已变化；请重新计算")
         if dates:
             self._on_study(patient_id, dates[0])
         self._refresh_evolution()
         self.status.showMessage(f"患者 {patient_id}  · {len(dates)} 次检查")
 
+    def _feature_csv_current(self, csv_path: Path, patient_id: str, session) -> bool:
+        if not csv_path.is_file():
+            return False
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            if not rows:
+                return False
+            represented = {row.get("study_date") for row in rows
+                           if row.get("roi_type") == "native_lesion"}
+            if represented != set(session.assigned().values()):
+                return False
+            baseline = self.catalog.get_study(patient_id, session.baseline) if session.baseline else None
+            for row in rows:
+                if session.role_of(row.get("study_date", "")) != row.get("role"):
+                    return False
+                assets = self.catalog.get_study(patient_id, row["study_date"])
+                if assets is None or assets.pet_units != row.get("pet_units") or assets.tracer != row.get("tracer"):
+                    return False
+                pet_path = assets.working_pet
+                ct_path = assets.working_ct
+                if (pet_path is None or str(pet_path) != row.get("pet_path") or
+                        fingerprint(pet_path)["sha256"] != row.get("pet_sha256") or
+                        (str(ct_path) if ct_path else "") != row.get("ct_path") or
+                        (ct_path is not None and fingerprint(ct_path)["sha256"] != row.get("ct_sha256"))):
+                    return False
+                mask = Path(row["mask_path"])
+                if (row.get("feature_protocol_version") != "pet_suv_union_v1"
+                        or not mask.is_file()
+                        or fingerprint(mask)["sha256"] != row.get("mask_sha256")):
+                    return False
+                if row.get("roi_type", "").startswith("native"):
+                    if mask_review_status(mask) != "approved":
+                        return False
+                elif row.get("roi_type", "").startswith("baseline_mapped"):
+                    followup = self.catalog.get_study(patient_id, row["study_date"])
+                    if baseline is None or followup is None or mapping_status(baseline, followup) != "approved":
+                        return False
+            return True
+        except (OSError, KeyError, ValueError):
+            return False
+
     def _on_study(self, patient_id: str, study_date: str) -> None:
+        if patient_id != self.current_patient:
+            return
+        if self.current_date and study_date != self.current_date and not self._confirm_navigation():
+            self.browser.select_study(patient_id, self.current_date)
+            return
         self.current_patient = patient_id
         self.current_date = study_date
         session = self._session() or load_session(self.catalog.processed_root, patient_id)
@@ -365,6 +437,11 @@ class MainWindow(QMainWindow):
     def _on_session_edit(self) -> None:
         if not self.current_patient:
             return
+        if not self._confirm_navigation():
+            self.timepoints.set_dates(
+                self.catalog.get_patient(self.current_patient).study_dates(),
+                load_session(self.catalog.processed_root, self.current_patient))
+            return
         session = self.timepoints.current_session(self.current_patient)
         rec = self.catalog.get_patient(self.current_patient)
         dates = rec.study_dates() if rec else []
@@ -373,6 +450,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage("时间点冲突: " + "; ".join(issues))
             return
         save_session(self.catalog.processed_root, session)
+        self.features.clear("时间点已更改；请重新计算特征")
         if self.current_date:
             self._on_study(self.current_patient, self.current_date)
         self._refresh_evolution()
@@ -390,7 +468,7 @@ class MainWindow(QMainWindow):
             if vol is None:
                 continue
             vol.role = role
-            items.append((f"{labels[role]}  {date}", vol))
+            items.append((f"{labels.get(role, 'Follow-up')}  {date}", vol))
         self.evolution.set_volumes(
             items,
             suv_max=float(self.ortho.spin_suv.value()),
@@ -447,12 +525,60 @@ class MainWindow(QMainWindow):
                 seen.add(id(cached))
         return out
 
-    def _write_edited_mask(self, vol) -> None:
+    def _confirm_navigation(self) -> bool:
+        if any(worker is not None and worker.isRunning()
+               for worker in (self._map_worker, self._feat_worker, self._seg_worker)):
+            QMessageBox.warning(self, "任务进行中", "请等待当前后台任务完成后再切换检查。")
+            return False
+        dirty = self._dirty_volumes()
+        if not dirty:
+            return True
+        answer = QMessageBox.question(
+            self, "未保存的 mask", "存在未保存的 mask，是否保存后继续？",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard |
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            for vol in dirty:
+                if not self._write_edited_mask(vol):
+                    return False
+            self.catalog.refresh()
+        else:
+            for vol in dirty:
+                self._drop_cached(patient_id=vol.patient_id, study_date=vol.study_date)
+        return True
+
+    def closeEvent(self, event) -> None:
+        if self._confirm_navigation():
+            event.accept()
+        else:
+            event.ignore()
+
+    def _write_edited_mask(self, vol) -> bool:
         assets = self.catalog.get_study(vol.patient_id, vol.study_date)
         if assets is None:
-            return
-        save_edited_mask(vol, assets.edited_mask_path())
+            return False
+        out_path = assets.edited_mask_path()
+        current_source = assets.working_lesion
+        if (str(current_source) if current_source else None) != vol.native_source_path or (
+                fingerprint(current_source)["sha256"] if current_source else None
+                ) != vol.native_source_sha256:
+            QMessageBox.warning(self, "版本冲突", "正在编辑的源 mask 已改变；请刷新检查后重新编辑。")
+            return False
+        current_sha = fingerprint(out_path)["sha256"] if out_path.is_file() else None
+        if current_sha != vol.edited_sha256:
+            QMessageBox.warning(self, "版本冲突", "磁盘上的 edited mask 已被其他操作修改；请刷新检查后再编辑。")
+            return False
+        archive_existing_mask(out_path)
+        save_edited_mask(vol, out_path)
+        record_mask_version(out_path, assets.lesion_auto)
+        vol.edited_sha256 = fingerprint(out_path)["sha256"]
+        vol.native_source_path = str(out_path)
+        vol.native_source_sha256 = vol.edited_sha256
         vol.dirty = False
+        return True
 
     def _run_mapping(self) -> None:
         if not self.current_patient:
@@ -478,7 +604,8 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
             for vol in dirty:
-                self._write_edited_mask(vol)
+                if not self._write_edited_mask(vol):
+                    return
             self.catalog.refresh()
         bl = self.catalog.get_study(self.current_patient, session.baseline)
         missing: list[str] = []
@@ -499,8 +626,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "映射", "无法开始映射：\n" + "\n".join(missing))
             return
         save_session(self.catalog.processed_root, session)
-        self.timepoints.btn_map.setEnabled(False)
-        self.edit_panel.set_busy(True)
+        self._set_work_busy(True)
         self._show_progress("映射", "正在配准 CT（约数分钟，请勿关闭）…")
         self._map_worker = MappingWorker(self.catalog, self.current_patient, overwrite=True)
         self._map_worker.progress.connect(self._update_progress)
@@ -510,8 +636,7 @@ class MainWindow(QMainWindow):
 
     def _on_map_done(self, msg: str) -> None:
         self._close_progress()
-        self.timepoints.btn_map.setEnabled(True)
-        self.edit_panel.set_busy(False)
+        self._set_work_busy(False)
         if self.current_patient:
             self._drop_cached(patient_id=self.current_patient)
         self.catalog.refresh()
@@ -523,27 +648,33 @@ class MainWindow(QMainWindow):
                 self.catalog.processed_root, self.current_patient
             )
             assigned = session.assigned()
-            target = assigned.get("interim") or assigned.get("end") or self.current_date
+            followups = session.followups()
+            target = followups[0][1] if followups else self.current_date
             self.ortho.chk_mapped.setChecked(True)
             if target:
                 self._on_study(self.current_patient, target)
             self._refresh_evolution()
-        self.status.showMessage(msg + hint)
+        self.status.showMessage(msg + hint + "；请核对 CT 棋盘格并记录质控")
+        self.features.clear("映射已更新；请完成质控并重新计算特征")
         if "失败" in msg:
             QMessageBox.information(self, "映射部分完成", msg)
 
     def _run_features(self) -> None:
         if not self.current_patient:
             return
+        if self._dirty_volumes():
+            QMessageBox.warning(self, "特征", "存在未保存的 mask，请先保存并完成质控。")
+            return
         session = self.timepoints.current_session(self.current_patient)
         save_session(self.catalog.processed_root, session)
         if not session.assigned():
             QMessageBox.information(self, "特征", "请先指定至少一个时间点。")
             return
-        self.timepoints.btn_feat.setEnabled(False)
-        self.edit_panel.set_busy(True)
+        self._set_work_busy(True)
         self._show_progress("特征", "正在提取代谢 / 组学特征…")
-        self._feat_worker = FeatureWorker(self.catalog, self.current_patient, include_radiomics=True)
+        self._feat_worker = FeatureWorker(
+            self.catalog, self.current_patient, include_radiomics=True,
+            per_lesion=self.timepoints.chk_per_lesion.isChecked())
         self._feat_worker.progress.connect(self._update_progress)
         self._feat_worker.failed.connect(self._on_worker_fail)
         self._feat_worker.finished_ok.connect(self._on_feat_done)
@@ -551,16 +682,13 @@ class MainWindow(QMainWindow):
 
     def _on_feat_done(self, csv_path: str) -> None:
         self._close_progress()
-        self.timepoints.btn_feat.setEnabled(True)
-        self.edit_panel.set_busy(False)
+        self._set_work_busy(False)
         self.features.load_csv(Path(csv_path))
         self.status.showMessage(f"特征已写入 {csv_path}")
 
     def _on_worker_fail(self, msg: str) -> None:
         self._close_progress()
-        self.timepoints.btn_map.setEnabled(True)
-        self.timepoints.btn_feat.setEnabled(True)
-        self.edit_panel.set_busy(False)
+        self._set_work_busy(False)
         QMessageBox.warning(self, "任务失败", msg)
         self.status.showMessage(msg)
 
@@ -613,6 +741,9 @@ class MainWindow(QMainWindow):
             start = np.zeros(vol.ct.shape, dtype=np.uint16)
             self._open_segment_editor(start)
             return
+        if self.catalog.manifest_path is not None:
+            QMessageBox.information(self, "自动分割", "通用清单模式未配置自动分割适配器；请导入已有 mask 或手动编辑。")
+            return
         assets = self.catalog.get_study(self.current_patient, self.current_date)
         missing: list[str] = []
         if assets is None:
@@ -629,9 +760,7 @@ class MainWindow(QMainWindow):
                 "AutoPET 需要成对的 CT 与 PET，当前缺少：\n" + "\n".join(missing),
             )
             return
-        self.edit_panel.set_busy(True)
-        self.timepoints.btn_map.setEnabled(False)
-        self.timepoints.btn_feat.setEnabled(False)
+        self._set_work_busy(True)
         self._show_progress("AutoPET", "正在准备 AutoPET…")
         self._seg_worker = SegmentWorker(
             method, self.current_patient, self.current_date, self.catalog
@@ -672,11 +801,15 @@ class MainWindow(QMainWindow):
             return
         native = np.asarray(mask if mask is not None else vol.native, dtype=np.uint16).copy()
         work = replace(vol, native=native, dirty=False, _undo=[])
+        assets = self.catalog.get_study(vol.patient_id, vol.study_date)
+        original = (load_mask_from_path(assets.lesion_auto, vol)
+                    if assets is not None and assets.lesion_auto is not None else native.copy())
         dlg = SegmentEditorDialog(
             work,
             self,
             pet_cmap=self.ortho.pet_cmap(),
             render_device=self.ortho.render_device(),
+            reference_mask=original,
         )
         if dlg.exec() != SegmentEditorDialog.DialogCode.Accepted:
             return
@@ -689,9 +822,8 @@ class MainWindow(QMainWindow):
 
     def _on_seg_done(self, msg: str) -> None:
         self._close_progress()
-        self.edit_panel.set_busy(False)
-        self.timepoints.btn_map.setEnabled(True)
-        self.timepoints.btn_feat.setEnabled(True)
+        self._set_work_busy(False)
+        self.features.clear("自动分割已更新；请完成质控并重新计算特征")
         if self.current_patient:
             self._drop_cached(patient_id=self.current_patient, study_date=self.current_date)
         self.catalog.refresh()
@@ -746,7 +878,8 @@ class MainWindow(QMainWindow):
         vol = self.ortho.volumes()
         if vol is None or not self.current_patient or not self.current_date:
             return
-        self._write_edited_mask(vol)
+        if not self._write_edited_mask(vol):
+            return
         self.catalog.refresh()
         self.browser.populate(self.catalog)
         if self.current_patient:
@@ -754,6 +887,118 @@ class MainWindow(QMainWindow):
         assets = self.catalog.get_study(self.current_patient, self.current_date)
         name = assets.edited_mask_path().name if assets is not None else "lesion_edited.nii.gz"
         self.status.showMessage(f"已保存 {name}（未覆盖 nnU-Net 原 mask）")
+        self.features.clear("mask 已更新；请完成质控并重新计算特征")
+
+    def _review_mask(self) -> None:
+        vol = self.ortho.volumes()
+        if vol is None or not self.current_patient or not self.current_date:
+            return
+        if vol.dirty:
+            QMessageBox.warning(self, "mask 质控", "请先保存当前修改。")
+            return
+        self.catalog.refresh()
+        assets = self.catalog.get_study(self.current_patient, self.current_date)
+        if assets is None or assets.working_lesion is None:
+            QMessageBox.warning(self, "mask 质控", "没有可审阅的 mask。")
+            return
+        if (str(assets.working_lesion) != vol.native_source_path or
+                fingerprint(assets.working_lesion)["sha256"] != vol.native_source_sha256):
+            self._drop_cached(patient_id=self.current_patient, study_date=self.current_date)
+            self._on_study(self.current_patient, self.current_date)
+            QMessageBox.information(self, "mask 质控", "磁盘 mask 已变化，界面已重新载入；请重新检查后质控。")
+            return
+        original = (load_mask_from_path(assets.lesion_auto, vol)
+                    if assets.lesion_auto is not None else vol.native.copy())
+        dlg = QualityReviewDialog(ct=vol.ct, pet=vol.pet, original_mask=original,
+                                  edited_mask=vol.native, parent=self)
+        if dlg.exec() == dlg.DialogCode.Accepted and dlg.verdict:
+            try:
+                review_mask(assets.working_lesion, dlg.reviewer.text(),
+                            dlg.reason.toPlainText(), dlg.verdict)
+                self.status.showMessage(f"mask 质控状态：{dlg.verdict}")
+                self.features.clear("mask 质控已更新；请重新计算特征")
+            except Exception as exc:
+                QMessageBox.warning(self, "mask 质控", str(exc))
+
+    def _review_mapping(self) -> None:
+        import nibabel as nib
+        import numpy as np
+        from nibabel.processing import resample_from_to
+
+        if not self.current_patient or not self.current_date:
+            return
+        session = self._session() or load_session(self.catalog.processed_root, self.current_patient)
+        if not session.baseline or self.current_date == session.baseline:
+            QMessageBox.information(self, "配准质控", "请先打开一项已映射的随访检查。")
+            return
+        baseline = self.catalog.get_study(self.current_patient, session.baseline)
+        followup = self.catalog.get_study(self.current_patient, self.current_date)
+        vol = self.ortho.volumes()
+        if baseline is None or followup is None or vol is None:
+            return
+        state = mapping_status(baseline, followup)
+        if state in {"stale", "invalid", "unreviewed"}:
+            QMessageBox.warning(self, "配准质控", f"映射状态为 {state}，请先重新映射。")
+            return
+        warped_path = followup.longitudinal_dir() / "baseline_ct_warped.nii.gz"
+        if not warped_path.is_file():
+            QMessageBox.warning(self, "配准质控", "缺少基线 CT warped 图像。")
+            return
+        ref = nib.as_closest_canonical(nib.load(str(followup.working_ct)))
+        warped = nib.load(str(warped_path))
+        if warped.shape != ref.shape or not np.allclose(warped.affine, ref.affine, atol=1e-4):
+            warped = resample_from_to(warped, (ref.shape, ref.affine), order=1)
+        dlg = QualityReviewDialog(ct=vol.ct,
+                                  warped_ct=np.asanyarray(warped.dataobj, dtype=np.float32),
+                                  mapped_mask=vol.mapped, parent=self)
+        if dlg.exec() == dlg.DialogCode.Accepted and dlg.verdict:
+            try:
+                review_mapping(baseline, followup, dlg.reviewer.text(),
+                               dlg.reason.toPlainText(), dlg.verdict)
+                self.status.showMessage(f"配准质控状态：{dlg.verdict}")
+                self.features.clear("配准质控已更新；请重新计算特征")
+            except Exception as exc:
+                QMessageBox.warning(self, "配准质控", str(exc))
+
+    def _link_lesion(self) -> None:
+        import nibabel as nib
+        import numpy as np
+
+        if not self.current_patient or not self.current_date:
+            return
+        session = self._session() or load_session(self.catalog.processed_root, self.current_patient)
+        if not session.baseline or self.current_date == session.baseline:
+            QMessageBox.information(self, "病灶对应", "请在随访检查中选择一个病灶。")
+            return
+        baseline = self.catalog.get_study(self.current_patient, session.baseline)
+        followup = self.catalog.get_study(self.current_patient, self.current_date)
+        vol = self.ortho.volumes()
+        lid = int(self.ortho.current_label)
+        if vol is None or baseline is None or followup is None or followup.working_lesion is None:
+            return
+        if vol.dirty or not np.any(vol.native == lid):
+            QMessageBox.warning(self, "病灶对应", "请先选择一个存在的病灶并保存 mask。")
+            return
+        number, ok = QInputDialog.getInt(self, "病灶对应", "基线病灶编号（0 = 随访新灶）", 0, 0, 65535)
+        if not ok:
+            return
+        if number and (baseline.working_lesion is None or
+                       not np.any(np.asanyarray(nib.load(str(baseline.working_lesion)).dataobj) == number)):
+            QMessageBox.warning(self, "病灶对应", f"基线 mask 不含编号 {number}。")
+            return
+        reviewer, ok = QInputDialog.getText(self, "病灶对应", "审阅者")
+        if not ok:
+            return
+        reason, ok = QInputDialog.getText(self, "病灶对应", "影像对应依据 / 备注")
+        if not ok:
+            return
+        try:
+            uid = record_lesion_link(self.catalog.processed_root, baseline, followup,
+                                     baseline_label=number or None, followup_label=lid,
+                                     reviewer=reviewer, reason=reason)
+            self.status.showMessage(f"已记录病灶 UID：{uid}")
+        except Exception as exc:
+            QMessageBox.warning(self, "病灶对应", str(exc))
 
     def _about(self) -> None:
         QMessageBox.information(

@@ -61,6 +61,18 @@ class PatientBrowser(QTreeWidget):
                 self.setCurrentItem(item)
                 return
 
+    def select_study(self, patient_id: str, study_date: str) -> None:
+        for i in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(i)
+            if parent and parent.text(0) == patient_id:
+                for j in range(parent.childCount()):
+                    child = parent.child(j)
+                    if child.text(0) == study_date:
+                        self.blockSignals(True)
+                        self.setCurrentItem(child)
+                        self.blockSignals(False)
+                        return
+
     def _on_select(self) -> None:
         items = self.selectedItems()
         if not items:

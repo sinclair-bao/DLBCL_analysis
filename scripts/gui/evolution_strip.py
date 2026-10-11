@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""最多三列冠状 MIP：基线 / 中期 / 末期；等比例、统一缩放。"""
+"""任意数量时间点的冠状 MIP；等比例、统一缩放。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -32,6 +33,7 @@ class _MipView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
         self.setMinimumHeight(120)
+        self.setMinimumWidth(220)
         self.box = self.addViewBox(lockAspect=True, invertY=True)
         self.box.setMenuEnabled(False)
         self.box.disableAutoRange()
@@ -84,9 +86,15 @@ class EvolutionStrip(QWidget):
         super().__init__(parent)
         self._views = [_MipView("—") for _ in range(3)]
         row = QHBoxLayout()
+        self._row = row
         row.setContentsMargins(0, 0, 0, 0)
         for v in self._views:
-            row.addWidget(v, 1)
+            row.addWidget(v)
+        self._mip_widget = QWidget()
+        self._mip_widget.setLayout(row)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setWidget(self._mip_widget)
 
         self.spin_zoom = QSpinBox()
         self.spin_zoom.setRange(50, 400)
@@ -103,7 +111,7 @@ class EvolutionStrip(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addLayout(row, 1)
+        layout.addWidget(self._scroll, 1)
         layout.addLayout(bar)
         self.setMinimumHeight(140)
         self._highlight: str | None = None
@@ -136,11 +144,17 @@ class EvolutionStrip(QWidget):
         if not items:
             self.clear()
             return
+        while len(self._views) < len(items):
+            view = _MipView("—")
+            self._views.append(view)
+            self._row.addWidget(view)
         for i, v in enumerate(self._views):
             if i >= len(items):
                 v.set_rgb(None)
                 v.set_title("—")
+                v.hide()
                 continue
+            v.show()
             title, vol = items[i]
             pet_mip = coronal_mip(np.clip(vol.pet, 0.0, suv_max))
             rgb = apply_pet_cmap(pet_mip, 0.0, suv_max, pet_cmap)
@@ -150,6 +164,7 @@ class EvolutionStrip(QWidget):
                 rgb = _blend_mask(rgb, coronal_mip(vol.mapped.astype(np.float32)), MAPPED_RGB)
             v.set_rgb(rgb)
             v.set_title(title, highlight=(vol.role == self._highlight))
+        self._mip_widget.adjustSize()
         self._apply_zoom(self.spin_zoom.value())
 
     def _apply_zoom(self, percent: int) -> None:
@@ -157,7 +172,7 @@ class EvolutionStrip(QWidget):
             v.set_zoom(int(percent))
 
     def save_png(self, path) -> None:
-        self.grab().save(str(path))
+        self._mip_widget.grab().save(str(path))
 
 
 def _blend_mask(rgb: np.ndarray, mask_mip: np.ndarray, color: np.ndarray, alpha: float = 0.5) -> np.ndarray:

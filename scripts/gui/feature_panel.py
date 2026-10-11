@@ -13,6 +13,7 @@ from matplotlib.figure import Figure
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
+    QLabel,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -47,13 +48,16 @@ class FeaturePanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.status = QLabel("尚无特征")
+        layout.addWidget(self.status)
         layout.addWidget(self.table, 2)
         layout.addWidget(self.canvas, 2)
         self._rows: list[dict] = []
         self.clear()
 
-    def clear(self) -> None:
+    def clear(self, message: str = "尚无特征") -> None:
         self._rows = []
+        self.status.setText(message)
         self.table.setRowCount(0)
         self.fig.clear()
         ax = self.fig.add_subplot(111)
@@ -68,6 +72,7 @@ class FeaturePanel(QWidget):
             return
         with path.open("r", encoding="utf-8") as fh:
             self._rows = list(csv.DictReader(fh))
+        self.status.setText("特征结果：已核对 mask 与映射版本")
         self.table.setRowCount(len(self._rows))
         for r, row in enumerate(self._rows):
             for c, key in enumerate(DISPLAY_COLS):

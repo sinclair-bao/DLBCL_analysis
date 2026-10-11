@@ -651,7 +651,12 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）  
 **使用说明：** 脚本职责、操作步骤与后续 Todo 见 [`scripts/gui/README.md`](scripts/gui/README.md)。
 
-时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**（可只选 1–3 个），写入
+GUI 现支持任意数量的随访勾选和 `--manifest` 外部 PET 队列清单；每次 edited mask
+保留版本快照，原始/编辑 mask 差异和基线 CT warped 棋盘格可供审阅。GUI 特征提取要求
+mask 与映射质控通过，并按文件指纹发现过期结果。CLI 可用 `--require-qc` 执行相同质控门槛，
+`--per-lesion` 另输出逐编号病灶行。详见 GUI README。
+
+时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**，其他随访可多选，写入
 
 `data/processed/<PatientID>/longitudinal_session.json`
 
@@ -674,7 +679,7 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 - **渲染** 下拉 CPU / GPU：GPU 用可选 CuPy 整本上传后切片合成，无 CUDA 时禁用并回退 CPU（`pip install cupy-cuda12x`，按本机 CUDA）
 - 主界面可点选 **查看基线 / 中期 / 末期**（需先在右侧指定角色）
 - CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（刷新不带动画面跳动）
-- 冠状 MIP **等比例**显示，三列统一缩放，不横向拉扁
+- 冠状 MIP **等比例**显示，任意时间点横向滚动、统一缩放，不横向拉扁
 - 轴位、冠状与 MIP 左右标 **R / L**（画面左 = 患者右，放射科惯例）；矢状标 **P / A**（左后右前）。标记贴在视口边，缩放不跟着跑
 - 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动
 - **患者列表**：F2 或工具栏「患者」手动显隐；默认在选中一次检查后自动隐藏
@@ -725,7 +730,7 @@ data/processed/<ID>/<FollowupDate>/longitudinal/
 │ 绿/黄/红灯  │ CT / PET / 融合 + 窗宽窗位    │ 画笔 / 形态学    │
 │            │ 编辑 mask：左涂右擦            │ 病灶编号表       │
 ├────────────┼──────────────────────────────┼─────────────────┤
-│            │ 最多三列冠状 MIP 演变条         │ 特征表 + 折线    │
+│            │ 多时间点冠状 MIP 演变条         │ 特征表 + 折线    │
 └────────────┴──────────────────────────────┴─────────────────┘
 ```
 
