@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Optional
+from weakref import ref
 
 import numpy as np
 
@@ -61,7 +63,7 @@ def compose_plane_cpu(vol, plane: str, i: int, j: int, k: int, **kwargs) -> np.n
 
 
 class GpuVolumeCache:
-    """把 CT/PET/mask 留在设备上，滚层只改切片下标。"""
+    """Keep two recently displayed studies on GPU for rapid back-and-forth."""
 
     def __init__(self) -> None:
         self._cp = None
@@ -69,12 +71,13 @@ class GpuVolumeCache:
         self._pet = None
         self._native = None
         self._mapped = None
-        self._ct_id = 0
-        self._pet_id = 0
+        self._active_slot = None
+        self._slots: OrderedDict[int, dict] = OrderedDict()
 
     def clear(self) -> None:
         self._ct = self._pet = self._native = self._mapped = None
-        self._ct_id = self._pet_id = 0
+        self._active_slot = None
+        self._slots.clear()
         self._cp = None
 
     def bind_volumes(self, vol) -> bool:
@@ -83,11 +86,29 @@ class GpuVolumeCache:
         import cupy as cp
 
         self._cp = cp
-        if self._ct is None or self._ct_id != id(vol.ct) or self._pet_id != id(vol.pet):
-            self._ct = cp.asarray(np.ascontiguousarray(vol.ct, dtype=np.float32))
-            self._pet = cp.asarray(np.ascontiguousarray(vol.pet, dtype=np.float32))
-            self._ct_id = id(vol.ct)
-            self._pet_id = id(vol.pet)
+        key = id(vol)
+        slot = self._slots.get(key)
+        if slot is None or slot["volume"]() is not vol:
+            self._ct = self._pet = self._native = self._mapped = None
+            self._active_slot = None
+            self._slots.pop(key, None)
+            while len(self._slots) >= 2:
+                self._slots.popitem(last=False)
+            slot = {
+                "volume": ref(vol),
+                "ct": cp.asarray(np.ascontiguousarray(vol.ct, dtype=np.float32)),
+                "pet": cp.asarray(np.ascontiguousarray(vol.pet, dtype=np.float32)),
+                "native": None,
+                "mapped": None,
+                "mask_revision": -1,
+            }
+            self._slots[key] = slot
+        self._slots.move_to_end(key)
+        self._active_slot = slot
+        self._ct, self._pet = slot["ct"], slot["pet"]
+        self._native, self._mapped = slot["native"], slot["mapped"]
+        if slot["mask_revision"] != vol.mask_revision:
+            self.sync_masks(vol)
         return True
 
     def sync_masks(self, vol) -> None:
@@ -106,6 +127,10 @@ class GpuVolumeCache:
             if mapped is not None
             else None
         )
+        if self._active_slot is not None:
+            self._active_slot["native"] = self._native
+            self._active_slot["mapped"] = self._mapped
+            self._active_slot["mask_revision"] = vol.mask_revision
 
     def compose_plane(self, plane: str, i: int, j: int, k: int, **kwargs) -> np.ndarray:
         if self._cp is None or self._ct is None or self._pet is None:

@@ -21,10 +21,9 @@ from display_utils import (
     MAPPED_RGB,
     NATIVE_RGB,
     apply_pet_cmap,
-    coronal_mip,
 )
 from ortho_viewer import _LateralityMixin
-from volume_io import VolumeSet
+from volume_io import MipData
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
 
@@ -131,7 +130,7 @@ class EvolutionStrip(QWidget):
 
     def set_volumes(
         self,
-        items: list[tuple[str, VolumeSet]],
+        items: list[tuple[str, MipData | None]],
         *,
         suv_max: float = 6.0,
         show_native: bool = True,
@@ -155,15 +154,19 @@ class EvolutionStrip(QWidget):
                 v.hide()
                 continue
             v.show()
-            title, vol = items[i]
-            pet_mip = coronal_mip(np.clip(vol.pet, 0.0, suv_max))
+            title, mip = items[i]
+            if mip is None:
+                v.set_rgb(None)
+                v.set_title(title)
+                continue
+            pet_mip = np.clip(mip.pet, 0.0, suv_max)
             rgb = apply_pet_cmap(pet_mip, 0.0, suv_max, pet_cmap)
-            if show_native and vol.native is not None:
-                rgb = _blend_mask(rgb, coronal_mip(vol.native.astype(np.float32)), NATIVE_RGB)
-            if show_mapped and vol.mapped is not None:
-                rgb = _blend_mask(rgb, coronal_mip(vol.mapped.astype(np.float32)), MAPPED_RGB)
+            if show_native:
+                rgb = _blend_mask(rgb, mip.native, NATIVE_RGB)
+            if show_mapped and mip.mapped is not None:
+                rgb = _blend_mask(rgb, mip.mapped, MAPPED_RGB)
             v.set_rgb(rgb)
-            v.set_title(title, highlight=(vol.role == self._highlight))
+            v.set_title(title, highlight=(mip.role == self._highlight))
         self._mip_widget.adjustSize()
         self._apply_zoom(self.spin_zoom.value())
 

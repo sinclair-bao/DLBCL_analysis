@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -319,7 +318,7 @@ class OrthoViewer(QWidget):
         self.combo_render.currentIndexChanged.connect(self._on_render_device)
 
         self.lbl_pos = QLabel("—")
-        self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         for spin in (
             self.spin_alpha,
             self.spin_suv_min,
@@ -339,34 +338,38 @@ class OrthoViewer(QWidget):
         slice_row.addWidget(self.slider_j, 1)
         slice_row.addWidget(QLabel("矢状"))
         slice_row.addWidget(self.slider_i, 1)
-        slice_row.addWidget(self.radio_fusion)
-        slice_row.addWidget(self.radio_ct)
-        slice_row.addWidget(self.radio_pet)
-        slice_row.addWidget(QLabel("查看"))
-        slice_row.addWidget(self.radio_bl)
-        slice_row.addWidget(self.radio_in)
-        slice_row.addWidget(self.radio_end)
 
-        tools = QGridLayout()
-        tools.setContentsMargins(0, 0, 0, 0)
-        tools.setHorizontalSpacing(6)
-        tools.setVerticalSpacing(4)
-        r1 = [
+        view_row = QHBoxLayout()
+        for control in (self.radio_fusion, self.radio_ct, self.radio_pet,
+                        QLabel("查看"), self.radio_bl, self.radio_in, self.radio_end):
+            view_row.addWidget(control)
+        view_row.addStretch(1)
+
+        controls = QVBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(4)
+        mask_row = QHBoxLayout()
+        for control in (
             self.chk_native,
             self.chk_mapped,
             self.chk_edit,
             self.chk_crosshair,
             QLabel("笔刷"),
             self.spin_brush,
-            QLabel("窗位"),
-            self.spin_wl,
-            QLabel("窗宽"),
-            self.spin_ww,
-        ]
-        r2 = [
+        ):
+            mask_row.addWidget(control)
+        mask_row.addStretch(1)
+        window_row = QHBoxLayout()
+        for control in (
+            QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
             QLabel("SUV"),
             self.spin_suv_min,
             self.spin_suv_max,
+        ):
+            window_row.addWidget(control)
+        window_row.addStretch(1)
+        display_row = QHBoxLayout()
+        for control in (
             QLabel("配色"),
             self.combo_cmap,
             QLabel("融合"),
@@ -377,19 +380,20 @@ class OrthoViewer(QWidget):
             QLabel("渲染"),
             self.combo_render,
             self.lbl_cuda,
-            self.lbl_pos,
-        ]
-        for col, w in enumerate(r1):
-            tools.addWidget(w, 0, col)
-        for col, w in enumerate(r2):
-            tools.addWidget(w, 1, col)
-        tools.setColumnStretch(max(len(r1), len(r2)) - 1, 1)
+        ):
+            display_row.addWidget(control)
+        display_row.addStretch(1)
+        controls.addLayout(mask_row)
+        controls.addLayout(window_row)
+        controls.addLayout(display_row)
+        controls.addWidget(self.lbl_pos)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(views, 1)
         layout.addLayout(slice_row)
-        layout.addLayout(tools)
+        layout.addLayout(view_row)
+        layout.addLayout(controls)
 
     def set_role_buttons(self, available: dict[str, bool], current: str | None) -> None:
         mapping = {
@@ -415,6 +419,8 @@ class OrthoViewer(QWidget):
 
     def mark_masks_dirty(self) -> None:
         self._masks_dirty = True
+        if self._vol is not None:
+            self._vol.mask_revision += 1
 
     def _on_render_device(self, _index: int = 0) -> None:
         self._gpu_failed = False
@@ -428,7 +434,6 @@ class OrthoViewer(QWidget):
         if vol is None or self.render_device() != "gpu":
             return
         if self._gpu.bind_volumes(vol):
-            self._gpu.sync_masks(vol)
             self._masks_dirty = False
 
     def display_mode(self) -> str:
@@ -444,7 +449,6 @@ class OrthoViewer(QWidget):
 
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
-        self._gpu.clear()
         self._gpu_failed = False
         self._masks_dirty = True
         self._shown_ijk = None
@@ -607,9 +611,7 @@ class OrthoViewer(QWidget):
                 try:
                     if not self._gpu.bind_volumes(vol):
                         raise RuntimeError("GPU 不可用")
-                    if self._masks_dirty:
-                        self._gpu.sync_masks(vol)
-                        self._masks_dirty = False
+                    self._masks_dirty = False
                     gpu_cache = self._gpu
                 except Exception:
                     _LOG.exception("GPU 体积上传失败，回退 CPU")

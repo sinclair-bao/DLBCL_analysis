@@ -85,7 +85,7 @@ python scripts/gui/app.py --manifest /path/to/studies.csv \
 └────────────┴──────────────────────────────┴─────────────────┘
 ```
 
-启动时窗口按当前显示器可用区域缩放；右侧栏可滚动。
+启动时窗口按当前显示器可用区域缩放；三视图下方控件按切片、显示模式、mask、窗位/SUV 与配色分行，避免把右侧栏挤出屏幕。右侧栏保证至少 320 个逻辑像素宽，可纵向滚动。选择患者后先显示当前检查；其他检查的 MIP 在后台逐项载入，短暂出现“载入中”是正常状态。
 
 ### 3.1 菜单与快捷键
 
@@ -109,7 +109,7 @@ python scripts/gui/app.py --manifest /path/to/studies.csv \
 | 当前选中灶 | 黄 | 编号表里选中的连通域 |
 | 映射 mask | 青 | 基线病灶床 warp 到**当前随访** |
 
-PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。工具栏 **渲染** 可在 CPU / GPU 间切换：仍画到现有 pyqtgraph `ImageItem`；GPU 用 CuPy 把整本 CT/PET/mask 留在设备上，滚层只改切片下标，合成 RGB 后再下载。无 CuPy/CUDA 时 GPU 项禁用，旁注「无 CUDA」。
+PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。工具栏 **渲染** 可在 CPU / GPU 间切换：仍画到现有 pyqtgraph `ImageItem`；GPU 用 CuPy 缓存最近两次检查的 CT/PET/mask，滚层只改切片下标，合成 RGB 后再下载。无 CuPy/CUDA 时 GPU 项禁用，旁注「无 CUDA」。
 
 朝向为放射科惯例（RAS 体积，画面左 = 患者右）：
 
@@ -138,7 +138,7 @@ PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 
 | 文件 | 作用 |
 |------|------|
 | [`app.py`](app.py) | 程序入口。在导入 matplotlib 画布前设置 `QtAgg`，检查 PySide6/pyqtgraph，解析 `--interim-root` / `--processed-root`，创建 `QApplication` 与 `MainWindow`。 |
-| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存 `_vol_cache` 为上限 6 套的 LRU（换患者不整表清空；映射按患者失效，AutoPET 按检查失效）。耗时任务用 `QProgressDialog`。 |
+| [`main_window.py`](main_window.py) | 主窗口：拼患者树、三视图、MIP、右侧时间点/分割/特征；装菜单与 F2；把信号接到映射/分割/形态学/存盘。映射前校验会话与文件、询问未保存 mask、成功后跳到随访并打开青色 overlay。体积缓存 `_vol_cache` 为上限 6 套的 LRU，另保留轻量二维 MIP 缓存；其他时间点在后台读取。耗时任务用 `QProgressDialog`。 |
 | [`__init__.py`](__init__.py) | 包标记，无逻辑。 |
 
 ### 4.2 面板（左右栏）
@@ -259,8 +259,10 @@ DataCatalog 扫描磁盘
 
 ### 显示与性能
 
-- [x] 病灶表：`lesion_stats` 一次 `np.unique` + `ndimage.maximum` 归约，不再对每个编号做 `mask == lid`。
+- [x] 病灶表：用 `bincount` 统计标签，仅对病灶体素求 SUVmax；未修改 mask 时复用统计结果。
 - [x] 体积缓存：`OrderedDict` LRU，上限 6 套；换患者不清空；保存 edited 只更新当前 `VolumeSet`；映射丢掉该患者键，AutoPET 丢掉该检查键。
+- [x] 当前检查优先显示，其他时间点的 MIP 在后台预加载；MIP 缓存只保留二维投影，降低重复切换的等待与内存占用。
+- [x] GPU 显存只保留最近两次检查的体积，来回切换时复用已上传的数据。
 - [x] 渲染 CPU / GPU 二选一（仍画到 pyqtgraph `ImageItem`）。GPU 用可选 CuPy 在设备上切片+伪彩+融合；无 CUDA 时该项禁用并回退 CPU。不换 OpenGL/VisPy。
 
 ### 明确不做（保持现状）

@@ -6,9 +6,11 @@ import csv
 import sys
 import tempfile
 from pathlib import Path
+from time import monotonic, sleep
 
 import nibabel as nib
 import numpy as np
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +22,8 @@ from review_dialog import QualityReviewDialog  # noqa: E402
 from segment_editor import SegmentEditorDialog  # noqa: E402
 from features import compute_roi_features, write_csv  # noqa: E402
 from quality import review_mask  # noqa: E402
-from session import LongitudinalSession  # noqa: E402
+from render_backend import gpu_available  # noqa: E402
+from session import LongitudinalSession, save_session  # noqa: E402
 
 
 def main() -> None:
@@ -42,8 +45,47 @@ def main() -> None:
             writer.writerow({"patient_id": "P1", "study_date": "2026-01-01",
                              "ct_path": "ct.nii.gz", "pet_path": "pet.nii.gz",
                              "pet_units": "SUVbw", "lesion_mask_path": "mask.nii.gz"})
+            writer.writerow({"patient_id": "P1", "study_date": "2026-06-01",
+                             "ct_path": "ct.nii.gz", "pet_path": "pet.nii.gz",
+                             "pet_units": "SUVbw", "lesion_mask_path": "mask.nii.gz"})
+        save_session(root / "outputs", LongitudinalSession(
+            "P1", baseline="2026-01-01", interim="2026-06-01"))
         win = MainWindow(root, root / "outputs", manifest_path=manifest)
+        win.showNormal()
+        for width in (1024, 1366):
+            win.resize(width, 768)
+            app.processEvents()
+            assert win._right_panel.width() >= 320
+            viewport = win._right_panel.viewport()
+            buttons = (win.timepoints.btn_map, win.timepoints.btn_feat,
+                       win.timepoints.btn_review_map, win.edit_panel.btn_autopet,
+                       win.edit_panel.btn_save, win.edit_panel.btn_review,
+                       win.edit_panel.btn_link, win.edit_panel.btn_dilate,
+                       win.edit_panel.btn_close)
+            for button in buttons:
+                edge = button.mapTo(viewport, QPoint(button.width(), 0)).x()
+                assert edge <= viewport.width(), (width, button.text(), edge,
+                                                  viewport.width())
+        win._set_browser_visible(False)
+        app.processEvents()
+        assert win._right_panel.width() >= 320
         win._on_patient("P1")
+        deadline = monotonic() + 5
+        while (win._prefetch_worker is not None or win._prefetch_pending) and monotonic() < deadline:
+            app.processEvents()
+            sleep(0.01)
+        app.processEvents()
+        assert win.evolution._views[1].item.image is not None
+        if gpu_available():
+            win.ortho.combo_render.setCurrentIndex(win.ortho.combo_render.findData("gpu"))
+            first_gpu_ct = win.ortho._gpu._ct
+            win._on_study("P1", "2026-06-01")
+            win._on_study("P1", "2026-01-01")
+            assert win.ortho._gpu._ct is first_gpu_ct
+            win.ortho.volumes().native[8, 8, 8] = 2
+            win.ortho.mark_masks_dirty()
+            win.ortho.refresh(True)
+            assert win.ortho._gpu._native.get()[8, 8, 8] == 2
         vol = win.ortho.volumes()
         assert vol is not None and vol.ct.shape == ct.shape
         editor = SegmentEditorDialog(vol, reference_mask=vol.native)
@@ -64,6 +106,9 @@ def main() -> None:
         assert win._feature_csv_current(feature_csv, "P1", session)
         nib.save(nib.Nifti1Image(pet + 1, np.eye(4)), str(root / "pet.nii.gz"))
         assert not win._feature_csv_current(feature_csv, "P1", session)
+        win._refresh()
+        assert win.ortho.volumes() is not vol
+        assert win.ortho.volumes().pet[7, 7, 7] == 9.0
         editor.close()
         mask_review.close()
         reg_review.close()

@@ -24,6 +24,34 @@ AUTOPET_PYTHON = Path(os.environ.get("AUTOPET_PYTHON", "/home/sun/miniconda3/env
 DA_PYTHON = Path(sys.executable)
 
 
+class MipPrefetchWorker(QThread):
+    """Read one inactive study outside the UI thread and keep its small MIP."""
+
+    loaded = Signal(object)
+
+    def __init__(self, assets, baseline_date: str | None, generation: int,
+                 keep_volume: bool = False) -> None:
+        super().__init__()
+        self.assets = assets
+        self.baseline_date = baseline_date
+        self.generation = generation
+        self.keep_volume = keep_volume
+
+    def run(self) -> None:
+        from volume_io import build_mip_data, load_volume_set
+
+        try:
+            vol = load_volume_set(self.assets, self.baseline_date)
+            mip = build_mip_data(vol) if vol is not None else None
+            self.loaded.emit((self.generation, self.assets.patient_id,
+                              self.assets.study_date, self.baseline_date or "",
+                              mip, vol if self.keep_volume else None, ""))
+        except Exception as exc:  # noqa: BLE001
+            self.loaded.emit((self.generation, self.assets.patient_id,
+                              self.assets.study_date, self.baseline_date or "",
+                              None, None, str(exc)))
+
+
 class MappingWorker(QThread):
     progress = Signal(str)
     finished_ok = Signal(str)

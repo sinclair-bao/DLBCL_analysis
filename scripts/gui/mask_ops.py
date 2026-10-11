@@ -109,22 +109,23 @@ def lesion_stats(
     pet: Optional[np.ndarray],
     voxel_ml: float,
 ) -> list[dict]:
-    """编号、体素、体积、SUVmax。一次 unique + ndimage.maximum，不按灶扫 boolean。"""
+    """Count labels once, then reduce PET values only inside positive voxels."""
     labeled = np.asarray(mask, dtype=np.uint16)
-    ids, counts = np.unique(labeled, return_counts=True)
-    keep = ids > 0
-    ids = ids[keep]
-    counts = counts[keep]
+    flat = labeled.ravel()
+    counts = np.bincount(flat)
+    ids = np.flatnonzero(counts[1:]) + 1
     suv_vals: Optional[np.ndarray] = None
     if pet is not None and ids.size:
-        pet_f = np.asarray(pet, dtype=np.float32)
-        work = np.where(np.isfinite(pet_f), pet_f, np.float32(-np.inf))
-        suv_vals = np.asarray(
-            ndimage.maximum(work, labels=labeled, index=ids), dtype=np.float64
-        )
+        positive = np.flatnonzero(flat)
+        labels = flat[positive]
+        values = np.asarray(pet, dtype=np.float32).ravel()[positive]
+        finite = np.isfinite(values)
+        maxima = np.full(len(counts), -np.inf, dtype=np.float32)
+        np.maximum.at(maxima, labels[finite], values[finite])
+        suv_vals = maxima[ids]
     rows: list[dict] = []
     for i, lid in enumerate(ids):
-        n = int(counts[i])
+        n = int(counts[lid])
         suv_max: float | str = ""
         if suv_vals is not None:
             peak = float(suv_vals[i])

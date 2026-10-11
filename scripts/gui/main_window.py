@@ -10,6 +10,7 @@ import sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
+from weakref import ref
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
@@ -53,8 +54,8 @@ from ortho_viewer import OrthoViewer  # noqa: E402
 from patient_browser import PatientBrowser  # noqa: E402
 from review_dialog import QualityReviewDialog  # noqa: E402
 from timepoint_panel import TimepointPanel  # noqa: E402
-from volume_io import load_mask_from_path, load_volume_set, save_edited_mask  # noqa: E402
-from workers import FeatureWorker, MappingWorker, SegmentWorker  # noqa: E402
+from volume_io import build_mip_data, load_mask_from_path, load_volume_set, save_edited_mask  # noqa: E402
+from workers import FeatureWorker, MappingWorker, MipPrefetchWorker, SegmentWorker  # noqa: E402
 
 _VOL_CACHE_CAP = 6
 
@@ -85,7 +86,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("纵向 PET/CT 分析与质控")
         self.setStyleSheet(STYLESHEET)
-        self.setMinimumSize(1100, 680)
+        self.setMinimumSize(900, 620)
 
         self.catalog = DataCatalog(interim_root, processed_root, manifest_path)
         self.current_patient: Optional[str] = None
@@ -94,6 +95,11 @@ class MainWindow(QMainWindow):
         self._feat_worker: Optional[FeatureWorker] = None
         self._seg_worker: Optional[SegmentWorker] = None
         self._vol_cache: OrderedDict[tuple[str, str, str], object] = OrderedDict()
+        self._mip_cache: OrderedDict[tuple[str, str, str], tuple[object, int, object]] = OrderedDict()
+        self._prefetch_worker: Optional[MipPrefetchWorker] = None
+        self._prefetch_pending: list[tuple[str, str, str]] = []
+        self._prefetch_failed: set[tuple[str, str, str]] = set()
+        self._prefetch_generation = 0
         self._browser_width = 0
         self._busy_dlg: Optional[QProgressDialog] = None
 
@@ -119,9 +125,11 @@ class MainWindow(QMainWindow):
         right_l.addWidget(self.features, 1)
 
         right = QScrollArea()
+        self._right_panel = right
         right.setWidgetResizable(True)
         right.setFrameShape(QFrame.Shape.NoFrame)
         right.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right.setMinimumWidth(320)
         right.setWidget(right_inner)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
@@ -276,7 +284,9 @@ class MainWindow(QMainWindow):
                     geo.x() + (geo.width() - w) // 2,
                     geo.y() + (geo.height() - h) // 2,
                 )
-        self._main_split.setSizes([int(w * 0.18), int(w * 0.58), int(w * 0.24)])
+        right_width = max(320, min(420, int(w * 0.28)))
+        left_width = 180 if w >= 1200 else 140
+        self._main_split.setSizes([left_width, max(w - left_width - right_width, 1), right_width])
         self._center_split.setSizes([int(h * 0.78), int(h * 0.22)])
 
     def _session(self):
@@ -333,6 +343,9 @@ class MainWindow(QMainWindow):
             del self._vol_cache[victim]
 
     def _drop_cached(self, *, patient_id: str, study_date: Optional[str] = None) -> None:
+        self._prefetch_generation += 1
+        self._prefetch_pending.clear()
+        self._prefetch_failed.clear()
         drop = [
             key
             for key in self._vol_cache
@@ -340,6 +353,10 @@ class MainWindow(QMainWindow):
         ]
         for key in drop:
             del self._vol_cache[key]
+        drop_mips = [key for key in self._mip_cache
+                     if key[0] == patient_id and (study_date is None or key[1] == study_date)]
+        for key in drop_mips:
+            del self._mip_cache[key]
 
     def _on_patient(self, patient_id: str) -> None:
         if patient_id == self.current_patient:
@@ -347,6 +364,9 @@ class MainWindow(QMainWindow):
         if self.current_patient and not self._confirm_navigation():
             self.browser.select_patient(self.current_patient)
             return
+        self._prefetch_generation += 1
+        self._prefetch_pending.clear()
+        self._prefetch_failed.clear()
         self.catalog.refresh()
         self.current_patient = patient_id
         rec = self.catalog.get_patient(patient_id)
@@ -360,7 +380,8 @@ class MainWindow(QMainWindow):
             self.features.clear("历史特征缺少质控或输入已变化；请重新计算")
         if dates:
             self._on_study(patient_id, dates[0])
-        self._refresh_evolution()
+        else:
+            self._refresh_evolution()
         self.status.showMessage(f"患者 {patient_id}  · {len(dates)} 次检查")
 
     def _feature_csv_current(self, csv_path: Path, patient_id: str, session) -> bool:
@@ -449,11 +470,20 @@ class MainWindow(QMainWindow):
         if issues:
             self.status.showMessage("时间点冲突: " + "; ".join(issues))
             return
+        previous = load_session(self.catalog.processed_root, self.current_patient)
         save_session(self.catalog.processed_root, session)
         self.features.clear("时间点已更改；请重新计算特征")
-        if self.current_date:
+        if previous.baseline != session.baseline:
+            self._drop_cached(patient_id=self.current_patient)
+        if self.current_date and previous.baseline != session.baseline:
             self._on_study(self.current_patient, self.current_date)
-        self._refresh_evolution()
+        else:
+            self._prefetch_generation += 1
+            self._prefetch_pending.clear()
+            if self.ortho.volumes() is not None:
+                self.ortho.volumes().role = session.role_of(self.current_date) or ""
+            self._sync_role_buttons()
+            self._refresh_evolution()
         self.status.showMessage(f"已保存会话 {self.current_patient}")
 
     def _refresh_evolution(self) -> None:
@@ -462,13 +492,38 @@ class MainWindow(QMainWindow):
             return
         session = self._session() or load_session(self.catalog.processed_root, self.current_patient)
         items = []
+        pending = []
         labels = {"baseline": "Baseline", "interim": "Interim", "end": "End"}
         for role, date in session.dates_in_order():
-            vol = self._load_vol(self.current_patient, date, session.baseline)
-            if vol is None:
-                continue
-            vol.role = role
-            items.append((f"{labels.get(role, 'Follow-up')}  {date}", vol))
+            key = (self.current_patient, date, session.baseline or "")
+            assets = self.catalog.get_study(self.current_patient, date)
+            vol = self._vol_cache.get(key)
+            cached = self._mip_cache.get(key)
+            if vol is not None:
+                if cached is None or cached[0] is None or cached[0]() is not vol or (
+                        cached[1] != vol.mask_revision):
+                    mip = build_mip_data(vol)
+                    self._mip_cache[key] = (ref(vol), vol.mask_revision, mip)
+                else:
+                    mip = cached[2]
+            else:
+                mip = cached[2] if cached is not None else None
+                if mip is None and key not in self._prefetch_failed and assets is not None and (
+                        assets.working_ct is not None and assets.working_pet is not None):
+                    pending.append(key)
+            if mip is not None:
+                mip.role = role
+            title = f"{labels.get(role, 'Follow-up')}  {date}"
+            if mip is None:
+                if key in self._prefetch_failed:
+                    title += "  · 载入失败"
+                elif assets is None or assets.working_ct is None or assets.working_pet is None:
+                    title += "  · 缺少 CT/PET"
+                else:
+                    title += "  · 载入中"
+            items.append((title, mip))
+        while len(self._mip_cache) > 32:
+            self._mip_cache.popitem(last=False)
         self.evolution.set_volumes(
             items,
             suv_max=float(self.ortho.spin_suv.value()),
@@ -477,6 +532,52 @@ class MainWindow(QMainWindow):
             highlight_role=session.role_of(self.current_date) if self.current_date else None,
             pet_cmap=self.ortho.pet_cmap(),
         )
+        self._prefetch_pending = pending
+        self._start_next_prefetch()
+
+    def _start_next_prefetch(self) -> None:
+        if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
+            return
+        while self._prefetch_pending:
+            key = self._prefetch_pending.pop(0)
+            if key in self._mip_cache or key in self._prefetch_failed or key[0] != self.current_patient:
+                continue
+            assets = self.catalog.get_study(key[0], key[1])
+            if assets is None:
+                continue
+            keep_volume = sum(k[0] == key[0] and v is not None
+                              for k, v in self._vol_cache.items()) < 3
+            worker = MipPrefetchWorker(assets, key[2] or None,
+                                       self._prefetch_generation, keep_volume)
+            self._prefetch_worker = worker
+            worker.loaded.connect(self._on_prefetch_loaded)
+            worker.finished.connect(self._on_prefetch_finished)
+            worker.start()
+            return
+
+    def _on_prefetch_loaded(self, result: tuple) -> None:
+        generation, patient_id, date, baseline_date, mip, vol, error = result
+        if generation != self._prefetch_generation or patient_id != self.current_patient:
+            return
+        key = (patient_id, date, baseline_date)
+        if error or mip is None:
+            self._prefetch_failed.add(key)
+        else:
+            self._mip_cache[key] = (ref(vol) if vol is not None else None,
+                                    vol.mask_revision if vol is not None else 0, mip)
+            if vol is not None and key not in self._vol_cache:
+                self._vol_cache[key] = vol
+                self._vol_cache.move_to_end(key)
+                self._evict_vol_cache()
+        self._refresh_evolution()
+
+    def _on_prefetch_finished(self) -> None:
+        worker = self.sender()
+        if worker is self._prefetch_worker:
+            self._prefetch_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._start_next_prefetch()
 
     def _sync_role_buttons(self) -> None:
         session = self._session()
@@ -552,6 +653,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._confirm_navigation():
+            self._prefetch_generation += 1
+            self._prefetch_pending.clear()
+            if self._prefetch_worker is not None:
+                self._prefetch_worker.wait()
             event.accept()
         else:
             event.ignore()
@@ -705,8 +810,10 @@ class MainWindow(QMainWindow):
         if vol is None:
             self.edit_panel.set_lesions([])
             return
-        rows = lesion_stats(vol.native, vol.pet, self._voxel_ml())
-        self.edit_panel.set_lesions(rows, selected=self.ortho.current_label)
+        if vol.stats_revision != vol.mask_revision:
+            vol.stats_cache = lesion_stats(vol.native, vol.pet, self._voxel_ml())
+            vol.stats_revision = vol.mask_revision
+        self.edit_panel.set_lesions(vol.stats_cache, selected=self.ortho.current_label)
 
     def _on_lesion_selected(self, lid: int) -> None:
         vol = self.ortho.volumes()
@@ -1015,8 +1122,27 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh(self) -> None:
+        if not self._confirm_navigation():
+            return
+        patient_id, study_date = self.current_patient, self.current_date
+        self._prefetch_generation += 1
+        self._prefetch_pending.clear()
+        self._prefetch_failed.clear()
+        self._vol_cache.clear()
+        self._mip_cache.clear()
         self.catalog.refresh()
         self.browser.populate(self.catalog)
+        self.current_patient = None
+        self.current_date = None
+        if patient_id and self.catalog.get_patient(patient_id):
+            self._on_patient(patient_id)
+            if study_date and study_date != self.current_date and (
+                    self.catalog.get_study(patient_id, study_date) is not None):
+                self._on_study(patient_id, study_date)
+        else:
+            self.ortho.set_volumes(None)
+            self.evolution.clear()
+            self.features.clear()
         self.status.showMessage("目录已刷新")
 
     def _export_csv(self) -> None:

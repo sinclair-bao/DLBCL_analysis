@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "gui"))
 
 from catalog import DataCatalog, StudyAssets  # noqa: E402
 from features import compute_roi_features  # noqa: E402
-from mask_ops import threshold_pet_mask  # noqa: E402
+from mask_ops import lesion_stats, threshold_pet_mask  # noqa: E402
 from quality import (archive_existing_mask, mapping_status, mask_review_status, record_mask_version,
                      review_mapping, review_mask, write_mapping_manifest)  # noqa: E402
 from session import LongitudinalSession  # noqa: E402
@@ -126,6 +126,17 @@ class LongitudinalQcTests(unittest.TestCase):
         self.assertEqual(len(session.dates_in_order()), 5)
         self.assertEqual(len(session.followups()), 4)
         self.assertEqual(session.validate(["T1", "T2", "T3", "T4", "T5"]), [])
+
+    def test_sparse_lesion_stats_and_nonfinite_pet(self) -> None:
+        mask = np.zeros((20, 20, 20), dtype=np.uint16)
+        pet = np.zeros(mask.shape, dtype=np.float32)
+        mask[1, 1, 1] = mask[1, 1, 2] = 1
+        mask[4, 4, 4] = 3
+        pet[1, 1, 1], pet[1, 1, 2], pet[4, 4, 4] = 5.0, np.nan, 7.0
+        rows = lesion_stats(mask, pet, 0.008)
+        self.assertEqual([r["id"] for r in rows], [1, 3])
+        self.assertEqual([r["n_voxels"] for r in rows], [2, 1])
+        self.assertEqual([r["suv_max"] for r in rows], [5.0, 7.0])
 
     def test_manifest_and_local_threshold(self) -> None:
         image = np.zeros((24, 24, 24), dtype=np.float32)

@@ -12,6 +12,7 @@ import numpy as np
 from nibabel.processing import resample_from_to
 
 from catalog import StudyAssets
+from display_utils import coronal_mip
 from mask_ops import ensure_labeled
 from quality import fingerprint
 
@@ -30,7 +31,28 @@ class VolumeSet:
     edited_sha256: Optional[str] = None
     native_source_path: Optional[str] = None
     native_source_sha256: Optional[str] = None
+    mask_revision: int = 0
+    stats_revision: int = -1
+    stats_cache: list[dict] = field(default_factory=list, repr=False)
     _undo: list = field(default_factory=list, repr=False)
+
+
+@dataclass
+class MipData:
+    pet: np.ndarray
+    native: np.ndarray
+    mapped: Optional[np.ndarray]
+    role: str = ""
+
+
+def build_mip_data(vol: VolumeSet) -> MipData:
+    """Keep only 2D projections so inactive studies need little resident memory."""
+    return MipData(
+        pet=coronal_mip(vol.pet),
+        native=coronal_mip(vol.native),
+        mapped=coronal_mip(vol.mapped) if vol.mapped is not None else None,
+        role=vol.role,
+    )
 
 
 def _to_ref(
