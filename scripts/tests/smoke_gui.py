@@ -68,6 +68,22 @@ def main() -> None:
                 edge = button.mapTo(viewport, QPoint(button.width(), 0)).x()
                 assert edge <= viewport.width(), (width, button.text(), edge,
                                                   viewport.width())
+            control_scroll = win.ortho._control_scroll
+            content = control_scroll.widget()
+            controls = (win.ortho.slider_k, win.ortho.radio_fusion,
+                        win.ortho.chk_native, win.ortho.spin_wl,
+                        win.ortho.combo_render)
+            centers = [widget.mapTo(content, QPoint(0, widget.height() // 2)).y()
+                       for widget in controls]
+            assert max(centers) - min(centers) <= 2, centers
+            assert all(0 <= widget.mapTo(control_scroll.viewport(),
+                                         QPoint(0, widget.height() // 2)).y()
+                       < control_scroll.viewport().height() for widget in controls)
+            assert control_scroll.horizontalScrollBar().maximum() > 0
+            control_scroll.ensureWidgetVisible(win.ortho.combo_render)
+            app.processEvents()
+            render_x = win.ortho.combo_render.mapTo(control_scroll.viewport(), QPoint(0, 0)).x()
+            assert 0 <= render_x < control_scroll.viewport().width()
         win._set_browser_visible(False)
         app.processEvents()
         assert win._right_panel.width() >= 320

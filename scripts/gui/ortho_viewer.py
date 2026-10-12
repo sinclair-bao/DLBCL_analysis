@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -332,69 +334,52 @@ class OrthoViewer(QWidget):
             spin.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             spin.setMaximumWidth(90)
 
-        slice_row = QHBoxLayout()
-        slice_row.addWidget(QLabel("轴位"))
-        slice_row.addWidget(self.slider_k, 1)
-        slice_row.addWidget(QLabel("冠状"))
-        slice_row.addWidget(self.slider_j, 1)
-        slice_row.addWidget(QLabel("矢状"))
-        slice_row.addWidget(self.slider_i, 1)
+        for slider in (self.slider_k, self.slider_j, self.slider_i):
+            slider.setFixedWidth(140)
 
-        view_row = QHBoxLayout()
-        for control in (self.radio_fusion, self.radio_ct, self.radio_pet,
-                        QLabel("查看"), self.radio_bl, self.radio_in, self.radio_end):
-            view_row.addWidget(control)
-        view_row.addStretch(1)
+        control_content = QWidget()
+        control_row = QHBoxLayout(control_content)
+        control_row.setContentsMargins(4, 2, 4, 2)
+        control_row.setSpacing(6)
 
-        controls = QVBoxLayout()
-        controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(4)
-        mask_row = QHBoxLayout()
-        for control in (
-            self.chk_native,
-            self.chk_mapped,
-            self.chk_edit,
-            self.chk_crosshair,
-            QLabel("笔刷"),
-            self.spin_brush,
-        ):
-            mask_row.addWidget(control)
-        mask_row.addStretch(1)
-        window_row = QHBoxLayout()
-        for control in (
-            QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
-            self.lbl_pet_unit,
-            self.spin_suv_min,
-            self.spin_suv_max,
-        ):
-            window_row.addWidget(control)
-        window_row.addStretch(1)
-        display_row = QHBoxLayout()
-        for control in (
-            QLabel("配色"),
-            self.combo_cmap,
-            QLabel("融合"),
-            self.spin_alpha,
-            QLabel("缩放"),
-            self.spin_zoom,
-            self.btn_zoom_reset,
-            QLabel("渲染"),
-            self.combo_render,
-            self.lbl_cuda,
-        ):
-            display_row.addWidget(control)
-        display_row.addStretch(1)
-        controls.addLayout(mask_row)
-        controls.addLayout(window_row)
-        controls.addLayout(display_row)
-        controls.addWidget(self.lbl_pos)
+        def add_section(*widgets: QWidget) -> None:
+            if control_row.count():
+                separator = QFrame()
+                separator.setFrameShape(QFrame.Shape.VLine)
+                separator.setFrameShadow(QFrame.Shadow.Sunken)
+                control_row.addWidget(separator)
+            for widget in widgets:
+                control_row.addWidget(widget)
+
+        add_section(QLabel("轴位"), self.slider_k, QLabel("冠状"), self.slider_j,
+                    QLabel("矢状"), self.slider_i)
+        add_section(self.radio_fusion, self.radio_ct, self.radio_pet,
+                    QLabel("查看"), self.radio_bl, self.radio_in, self.radio_end)
+        add_section(self.chk_native, self.chk_mapped, self.chk_edit,
+                    self.chk_crosshair, QLabel("笔刷"), self.spin_brush)
+        add_section(QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
+                    self.lbl_pet_unit, self.spin_suv_min, self.spin_suv_max)
+        add_section(QLabel("配色"), self.combo_cmap, QLabel("融合"), self.spin_alpha,
+                    QLabel("缩放"), self.spin_zoom, self.btn_zoom_reset,
+                    QLabel("渲染"), self.combo_render, self.lbl_cuda)
+
+        self._control_scroll = QScrollArea()
+        self._control_scroll.setWidget(control_content)
+        self._control_scroll.setWidgetResizable(False)
+        self._control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._control_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._control_scroll.setFixedHeight(
+            control_content.sizeHint().height()
+            + self._control_scroll.horizontalScrollBar().sizeHint().height() + 4
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(views, 1)
-        layout.addLayout(slice_row)
-        layout.addLayout(view_row)
-        layout.addLayout(controls)
+        layout.addWidget(self._control_scroll)
+        layout.addWidget(self.lbl_pos)
 
     def set_role_buttons(self, available: dict[str, bool], current: str | None) -> None:
         mapping = {
