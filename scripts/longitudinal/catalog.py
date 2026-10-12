@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 import sys
+import csv
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -27,6 +30,27 @@ from pipeline_utils import discover_subject_studies  # noqa: E402
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INTERIM_ROOT = PROJECT_ROOT / "data" / "interim"
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
+
+
+def resolve_data_directory(directory: Path | str) -> tuple[Path, Path, str | None]:
+    """Resolve a data/, interim/, or single-patient directory for the GUI."""
+    selected = Path(directory).expanduser().resolve()
+    if not selected.is_dir():
+        raise ValueError(f"数据目录不存在：{selected}")
+    if (selected / "interim").is_dir():
+        return selected / "interim", selected / "processed", None
+    if selected.name == "interim":
+        return selected, selected.parent / "processed", None
+    study_dirs = [child for child in selected.iterdir() if child.is_dir()]
+    is_patient = selected.parent.name == "interim" or any(
+        any((study / name).is_dir() for name in ("CT", "PET", "preprocessed"))
+        for study in study_dirs
+    )
+    if is_patient:
+        processed = (selected.parent.parent / "processed" if selected.parent.name == "interim"
+                     else selected.parent / "processed")
+        return selected.parent, processed, selected.name
+    return selected, selected.parent / "processed", None
 
 # 器官标签（与 organ_segmentation.py 一致）
 ORGAN_SPLEEN = 1
@@ -71,6 +95,8 @@ class StudyAssets:
     lesion_edited: Optional[Path] = None
     organs: Optional[Path] = None
     pet_to_ct_mat: Optional[Path] = None
+    pet_units: str = "SUVbw"
+    tracer: str = ""
 
     @property
     def working_ct(self) -> Optional[Path]:
@@ -109,6 +135,8 @@ class StudyAssets:
             return "missing"
         if self.working_lesion is None:
             return "partial"
+        if self.pet_aligned is None:
+            return "partial"
         return "ok"
 
     def status_note(self) -> str:
@@ -136,6 +164,14 @@ class StudyAssets:
             / f"baseline_{baseline_date}_to_this_0GenericAffine.mat"
         )
         if out.is_file() and mat.is_file():
+            manifest = self.processed_dir / "longitudinal" / "mapping_qc.json"
+            if manifest.is_file():
+                try:
+                    data = json.loads(manifest.read_text(encoding="utf-8"))
+                    if data.get("inputs", {}).get("baseline_date") != baseline_date:
+                        return None
+                except (OSError, ValueError):
+                    return None
             return out
         return None
 
@@ -165,18 +201,73 @@ class DataCatalog:
         self,
         interim_root: Path | str = DEFAULT_INTERIM_ROOT,
         processed_root: Path | str = DEFAULT_PROCESSED_ROOT,
+        manifest_path: Path | str | None = None,
+        *,
+        patient_filter: str | None = None,
     ) -> None:
         self.interim_root = Path(interim_root)
         self.processed_root = Path(processed_root)
+        self.manifest_path = Path(manifest_path) if manifest_path else None
+        self.patient_filter = patient_filter
         self.patients: dict[str, PatientRecord] = {}
         self.refresh()
 
     def refresh(self) -> None:
         self.patients = {}
+        if self.manifest_path is not None:
+            self._scan_manifest()
+            return
         for patient_id, study_date, study_dir in discover_subject_studies(self.interim_root):
+            if self.patient_filter is not None and patient_id != self.patient_filter:
+                continue
             assets = self._scan_study(patient_id, study_date, study_dir)
             rec = self.patients.setdefault(patient_id, PatientRecord(patient_id))
             rec.studies.append(assets)
+
+    def _scan_manifest(self) -> None:
+        """Index an arbitrary longitudinal PET cohort from explicit paths."""
+        with self.manifest_path.open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            required = {"patient_id", "study_date", "ct_path", "pet_path", "pet_units"}
+            if not required.issubset(reader.fieldnames or []):
+                raise ValueError(f"manifest requires columns: {sorted(required)}")
+            for row in reader:
+                patient_id = row["patient_id"].strip()
+                study_date = row["study_date"].strip()
+                if not patient_id or not study_date:
+                    raise ValueError("manifest patient_id and study_date cannot be empty")
+                if any(v in {".", ".."} or re.fullmatch(r"[A-Za-z0-9_.-]+", v) is None
+                       for v in (patient_id, study_date)):
+                    raise ValueError("manifest IDs must be safe path segments")
+                pet_units = (row.get("pet_units") or "").strip()
+                if not pet_units:
+                    raise ValueError(f"manifest pet_units cannot be empty: {patient_id}/{study_date}")
+                def path(key: str) -> Optional[Path]:
+                    value = (row.get(key) or "").strip()
+                    if not value:
+                        return None
+                    candidate = Path(value).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = self.manifest_path.parent / candidate
+                    if not candidate.is_file():
+                        raise FileNotFoundError(f"manifest {key}: {candidate}")
+                    return candidate
+                processed = self.processed_root / patient_id / study_date
+                edited = processed / "masks" / f"{patient_id}_{study_date}_lesion_edited.nii.gz"
+                assets = StudyAssets(
+                    patient_id=patient_id, study_date=study_date,
+                    interim_dir=self.manifest_path.parent, processed_dir=processed,
+                    ct_reference=path("ct_path"), pet_aligned=path("pet_path"),
+                    lesion_auto=path("lesion_mask_path"),
+                    lesion_edited=edited if edited.is_file() else None,
+                    organs=path("organ_mask_path"),
+                    pet_units=pet_units,
+                    tracer=(row.get("tracer") or "").strip(),
+                )
+                rec = self.patients.setdefault(patient_id, PatientRecord(patient_id))
+                if rec.get(study_date) is not None:
+                    raise ValueError(f"duplicate patient/study: {patient_id}/{study_date}")
+                rec.studies.append(assets)
 
     def patient_ids(self) -> list[str]:
         return list(self.patients.keys())

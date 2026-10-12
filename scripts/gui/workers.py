@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""后台线程：跨检查映射、特征提取、AutoPET / 阈值分割。"""
+"""后台线程：跨检查映射、特征提取与 AutoPET 分割。"""
 
 from __future__ import annotations
 
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,13 +14,40 @@ from PySide6.QtCore import QThread, Signal
 _SCRIPTS = Path(__file__).resolve().parents[1]
 _LONG = _SCRIPTS / "longitudinal"
 _COMMON = _SCRIPTS / "common"
-_PROJECT = _SCRIPTS.parent
 for _p in (_LONG, _COMMON, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-AUTOPET_PYTHON = Path("/home/sun/miniconda3/envs/autopet/bin/python")
+AUTOPET_PYTHON = Path(os.environ.get("AUTOPET_PYTHON", "/home/sun/miniconda3/envs/autopet/bin/python"))
 DA_PYTHON = Path(sys.executable)
+
+
+class MipPrefetchWorker(QThread):
+    """Read one inactive study outside the UI thread and keep its small MIP."""
+
+    loaded = Signal(object)
+
+    def __init__(self, assets, baseline_date: str | None, generation: int,
+                 keep_volume: bool = False) -> None:
+        super().__init__()
+        self.assets = assets
+        self.baseline_date = baseline_date
+        self.generation = generation
+        self.keep_volume = keep_volume
+
+    def run(self) -> None:
+        from volume_io import build_mip_data, load_volume_set
+
+        try:
+            vol = load_volume_set(self.assets, self.baseline_date)
+            mip = build_mip_data(vol) if vol is not None else None
+            self.loaded.emit((self.generation, self.assets.patient_id,
+                              self.assets.study_date, self.baseline_date or "",
+                              mip, vol if self.keep_volume else None, ""))
+        except Exception as exc:  # noqa: BLE001
+            self.loaded.emit((self.generation, self.assets.patient_id,
+                              self.assets.study_date, self.baseline_date or "",
+                              None, None, str(exc)))
 
 
 class MappingWorker(QThread):
@@ -76,11 +103,13 @@ class FeatureWorker(QThread):
         catalog,
         patient_id: str,
         include_radiomics: bool = True,
+        per_lesion: bool = False,
     ) -> None:
         super().__init__()
         self._catalog = catalog
         self._patient_id = patient_id
         self._include_radiomics = include_radiomics
+        self._per_lesion = per_lesion
 
     def run(self) -> None:
         try:
@@ -93,6 +122,8 @@ class FeatureWorker(QThread):
                 self._catalog,
                 session,
                 include_radiomics=self._include_radiomics,
+                require_qc=True,
+                per_lesion=self._per_lesion,
             )
             if not rows:
                 self.failed.emit("没有特征行：请先指定时间点并完成基线映射。")
@@ -130,8 +161,6 @@ class SegmentWorker(QThread):
         try:
             if self._method == "autopet":
                 self._run_autopet()
-            elif self._method == "threshold":
-                self._run_threshold()
             else:
                 self.failed.emit(f"未知分割方法: {self._method}")
                 return
@@ -149,55 +178,39 @@ class SegmentWorker(QThread):
     def _run_autopet(self) -> None:
         if not AUTOPET_PYTHON.is_file():
             raise RuntimeError(f"未找到 autopet Python: {AUTOPET_PYTHON}")
-        export_root = _PROJECT / "data" / "nnunet_export"
+        export_root = self._catalog.processed_root.parent / "nnunet_export"
+        log_dir = self._catalog.processed_root.parent / "logs"
         case = f"{self._patient_id}_{self._study_date}"
-        if not (export_root / f"{case}_0000.nii.gz").is_file():
-            self._run_cmd(
-                [
-                    str(DA_PYTHON),
-                    str(_SCRIPTS / "processing" / "export_nnunet.py"),
-                    "--patient-id",
-                    self._patient_id,
-                    "--study-date",
-                    self._study_date,
-                ],
-                "导出 nnU-Net 格式",
+        self._run_cmd(
+            [
+                str(DA_PYTHON), str(_SCRIPTS / "processing" / "export_nnunet.py"),
+                "--interim-root", str(self._catalog.interim_root),
+                "--export-root", str(export_root), "--log-dir", str(log_dir),
+                "--patient-id", self._patient_id, "--study-date", self._study_date,
+                "--overwrite",
+            ],
+            "导出当前 CT/PET（CT=_0000，PET=_0001）",
+        )
+        ct_nii = export_root / f"{case}_0000.nii.gz"
+        pet_nii = export_root / f"{case}_0001.nii.gz"
+        if not ct_nii.is_file() or not pet_nii.is_file():
+            missing = []
+            if not ct_nii.is_file():
+                missing.append("CT（_0000）")
+            if not pet_nii.is_file():
+                missing.append("PET（_0001）")
+            raise RuntimeError(
+                "AutoPET 需要成对的 CT 与 PET 输入，缺少：" + "、".join(missing)
             )
         self._run_cmd(
             [
                 str(AUTOPET_PYTHON),
                 str(_SCRIPTS / "processing" / "infer_nnunet.py"),
-                "--patient-id",
-                self._patient_id,
-                "--study-date",
-                self._study_date,
+                "--export-root", str(export_root),
+                "--processed-root", str(self._catalog.processed_root),
+                "--log-dir", str(log_dir),
+                "--patient-id", self._patient_id, "--study-date", self._study_date,
+                "--overwrite",
             ],
             "AutoPET 推理（约 1–2 分钟）",
         )
-
-    def _run_threshold(self) -> None:
-        self._run_cmd(
-            [
-                str(DA_PYTHON),
-                str(_SCRIPTS / "processing" / "segmentation.py"),
-                "--method",
-                "threshold",
-                "--patient-id",
-                self._patient_id,
-                "--study-date",
-                self._study_date,
-            ],
-            "SUV 阈值分割",
-        )
-        masks = (
-            self._catalog.processed_root
-            / self._patient_id
-            / self._study_date
-            / "masks"
-        )
-        dest = masks / f"{self._patient_id}_{self._study_date}_lesion_edited.nii.gz"
-        cands = sorted(masks.glob("*_mask.nii.gz")) if masks.is_dir() else []
-        if not cands:
-            raise RuntimeError("SUV 阈值分割未写出 *_mask.nii.gz")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cands[0], dest)

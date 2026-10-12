@@ -73,14 +73,15 @@ def _find_preprocessed_ct(study_dir: Path) -> Optional[Path]:
     if not ct_dir.is_dir():
         return None
     files = sorted(ct_dir.glob("*.nii.gz"))
-    return files[0] if files else None
+    preferred = [path for path in files if "WB_Standard" in path.name]
+    return preferred[0] if preferred else (files[0] if files else None)
 
 
 def _find_preprocessed_pet(study_dir: Path) -> Optional[Path]:
     pet_dir = study_dir / "preprocessed" / "PET"
     if not pet_dir.is_dir():
         return None
-    candidates = sorted(pet_dir.glob("*_SUVbw.nii.gz")) or sorted(pet_dir.glob("*.nii.gz"))
+    candidates = sorted(pet_dir.glob("*_SUVbw.nii.gz"))
     return candidates[0] if candidates else None
 
 

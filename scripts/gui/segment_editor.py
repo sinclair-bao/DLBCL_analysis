@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
+
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -27,17 +31,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from busy import busy_progress
 from display_utils import (
     DEFAULT_PET_CMAP,
     DEFAULT_WL,
     DEFAULT_WW,
     PET_CMAP_CHOICES,
-    compose_rgb,
     ct_window_from_wl,
+    voxel_to_display,
     slice_axial,
     slice_coronal,
     slice_sagittal,
-    voxel_to_display,
 )
 from mask_ops import (
     lesion_stats,
@@ -48,17 +52,27 @@ from mask_ops import (
     relabel_by_volume,
     threshold_pet_mask,
 )
-from ortho_viewer import _RgbView
+from ortho_viewer import _RgbView, configure_render_combo
+from render_backend import GpuVolumeCache, compose_plane_cpu, gpu_available
 from volume_io import VolumeSet
 
+_LOG = logging.getLogger(__name__)
 _MODES = ("ct", "pet", "fusion")
 _MODE_LABEL = {"ct": "CT", "pet": "PET", "fusion": "融合"}
 _PLANE_LABEL = {"axial": "轴位", "coronal": "冠状", "sagittal": "矢状"}
-_SLICE_FN = {"axial": slice_axial, "coronal": slice_coronal, "sagittal": slice_sagittal}
 
 
 class SegmentEditorDialog(QDialog):
-    def __init__(self, vol: VolumeSet, parent=None, *, pet_cmap: str = DEFAULT_PET_CMAP) -> None:
+    def __init__(
+        self,
+        vol: VolumeSet,
+        parent=None,
+        *,
+        pet_cmap: str = DEFAULT_PET_CMAP,
+        render_device: str = "cpu",
+        reference_mask: np.ndarray | None = None,
+        require_change: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"分割编辑  {vol.patient_id}  {vol.study_date}")
         self.setModal(True)
@@ -71,7 +85,11 @@ class SegmentEditorDialog(QDialog):
             patient_id=vol.patient_id,
             affine=vol.affine,
             role=vol.role,
+            pet_units=vol.pet_units,
         )
+        self._require_change = require_change
+        self._reference = np.array(reference_mask if reference_mask is not None else vol.native,
+                                   copy=True, dtype=np.uint16)
         nx, ny, nz = vol.ct.shape
         self._i, self._j, self._k = nx // 2, ny // 2, nz // 2
         self.current_label = 1
@@ -81,6 +99,10 @@ class SegmentEditorDialog(QDialog):
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
+        self._gpu = GpuVolumeCache()
+        self._masks_dirty = True
+        self._gpu_failed = False
+        self._shown_slice: tuple[str, int] | None = None
         pet = np.asarray(vol.pet, dtype=np.float32)
         self._pet_peak = float(np.nanmax(pet)) if pet.size else 0.0
 
@@ -119,7 +141,7 @@ class SegmentEditorDialog(QDialog):
 
         self.chk_crosshair = QCheckBox("十字线")
         self.chk_crosshair.setChecked(True)
-        self.chk_crosshair.toggled.connect(lambda _: self.refresh(False))
+        self.chk_crosshair.toggled.connect(lambda _: self.refresh(False, force=False))
         self.spin_brush = QSpinBox()
         self.spin_brush.setRange(3, 15)
         self.spin_brush.setValue(5)
@@ -149,6 +171,16 @@ class SegmentEditorDialog(QDialog):
             w.valueChanged.connect(lambda _: self.refresh(False))
         self.combo_cmap.currentIndexChanged.connect(lambda _: self.refresh(False))
 
+        self.combo_render = QComboBox()
+        self.lbl_cuda = configure_render_combo(self.combo_render, render_device)
+        self.combo_render.currentIndexChanged.connect(self._on_render_device)
+        self.combo_compare = QComboBox()
+        self.combo_compare.addItem("当前编辑", "edited")
+        self.combo_compare.addItem("原始 mask", "original")
+        self.combo_compare.addItem("增删差异", "difference")
+        self.combo_compare.currentIndexChanged.connect(lambda _: self.refresh(force=True))
+        self.lbl_difference = QLabel("")
+
         self.lbl_pos = QLabel("—")
 
         plane_row = QHBoxLayout()
@@ -171,20 +203,36 @@ class SegmentEditorDialog(QDialog):
         ctrl.addWidget(self.spin_wl)
         ctrl.addWidget(QLabel("窗宽"))
         ctrl.addWidget(self.spin_ww)
-        ctrl.addWidget(QLabel("SUV"))
+        ctrl.addWidget(QLabel("SUV" if vol.pet_units == "SUVbw" else f"PET ({vol.pet_units})"))
         ctrl.addWidget(self.spin_suv_min)
         ctrl.addWidget(self.spin_suv_max)
         ctrl.addWidget(QLabel("融合"))
         ctrl.addWidget(self.spin_alpha)
         ctrl.addWidget(QLabel("配色"))
         ctrl.addWidget(self.combo_cmap)
+        ctrl.addWidget(QLabel("渲染"))
+        ctrl.addWidget(self.combo_render)
+        ctrl.addWidget(self.lbl_cuda)
+        ctrl.addWidget(QLabel("对比"))
+        ctrl.addWidget(self.combo_compare)
 
         self.radio_thr_rel = QRadioButton("41% SUVmax")
         self.radio_thr_abs = QRadioButton("固定 SUV")
-        self.radio_thr_rel.setChecked(True)
+        self.spin_roi_radius = QSpinBox()
+        self.spin_roi_radius.setRange(10, 100)
+        self.spin_roi_radius.setValue(30)
+        self.spin_roi_radius.setSuffix(" mm")
+        self.radio_thr_none = QRadioButton()
+        self.radio_thr_none.hide()
         self._thr_group = QButtonGroup(self)
+        self._thr_group.setExclusive(True)
+        self._thr_group.addButton(self.radio_thr_none)
         self._thr_group.addButton(self.radio_thr_rel)
         self._thr_group.addButton(self.radio_thr_abs)
+        self.radio_thr_none.setChecked(True)
+        if vol.pet_units != "SUVbw":
+            self.radio_thr_rel.setEnabled(False)
+            self.radio_thr_abs.setEnabled(False)
         self.slider_thr = QSlider(Qt.Orientation.Horizontal)
         self.slider_thr.setRange(5, 150)
         self.slider_thr.setValue(25)
@@ -209,6 +257,8 @@ class SegmentEditorDialog(QDialog):
         thr_row.addWidget(self.slider_thr, 1)
         thr_row.addWidget(self.spin_thr)
         thr_row.addWidget(self.lbl_thr, 1)
+        thr_row.addWidget(QLabel("十字线 ROI 半径"))
+        thr_row.addWidget(self.spin_roi_radius)
 
         morph = QHBoxLayout()
         self.spin_radius = QSpinBox()
@@ -249,12 +299,12 @@ class SegmentEditorDialog(QDialog):
         )
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并关闭")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept_edit)
         buttons.rejected.connect(self.reject)
 
         hint = QLabel(
             "点选轴位/冠状/矢状后，三格显示该平面的 CT、PET、融合。"
-            "左键涂抹、右键擦除。切换阈值模式或松开滑杆会重算 mask。"
+            "先看图，再选 SUV 阈值模式才会计算 mask。左键涂抹、右键擦除。"
         )
         hint.setWordWrap(True)
 
@@ -265,10 +315,12 @@ class SegmentEditorDialog(QDialog):
         layout.addLayout(thr_row)
         layout.addLayout(morph)
         layout.addWidget(self.table)
+        layout.addWidget(self.lbl_difference)
         layout.addWidget(hint)
         layout.addWidget(buttons)
 
         self._fit_to_screen()
+        self._bind_gpu()
         self.refresh(update_table=True)
 
     def _fit_to_screen(self) -> None:
@@ -290,19 +342,52 @@ class SegmentEditorDialog(QDialog):
     def edited_mask(self) -> np.ndarray:
         return self._vol.native
 
+    def _accept_edit(self) -> None:
+        if self._require_change and not self._vol.dirty:
+            QMessageBox.warning(self, "尚未生成 mask", "请先选择 SUV 阈值模式或进行手动编辑。")
+            return
+        self.accept()
+
     def _pet_cmap(self) -> str:
         data = self.combo_cmap.currentData()
         return str(data) if data else DEFAULT_PET_CMAP
 
+    def render_device(self) -> str:
+        if self._gpu_failed or not gpu_available():
+            return "cpu"
+        data = self.combo_render.currentData()
+        return str(data) if data else "cpu"
+
+    def _mark_masks_dirty(self) -> None:
+        self._masks_dirty = True
+
+    def _on_render_device(self, _index: int = 0) -> None:
+        self._gpu_failed = False
+        self._gpu.clear()
+        self._masks_dirty = True
+        self._shown_slice = None
+        self._bind_gpu()
+        self.refresh(update_table=False, force=True)
+
+    def _bind_gpu(self) -> None:
+        if self.render_device() != "gpu":
+            return
+        if self._gpu.bind_volumes(self._vol):
+            self._gpu.sync_masks(self._vol)
+            self._masks_dirty = False
+
     def _sync_thr_ui(self) -> None:
         rel = self.radio_thr_rel.isChecked()
-        self.slider_thr.setEnabled(not rel)
-        self.spin_thr.setEnabled(not rel)
+        abs_on = self.radio_thr_abs.isChecked()
+        self.slider_thr.setEnabled(abs_on)
+        self.spin_thr.setEnabled(abs_on)
         peak = self._pet_peak
         if rel:
             self.lbl_thr.setText(f"0.41 × SUVmax {peak:.2f} = {0.41 * peak:.2f}")
-        else:
+        elif abs_on:
             self.lbl_thr.setText(f"SUV ≥ {float(self.spin_thr.value()):.2f}")
+        else:
+            self.lbl_thr.setText("请选择阈值模式后再计算")
 
     def _on_thr_mode(self) -> None:
         self._sync_thr_ui()
@@ -327,40 +412,65 @@ class SegmentEditorDialog(QDialog):
         self._apply_threshold()
 
     def _apply_threshold(self) -> None:
+        if self._vol.pet_units != "SUVbw":
+            QMessageBox.warning(self, "SUV 阈值", "当前 PET 单位不是 SUVbw，不能使用 SUV 阈值分割。")
+            return
+        if not self.radio_thr_rel.isChecked() and not self.radio_thr_abs.isChecked():
+            return
         if self.radio_thr_abs.isChecked() and self.slider_thr.isSliderDown():
             return
         self._sync_thr_ui()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
         self._push_undo()
-        try:
+        with busy_progress(self, "SUV 阈值", "正在计算阈值 mask…"):
+            QApplication.processEvents()
             if self.radio_thr_rel.isChecked():
-                mask = threshold_pet_mask(self._vol.pet, mode="relative", value=0.41)
+                mask = threshold_pet_mask(self._vol.pet, mode="relative", value=0.41,
+                                          roi_center=(self._i, self._j, self._k),
+                                          roi_radius_mm=self.spin_roi_radius.value(), affine=self._vol.affine)
             else:
                 mask = threshold_pet_mask(
-                    self._vol.pet, mode="absolute", value=float(self.spin_thr.value())
+                    self._vol.pet, mode="absolute", value=float(self.spin_thr.value()),
+                    roi_center=(self._i, self._j, self._k),
+                    roi_radius_mm=self.spin_roi_radius.value(), affine=self._vol.affine,
                 )
             self._vol.native = mask
-        finally:
-            QApplication.restoreOverrideCursor()
         self._vol.dirty = True
         self.current_label = 1
         self.highlight_label = 0
-        self.refresh(update_table=True)
+        self._mark_masks_dirty()
+        self.refresh(update_table=True, force=True)
 
     def _set_plane(self, plane: str) -> None:
         self.plane = plane
         self.active_view = plane
+        self._shown_slice = None
         for view in self._cells.values():
             view.view_name = plane
             view.set_laterality(plane)
-        self.refresh(update_table=False)
+        self.refresh(update_table=False, force=True)
+        for view in self._cells.values():
+            view.set_zoom(100)
+
+    def _set_ijk(self, i: int, j: int, k: int) -> None:
+        self.slider_i.blockSignals(True)
+        self.slider_j.blockSignals(True)
+        self.slider_k.blockSignals(True)
+        self.slider_i.setValue(int(i))
+        self.slider_j.setValue(int(j))
+        self.slider_k.setValue(int(k))
+        self.slider_i.blockSignals(False)
+        self.slider_j.blockSignals(False)
+        self.slider_k.blockSignals(False)
+        self._i = self.slider_i.value()
+        self._j = self.slider_j.value()
+        self._k = self.slider_k.value()
+        self.refresh(update_table=False, force=False)
 
     def _sliders_changed(self) -> None:
         self._i = self.slider_i.value()
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
-        self.refresh(update_table=False)
+        self.refresh(update_table=False, force=False)
 
     def _click(self, x: float, y: float) -> None:
         from display_utils import display_to_voxel
@@ -368,9 +478,7 @@ class SegmentEditorDialog(QDialog):
         ii, jj, kk = display_to_voxel(
             self.plane, x, y, self._i, self._j, self._k, self._vol.ct.shape
         )
-        self.slider_i.setValue(ii)
-        self.slider_j.setValue(jj)
-        self.slider_k.setValue(kk)
+        self._set_ijk(ii, jj, kk)
 
     def _push_undo(self) -> None:
         self._vol._undo.append(self._vol.native.copy())
@@ -382,9 +490,12 @@ class SegmentEditorDialog(QDialog):
             return
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _paint(self, x: float, y: float, erase: bool) -> None:
+        if self.combo_compare.currentData() != "edited":
+            return
         if not self._stroke:
             self._push_undo()
             self._stroke = True
@@ -402,11 +513,13 @@ class SegmentEditorDialog(QDialog):
             label,
         )
         self._vol.dirty = True
-        self.refresh(update_table=False)
+        self._mark_masks_dirty()
+        self.refresh(update_table=False, force=True)
 
     def _end_stroke(self) -> None:
         if self._stroke and not self._stroke_erase and self._vol._undo:
             promote_new_islands(self._vol.native, self._vol._undo[-1])
+            self._mark_masks_dirty()
         self._stroke = False
         self.refresh(update_table=True)
 
@@ -418,18 +531,19 @@ class SegmentEditorDialog(QDialog):
         plane = self.plane if scope == "slice" else None
         ijk = (self._i, self._j, self._k) if plane else None
         waiting = plane is None
-        if waiting:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
         self._push_undo()
-        try:
+        if waiting:
+            with busy_progress(self, "形态学", "正在三维形态学运算…"):
+                QApplication.processEvents()
+                self._vol.native = morph_labels(
+                    self._vol.native, op, radius, label=label, plane=plane, ijk=ijk
+                )
+        else:
             self._vol.native = morph_labels(
                 self._vol.native, op, radius, label=label, plane=plane, ijk=ijk
             )
-        finally:
-            if waiting:
-                QApplication.restoreOverrideCursor()
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _relabel(self) -> None:
@@ -438,6 +552,7 @@ class SegmentEditorDialog(QDialog):
         self.current_label = 1
         self.highlight_label = 1
         self._vol.dirty = True
+        self._mark_masks_dirty()
         self.refresh(update_table=True)
 
     def _on_row(self) -> None:
@@ -475,13 +590,16 @@ class SegmentEditorDialog(QDialog):
             self.table.selectRow(selected_row)
         self.table.blockSignals(False)
 
-    def refresh(self, update_table: bool = True) -> None:
+    def refresh(self, update_table: bool = True, *, force: bool = True) -> None:
         vol = self._vol
         native = vol.native
-        mapped = vol.mapped
         plane = self.plane
-        fn = _SLICE_FN[plane]
         sl = {"axial": self._k, "coronal": self._j, "sagittal": self._i}[plane]
+        slice_key = (plane, sl)
+        skip_rgb = (
+            not force
+            and self._shown_slice == slice_key
+        )
         args_base = dict(
             pet_alpha=float(self.spin_alpha.value()),
             suv_min=float(self.spin_suv_min.value()),
@@ -494,17 +612,60 @@ class SegmentEditorDialog(QDialog):
         )
         on = self.chk_crosshair.isChecked()
         col, row = voxel_to_display(plane, self._i, self._j, self._k, vol.ct.shape)
-        for mode, view in self._cells.items():
-            view.set_rgb(
-                compose_rgb(
-                    fn(vol.ct, sl),
-                    fn(vol.pet, sl),
-                    fn(native, sl),
-                    fn(mapped, sl) if mapped is not None else None,
-                    mode=mode,
-                    **args_base,
-                )
-            )
+        if not skip_rgb:
+            compare = self.combo_compare.currentData()
+            device = self.render_device() if compare == "edited" else "cpu"
+            gpu_cache = None
+            if device == "gpu":
+                try:
+                    if not self._gpu.bind_volumes(vol):
+                        raise RuntimeError("GPU 不可用")
+                    if self._masks_dirty:
+                        self._gpu.sync_masks(vol)
+                        self._masks_dirty = False
+                    gpu_cache = self._gpu
+                except Exception:
+                    _LOG.exception("GPU 体积上传失败，回退 CPU")
+                    self._gpu_failed = True
+                    device = "cpu"
+            used_gpu = device == "gpu" and gpu_cache is not None
+            rgb_by_mode: dict[str, np.ndarray] | None = None
+            if used_gpu:
+                try:
+                    rgb_by_mode = {
+                        mode: gpu_cache.compose_plane(
+                            plane, self._i, self._j, self._k, mode=mode, **args_base
+                        )
+                        for mode in self._cells
+                    }
+                except Exception:
+                    _LOG.exception("GPU 合成失败，回退 CPU")
+                    self._gpu_failed = True
+                    used_gpu = False
+            for mode, view in self._cells.items():
+                if compare == "edited" and rgb_by_mode is not None:
+                    rgb = rgb_by_mode[mode]
+                elif compare == "original":
+                    rgb = compose_plane_cpu(replace(vol, native=self._reference), plane,
+                                            self._i, self._j, self._k, mode=mode, **args_base)
+                elif compare == "difference":
+                    rgb = compose_plane_cpu(vol, plane, self._i, self._j, self._k,
+                                            mode=mode, **{**args_base, "show_native": False})
+                    fn = {"axial": slice_axial, "coronal": slice_coronal,
+                          "sagittal": slice_sagittal}[plane]
+                    add = fn((native > 0) & (self._reference == 0), sl)
+                    remove = fn((native == 0) & (self._reference > 0), sl)
+                    rgb[add] = 0.35 * rgb[add] + 0.65 * np.array([0.15, 1.0, 0.2])
+                    rgb[remove] = 0.35 * rgb[remove] + 0.65 * np.array([0.85, 0.2, 1.0])
+                else:
+                    rgb = compose_plane_cpu(vol, plane, self._i, self._j, self._k,
+                                            mode=mode, **args_base)
+                view.set_rgb(rgb)
+            self._shown_slice = slice_key
+        added = int(np.count_nonzero((native > 0) & (self._reference == 0)))
+        removed = int(np.count_nonzero((native == 0) & (self._reference > 0)))
+        self.lbl_difference.setText(f"相对原始 mask：新增 {added} 体素，删除 {removed} 体素；绿色=新增，紫色=删除")
+        for view in self._cells.values():
             view.set_crosshair_visible(on)
             if on:
                 view.set_crosshair(col, row)
@@ -514,7 +675,7 @@ class SegmentEditorDialog(QDialog):
         extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
             f"{_PLANE_LABEL[plane]}  ijk=({self._i},{self._j},{self._k})  "
-            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
+            f"HU={hu:.0f}  {('SUV' if vol.pet_units == 'SUVbw' else 'PET (' + vol.pet_units + ')')}={suv:.2f}{extra}"
         )
         if update_table:
             self._refresh_table()

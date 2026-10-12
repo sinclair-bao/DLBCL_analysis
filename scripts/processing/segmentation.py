@@ -98,10 +98,13 @@ def threshold_suv_mask(
     SUV 阈值分割基线（mode='absolute' 或 'relative'），返回 uint8 掩码。
     """
     if mode == "absolute":
-        mask = suv_data >= threshold
+        mask = np.isfinite(suv_data) & (suv_data >= threshold)
     elif mode == "relative":
-        suv_max = float(np.nanmax(suv_data)) if suv_data.size else 0.0
-        mask = suv_data >= (threshold * suv_max)
+        finite = np.asarray(suv_data)[np.isfinite(suv_data)]
+        suv_max = float(np.max(finite)) if finite.size else 0.0
+        if suv_max <= 0:
+            return np.zeros(np.shape(suv_data), dtype=np.uint8)
+        mask = np.isfinite(suv_data) & (suv_data >= (threshold * suv_max))
     else:
         raise ValueError(f"未知的 threshold mode: {mode!r}")
     return mask.astype(np.uint8)
@@ -138,7 +141,7 @@ class ThresholdSegmenter:
         pet_dir = study_dir / "preprocessed" / "PET"
         if not pet_dir.is_dir():
             return None
-        candidates = sorted(pet_dir.glob("*_SUVbw.nii.gz")) or sorted(pet_dir.glob("*.nii.gz"))
+        candidates = sorted(pet_dir.glob("*_SUVbw.nii.gz"))
         return candidates[0] if candidates else None
 
     def segment_study(self, patient_id: str, study_date: str, study_dir: Path) -> StageResult:

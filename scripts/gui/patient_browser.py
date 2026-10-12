@@ -26,6 +26,9 @@ class PatientBrowser(QTreeWidget):
         self.setHeaderLabels(["患者 / 检查", "状态"])
         self.setColumnWidth(0, 160)
         self.setAnimated(True)
+        self.setStyleSheet(
+            "QTreeWidget::item:selected { background: #2b60a6; color: #ffffff; }"
+        )
         self.itemSelectionChanged.connect(self._on_select)
 
     def populate(self, catalog: DataCatalog) -> None:
@@ -60,6 +63,18 @@ class PatientBrowser(QTreeWidget):
             if item and item.text(0) == patient_id:
                 self.setCurrentItem(item)
                 return
+
+    def select_study(self, patient_id: str, study_date: str) -> None:
+        for i in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(i)
+            if parent and parent.text(0) == patient_id:
+                for j in range(parent.childCount()):
+                    child = parent.child(j)
+                    if child.text(0) == study_date:
+                        self.blockSignals(True)
+                        self.setCurrentItem(child)
+                        self.blockSignals(False)
+                        return
 
     def _on_select(self) -> None:
         items = self.selectedItems()

@@ -12,7 +12,7 @@ from pathlib import Path
 
 logger = logging.getLogger("longitudinal.ants")
 
-DEFAULT_ANTS_BIN = Path("/home/sun/ants-2.6.5/bin")
+DEFAULT_ANTS_BIN = Path(os.environ.get("ANTS_BIN", "/home/sun/ants-2.6.5/bin"))
 
 ANTS_ENV: dict[str, str] = {
     **os.environ,

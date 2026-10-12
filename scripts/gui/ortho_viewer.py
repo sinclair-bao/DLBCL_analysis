@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import numpy as np
@@ -14,11 +15,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
-    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -31,17 +33,15 @@ from display_utils import (
     DEFAULT_WL,
     DEFAULT_WW,
     PET_CMAP_CHOICES,
-    compose_rgb,
     ct_window_from_wl,
-    slice_axial,
-    slice_coronal,
-    slice_sagittal,
     voxel_to_display,
 )
 from mask_ops import paint_disk, promote_new_islands
+from render_backend import GpuVolumeCache, compose_plane_cpu, gpu_available
 from volume_io import VolumeSet
 
 pg.setConfigOptions(imageAxisOrder="row-major", antialias=False)
+_LOG = logging.getLogger(__name__)
 
 _LAT_STYLE = (
     "QLabel { color: #f2f2f2; background: rgba(10, 10, 10, 165); "
@@ -81,6 +81,27 @@ class _LateralityMixin:
         )
         self._lat_left.raise_()
         self._lat_right.raise_()
+
+
+def configure_render_combo(combo: QComboBox, current: str = "cpu") -> QLabel:
+    """CPU / GPU 下拉。无 CUDA 时禁用 GPU 并旁注。"""
+    combo.addItem("CPU", "cpu")
+    combo.addItem("GPU", "gpu")
+    note = QLabel("")
+    want = current if current in ("cpu", "gpu") else "cpu"
+    if not gpu_available():
+        idx = combo.findData("gpu")
+        model = combo.model()
+        getter = getattr(model, "item", None)
+        item = getter(idx) if callable(getter) and idx >= 0 else None
+        if item is not None:
+            item.setEnabled(False)
+        note.setText("无 CUDA")
+        note.setStyleSheet("color: #888;")
+        want = "cpu"
+    idx = combo.findData(want)
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+    return note
 
 
 class _PaintItem(pg.ImageItem):
@@ -156,14 +177,11 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
     def set_rgb(self, rgb: np.ndarray) -> None:
         img = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
         cur = self.item.image
-        shape_changed = cur is None or cur.shape != img.shape
         if cur is not None and cur.shape == img.shape and cur.dtype == img.dtype:
             np.copyto(cur, img)
             self.item.updateImage()
         else:
             self.item.setImage(img, autoLevels=False)
-        if shape_changed:
-            self.set_zoom(100)
 
     def set_zoom(self, percent: int) -> None:
         if self.item.image is None:
@@ -182,6 +200,7 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
 class OrthoViewer(QWidget):
     mask_changed = Signal()
     role_requested = Signal(str)
+    cursor_changed = Signal(int, int, int, bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -193,6 +212,10 @@ class OrthoViewer(QWidget):
         self.active_view = "axial"
         self._stroke = False
         self._stroke_erase = False
+        self._gpu = GpuVolumeCache()
+        self._masks_dirty = True
+        self._gpu_failed = False
+        self._shown_ijk: Optional[tuple[int, int, int]] = None
 
         self.axial = _RgbView("Axial", "axial")
         self.coronal = _RgbView("Coronal", "coronal")
@@ -220,7 +243,7 @@ class OrthoViewer(QWidget):
         self._mode_group = QButtonGroup(self)
         for r in (self.radio_fusion, self.radio_ct, self.radio_pet):
             self._mode_group.addButton(r)
-            r.toggled.connect(self.refresh)
+            r.toggled.connect(lambda *_: self.refresh(True))
 
         self.radio_bl = QRadioButton("基线")
         self.radio_in = QRadioButton("中期")
@@ -243,16 +266,16 @@ class OrthoViewer(QWidget):
         self.chk_native.setChecked(True)
         self.chk_mapped.setChecked(True)
         self.chk_crosshair.setChecked(True)
-        self.chk_native.toggled.connect(self.refresh)
-        self.chk_mapped.toggled.connect(self.refresh)
+        self.chk_native.toggled.connect(lambda *_: self.refresh(True))
+        self.chk_mapped.toggled.connect(lambda *_: self.refresh(True))
         self.chk_edit.toggled.connect(self._toggle_edit)
-        self.chk_crosshair.toggled.connect(self.refresh)
+        self.chk_crosshair.toggled.connect(lambda *_: self.refresh(False))
 
         self.spin_alpha = QDoubleSpinBox()
         self.spin_alpha.setRange(0.0, 1.0)
         self.spin_alpha.setSingleStep(0.05)
         self.spin_alpha.setValue(0.55)
-        self.spin_alpha.valueChanged.connect(self.refresh)
+        self.spin_alpha.valueChanged.connect(lambda *_: self.refresh(True))
 
         self.spin_suv_min = QDoubleSpinBox()
         self.spin_suv_min.setRange(0.0, 20.0)
@@ -260,8 +283,8 @@ class OrthoViewer(QWidget):
         self.spin_suv_max = QDoubleSpinBox()
         self.spin_suv_max.setRange(0.5, 40.0)
         self.spin_suv_max.setValue(6.0)
-        self.spin_suv_min.valueChanged.connect(self.refresh)
-        self.spin_suv_max.valueChanged.connect(self.refresh)
+        self.spin_suv_min.valueChanged.connect(lambda *_: self.refresh(True))
+        self.spin_suv_max.valueChanged.connect(lambda *_: self.refresh(True))
         self.spin_suv = self.spin_suv_max
 
         self.spin_wl = QSpinBox()
@@ -270,8 +293,8 @@ class OrthoViewer(QWidget):
         self.spin_ww = QSpinBox()
         self.spin_ww.setRange(1, 4000)
         self.spin_ww.setValue(int(DEFAULT_WW))
-        self.spin_wl.valueChanged.connect(self.refresh)
-        self.spin_ww.valueChanged.connect(self.refresh)
+        self.spin_wl.valueChanged.connect(lambda *_: self.refresh(True))
+        self.spin_ww.valueChanged.connect(lambda *_: self.refresh(True))
 
         self.spin_zoom = QSpinBox()
         self.spin_zoom.setRange(50, 400)
@@ -291,10 +314,15 @@ class OrthoViewer(QWidget):
             self.combo_cmap.addItem(label, key)
         idx = self.combo_cmap.findData(DEFAULT_PET_CMAP)
         self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
-        self.combo_cmap.currentIndexChanged.connect(self.refresh)
+        self.combo_cmap.currentIndexChanged.connect(lambda *_: self.refresh(True))
+
+        self.combo_render = QComboBox()
+        self.lbl_cuda = configure_render_combo(self.combo_render)
+        self.combo_render.currentIndexChanged.connect(self._on_render_device)
 
         self.lbl_pos = QLabel("—")
-        self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.lbl_pet_unit = QLabel("SUV")
+        self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         for spin in (
             self.spin_alpha,
             self.spin_suv_min,
@@ -307,61 +335,52 @@ class OrthoViewer(QWidget):
             spin.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             spin.setMaximumWidth(90)
 
-        slice_row = QHBoxLayout()
-        slice_row.addWidget(QLabel("轴位"))
-        slice_row.addWidget(self.slider_k, 1)
-        slice_row.addWidget(QLabel("冠状"))
-        slice_row.addWidget(self.slider_j, 1)
-        slice_row.addWidget(QLabel("矢状"))
-        slice_row.addWidget(self.slider_i, 1)
-        slice_row.addWidget(self.radio_fusion)
-        slice_row.addWidget(self.radio_ct)
-        slice_row.addWidget(self.radio_pet)
-        slice_row.addWidget(QLabel("查看"))
-        slice_row.addWidget(self.radio_bl)
-        slice_row.addWidget(self.radio_in)
-        slice_row.addWidget(self.radio_end)
+        for slider in (self.slider_k, self.slider_j, self.slider_i):
+            slider.setFixedWidth(140)
 
-        tools = QGridLayout()
-        tools.setContentsMargins(0, 0, 0, 0)
-        tools.setHorizontalSpacing(6)
-        tools.setVerticalSpacing(4)
-        r1 = [
-            self.chk_native,
-            self.chk_mapped,
-            self.chk_edit,
-            self.chk_crosshair,
-            QLabel("笔刷"),
-            self.spin_brush,
-            QLabel("窗位"),
-            self.spin_wl,
-            QLabel("窗宽"),
-            self.spin_ww,
-        ]
-        r2 = [
-            QLabel("SUV"),
-            self.spin_suv_min,
-            self.spin_suv_max,
-            QLabel("配色"),
-            self.combo_cmap,
-            QLabel("融合"),
-            self.spin_alpha,
-            QLabel("缩放"),
-            self.spin_zoom,
-            self.btn_zoom_reset,
-            self.lbl_pos,
-        ]
-        for col, w in enumerate(r1):
-            tools.addWidget(w, 0, col)
-        for col, w in enumerate(r2):
-            tools.addWidget(w, 1, col)
-        tools.setColumnStretch(10, 1)
+        control_content = QWidget()
+        control_row = QHBoxLayout(control_content)
+        control_row.setContentsMargins(4, 2, 4, 2)
+        control_row.setSpacing(6)
+
+        def add_section(*widgets: QWidget) -> None:
+            if control_row.count():
+                separator = QFrame()
+                separator.setFrameShape(QFrame.Shape.VLine)
+                separator.setFrameShadow(QFrame.Shadow.Sunken)
+                control_row.addWidget(separator)
+            for widget in widgets:
+                control_row.addWidget(widget)
+
+        add_section(QLabel("轴位"), self.slider_k, QLabel("冠状"), self.slider_j,
+                    QLabel("矢状"), self.slider_i)
+        add_section(self.radio_fusion, self.radio_ct, self.radio_pet,
+                    QLabel("查看"), self.radio_bl, self.radio_in, self.radio_end)
+        add_section(self.chk_native, self.chk_mapped, self.chk_edit,
+                    self.chk_crosshair, QLabel("笔刷"), self.spin_brush)
+        add_section(QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
+                    self.lbl_pet_unit, self.spin_suv_min, self.spin_suv_max)
+        add_section(QLabel("配色"), self.combo_cmap, QLabel("融合"), self.spin_alpha,
+                    QLabel("缩放"), self.spin_zoom, self.btn_zoom_reset,
+                    QLabel("渲染"), self.combo_render, self.lbl_cuda)
+
+        self._control_scroll = QScrollArea()
+        self._control_scroll.setWidget(control_content)
+        self._control_scroll.setWidgetResizable(False)
+        self._control_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._control_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._control_scroll.setFixedHeight(
+            control_content.sizeHint().height()
+            + self._control_scroll.horizontalScrollBar().sizeHint().height() + 4
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(views, 1)
-        layout.addLayout(slice_row)
-        layout.addLayout(tools)
+        layout.addWidget(self._control_scroll)
+        layout.addWidget(self.lbl_pos)
 
     def set_role_buttons(self, available: dict[str, bool], current: str | None) -> None:
         mapping = {
@@ -379,6 +398,31 @@ class OrthoViewer(QWidget):
         data = self.combo_cmap.currentData()
         return str(data) if data else DEFAULT_PET_CMAP
 
+    def render_device(self) -> str:
+        if self._gpu_failed or not gpu_available():
+            return "cpu"
+        data = self.combo_render.currentData()
+        return str(data) if data else "cpu"
+
+    def mark_masks_dirty(self) -> None:
+        self._masks_dirty = True
+        if self._vol is not None:
+            self._vol.mask_revision += 1
+
+    def _on_render_device(self, _index: int = 0) -> None:
+        self._gpu_failed = False
+        self._gpu.clear()
+        self._masks_dirty = True
+        self._bind_gpu()
+        self.refresh(True)
+
+    def _bind_gpu(self) -> None:
+        vol = self._vol
+        if vol is None or self.render_device() != "gpu":
+            return
+        if self._gpu.bind_volumes(vol):
+            self._masks_dirty = False
+
     def display_mode(self) -> str:
         if self.radio_ct.isChecked():
             return "ct"
@@ -392,12 +436,20 @@ class OrthoViewer(QWidget):
 
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
+        self.lbl_pet_unit.setText(
+            "SUV" if vol is None or vol.pet_units == "SUVbw" else f"PET ({vol.pet_units})"
+        )
+        self._gpu_failed = False
+        self._masks_dirty = True
+        self._shown_ijk = None
         if vol is None:
             self.lbl_pos.setText("无图像")
             for view in (self.axial, self.coronal, self.sagittal):
                 view.item.clear()
                 view.set_crosshair_visible(False)
+            self.cursor_changed.emit(0, 0, 0, False)
             return
+        self._bind_gpu()
         nx, ny, nz = vol.ct.shape
         self.slider_i.blockSignals(True)
         self.slider_j.blockSignals(True)
@@ -412,17 +464,32 @@ class OrthoViewer(QWidget):
         self.slider_i.blockSignals(False)
         self.slider_j.blockSignals(False)
         self.slider_k.blockSignals(False)
-        self.refresh()
+        self.refresh(True)
         self._apply_zoom(self.spin_zoom.value())
 
     def volumes(self) -> Optional[VolumeSet]:
         return self._vol
 
+    def _set_ijk(self, i: int, j: int, k: int) -> None:
+        self.slider_i.blockSignals(True)
+        self.slider_j.blockSignals(True)
+        self.slider_k.blockSignals(True)
+        self.slider_i.setValue(int(i))
+        self.slider_j.setValue(int(j))
+        self.slider_k.setValue(int(k))
+        self.slider_i.blockSignals(False)
+        self.slider_j.blockSignals(False)
+        self.slider_k.blockSignals(False)
+        self._i = self.slider_i.value()
+        self._j = self.slider_j.value()
+        self._k = self.slider_k.value()
+        self.refresh(False)
+
     def _sliders_changed(self) -> None:
         self._i = self.slider_i.value()
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
-        self.refresh()
+        self.refresh(False)
 
     def _click(self, which: str, x: float, y: float) -> None:
         self.active_view = which
@@ -433,9 +500,7 @@ class OrthoViewer(QWidget):
         ii, jj, kk = display_to_voxel(
             which, x, y, self._i, self._j, self._k, self._vol.ct.shape
         )
-        self.slider_i.setValue(ii)
-        self.slider_j.setValue(jj)
-        self.slider_k.setValue(kk)
+        self._set_ijk(ii, jj, kk)
 
     def _push_undo(self) -> None:
         if self._vol is None:
@@ -449,7 +514,8 @@ class OrthoViewer(QWidget):
             return
         self._vol.native = self._vol._undo.pop()
         self._vol.dirty = True
-        self.refresh()
+        self.mark_masks_dirty()
+        self.refresh(True)
         self.mask_changed.emit()
 
     def _paint(self, which: str, x: float, y: float, erase: bool) -> None:
@@ -476,13 +542,15 @@ class OrthoViewer(QWidget):
             label,
         )
         vol.dirty = True
-        self.refresh()
+        self.mark_masks_dirty()
+        self.refresh(True)
 
     def _end_stroke(self) -> None:
         vol = self._vol
         if vol is not None and self._stroke and not self._stroke_erase and vol._undo:
             promote_new_islands(vol.native, vol._undo[-1])
-            self.refresh()
+            self.mark_masks_dirty()
+            self.refresh(True)
         self._stroke = False
         self.mask_changed.emit()
 
@@ -493,7 +561,8 @@ class OrthoViewer(QWidget):
             self._push_undo()
         self._vol.native = np.asarray(mask, dtype=np.uint16)
         self._vol.dirty = True
-        self.refresh()
+        self.mark_masks_dirty()
+        self.refresh(True)
         self.mask_changed.emit()
 
     def ijk(self) -> tuple[int, int, int]:
@@ -503,7 +572,7 @@ class OrthoViewer(QWidget):
         for v in (self.axial, self.coronal, self.sagittal):
             v.set_zoom(int(percent))
 
-    def refresh(self) -> None:
+    def refresh(self, force: bool = True) -> None:
         vol = self._vol
         if vol is None:
             return
@@ -519,42 +588,53 @@ class OrthoViewer(QWidget):
             pet_cmap=self.pet_cmap(),
         )
         native = vol.native
-        mapped = vol.mapped
-        self.axial.set_rgb(
-            compose_rgb(
-                slice_axial(vol.ct, self._k),
-                slice_axial(vol.pet, self._k),
-                slice_axial(native, self._k) if native is not None else None,
-                slice_axial(mapped, self._k) if mapped is not None else None,
-                **args,
-            )
-        )
-        self.coronal.set_rgb(
-            compose_rgb(
-                slice_coronal(vol.ct, self._j),
-                slice_coronal(vol.pet, self._j),
-                slice_coronal(native, self._j) if native is not None else None,
-                slice_coronal(mapped, self._j) if mapped is not None else None,
-                **args,
-            )
-        )
-        self.sagittal.set_rgb(
-            compose_rgb(
-                slice_sagittal(vol.ct, self._i),
-                slice_sagittal(vol.pet, self._i),
-                slice_sagittal(native, self._i) if native is not None else None,
-                slice_sagittal(mapped, self._i) if mapped is not None else None,
-                **args,
-            )
-        )
+        prev = self._shown_ijk
+        planes = [
+            (self.axial, "axial", prev is None or force or prev[2] != self._k),
+            (self.coronal, "coronal", prev is None or force or prev[1] != self._j),
+            (self.sagittal, "sagittal", prev is None or force or prev[0] != self._i),
+        ]
+        need = [(view, name) for view, name, yes in planes if yes]
+        if need:
+            device = self.render_device()
+            gpu_cache = None
+            if device == "gpu":
+                try:
+                    if not self._gpu.bind_volumes(vol):
+                        raise RuntimeError("GPU 不可用")
+                    self._masks_dirty = False
+                    gpu_cache = self._gpu
+                except Exception:
+                    _LOG.exception("GPU 体积上传失败，回退 CPU")
+                    self._gpu_failed = True
+                    device = "cpu"
+            used_gpu = device == "gpu" and gpu_cache is not None
+            if used_gpu:
+                try:
+                    for view, plane in need:
+                        view.set_rgb(
+                            gpu_cache.compose_plane(
+                                plane, self._i, self._j, self._k, **args
+                            )
+                        )
+                except Exception:
+                    _LOG.exception("GPU 合成失败，回退 CPU")
+                    self._gpu_failed = True
+                    used_gpu = False
+            if not used_gpu:
+                for view, plane in need:
+                    view.set_rgb(
+                        compose_plane_cpu(vol, plane, self._i, self._j, self._k, **args)
+                    )
         suv = float(vol.pet[self._i, self._j, self._k])
         hu = float(vol.ct[self._i, self._j, self._k])
         lid = int(native[self._i, self._j, self._k]) if native is not None else 0
         extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
             f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  "
-            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
+            f"HU={hu:.0f}  {('SUV' if vol.pet_units == 'SUVbw' else 'PET (' + vol.pet_units + ')')}={suv:.2f}{extra}"
         )
+        self._shown_ijk = (self._i, self._j, self._k)
         self._update_crosshairs()
 
     def _update_crosshairs(self) -> None:
@@ -563,6 +643,7 @@ class OrthoViewer(QWidget):
         on = self.chk_crosshair.isChecked()
         for v in views:
             v.set_crosshair_visible(on)
+        self.cursor_changed.emit(self._i, self._j, self._k, bool(vol is not None and on))
         if vol is None or not on:
             return
         shape = vol.ct.shape

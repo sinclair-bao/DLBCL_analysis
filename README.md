@@ -130,6 +130,8 @@ DLBCL/
 │   │       │   └── organs.nii.gz   # 11 类器官标签
 │   │       ├── masks/               # 病灶分割掩码
 │   │       │   ├── {case}_lesion.nii.gz     # nnU-Net 二值病灶掩码
+│   │       │   ├── {case}_lesion_edited.nii.gz # GUI 人工编辑稿（优先读取）
+│   │       │   ├── versions/                # 编辑版本和覆盖前备份
 │   │       │   ├── {case}.nii.gz            # nnU-Net 原始输出
 │   │       │   └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
 │   │       └── longitudinal/        # 跨检查 CT–CT 映射（随访目录）
@@ -361,6 +363,8 @@ data/interim/<PatientID>/<StudyDate>/
 - 依赖 `dcm2niix`（FSL 自带：`/home/sun/fsl/bin/dcm2niix`）
 - DICOM 目录须符合 PACS 三级结构 `Patient/Study/Series/Image`；IM 文件无扩展名但为标准 DICOM Part 10
 - SUV 换算需要 DICOM 头包含完整的注射剂量/体重/扫描时间信息；前提不满足时仅输出 `_ACT.nii.gz` 并记录 warning
+- 若同一 PET Series 被 `dcm2niix` 拆成多个 NIfTI，转换会报错并停止该 Series，避免只取第一份而丢失床位或帧；须先确认完整覆盖并按扫描协议重建。
+- 当前 SUVbw 使用一个 Series 级采集时刻计算缩放因子；多床位、跨时段数据须与设备导出 SUV 图逐例核对，未经验证不能把该值用于定量终点。
 - 默认源目录 `data/raw/DICOM*`（glob 展开），可通过 `--source` 指定多个路径
 
 ```bash
@@ -651,7 +655,27 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）  
 **使用说明：** 脚本职责、操作步骤与后续 Todo 见 [`scripts/gui/README.md`](scripts/gui/README.md)。
 
-时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**（可只选 1–3 个），写入
+**界面选择数据源：** 「文件 → 打开数据目录」可选 `data/`、`data/interim/` 或
+`data/interim/<PatientID>/`；「文件 → 导入清单」可选任意队列的 CSV。目录模式
+按 `interim/<PatientID>/<StudyDate>/` 建立患者列表，`processed/` 中同名层级提供
+配准图和 mask。工作 CT 优先 `processed/.../registration/ct_iso_reference.nii.gz`，
+否则 `interim/.../preprocessed/CT/*.nii.gz`；工作 PET 优先
+`processed/.../registration/pet_iso_aligned.nii.gz`，否则
+`interim/.../preprocessed/PET/*_SUVbw.nii.gz`。仅有原始 `CT/`、`PET/` 时
+仍能看到检查，但不能打开三视图。模型病灶 mask 必须命名
+`<PatientID>_<StudyDate>_lesion.nii.gz`；GUI 编辑稿命名
+`<PatientID>_<StudyDate>_lesion_edited.nii.gz` 并优先显示。
+完整目录树、清单列名、文件匹配、自动分割前提和保存版本逻辑见
+[`GUI README §1.1–1.2`](scripts/gui/README.md#11-输入目录树与文件名)。
+本次软件运行逻辑、mask 保存测试和全项目代码复核见
+[`docs/CODE_REVIEW_2026-10-12.md`](docs/CODE_REVIEW_2026-10-12.md)。
+
+GUI 现支持任意数量的随访勾选和 `--manifest` 外部 PET 队列清单；每次 edited mask
+保留版本快照，原始/编辑 mask 差异和基线 CT warped 棋盘格可供审阅。GUI 特征提取要求
+mask 与映射质控通过，并按文件指纹发现过期结果。CLI 可用 `--require-qc` 执行相同质控门槛，
+`--per-lesion` 另输出逐编号病灶行。详见 GUI README。
+
+时间点不预写进清单：打开患者后在界面里指定 **Baseline / Interim / End**，其他随访可多选，写入
 
 `data/processed/<PatientID>/longitudinal_session.json`
 
@@ -661,8 +685,9 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 
 - 自动读取 `{ID}_{Date}_lesion.nii.gz`；若存在 `{ID}_{Date}_lesion_edited.nii.gz` 则**优先**用调整副本
 - 无 mask 时：右侧 **AutoPET 分割**、**SUV 阈值分割**、**空白手动分割**，或 **其他（载入已有 mask）**
-- SUV 阈值在内存中计算（默认 **41% SUVmax**），编辑窗内可改为固定 SUV 滑杆（0.5–15）；不走后台 CLI
-- 四种入口都会打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
+- AutoPET 先检查该次检查有工作 CT 与 PET；推理完成后回到**主界面**看本底 overlay。需要手改时用「其他（载入 mask）」或完成框「手动调整」
+- SUV 阈值打开编辑窗时**只显示图像**，不预填 41%；用户点选「41% SUVmax」或固定 SUV 后才算 mask（内存计算，不走后台 CLI）
+- **空白手动**与**载入 mask**打开 **分割编辑窗**：并排 **CT / PET / 融合**；点选 **轴位 / 冠状 / 矢状** 切换平面。任一格左涂右擦，三格 mask 同步
 - **保存并关闭** 写入 sidecar `{ID}_{Date}_lesion_edited.nii.gz`；取消不改主窗口
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5，当前层或三维、当前灶或全部。**当前层只改该切片**；三维在病灶边界盒内运算（避免整本体膨胀卡顿）
 - 连通域自动编号，列表显示体素 / 体积 / SUVmax；可按体积重新编号
@@ -670,11 +695,12 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **显示：**
 
 - 单选：仅 CT / 仅 PET / PET-CT 融合；PET 与 MIP 默认 **PET 热金** 伪彩色（下拉可选灰度 / Hot / Jet / Inferno），mask 仍为红/黄/青
+- **渲染** 下拉 CPU / GPU：GPU 用可选 CuPy 整本上传后切片合成，无 CUDA 时禁用并回退 CPU（`pip install cupy-cuda12x`，按本机 CUDA）
 - 主界面可点选 **查看基线 / 中期 / 末期**（需先在右侧指定角色）
 - CT 窗位 / 窗宽（默认 40 / 400）、PET SUV 上下限、融合透明度、50%–400% 缩放、**十字线**（刷新不带动画面跳动）
-- 冠状 MIP **等比例**显示，三列统一缩放，不横向拉扁
+- 冠状 MIP **等比例**显示，任意时间点横向滚动、统一缩放，不横向拉扁
 - 轴位、冠状与 MIP 左右标 **R / L**（画面左 = 患者右，放射科惯例）；矢状标 **P / A**（左后右前）。标记贴在视口边，缩放不跟着跑
-- 启动时按当前显示器可用区域缩放窗口（小屏最大化），右侧栏可滚动
+- 启动时按当前显示器可用区域缩放窗口（小屏最大化）；底部工具按功能分行，右侧栏保持可见并可纵向滚动。当前检查先显示，其他检查的 MIP 在后台预加载
 - **患者列表**：F2 或工具栏「患者」手动显隐；默认在选中一次检查后自动隐藏
 
 **跨检查映射（CT→CT 刚体+仿射，不用 SyN）：**
@@ -723,7 +749,7 @@ data/processed/<ID>/<FollowupDate>/longitudinal/
 │ 绿/黄/红灯  │ CT / PET / 融合 + 窗宽窗位    │ 画笔 / 形态学    │
 │            │ 编辑 mask：左涂右擦            │ 病灶编号表       │
 ├────────────┼──────────────────────────────┼─────────────────┤
-│            │ 最多三列冠状 MIP 演变条         │ 特征表 + 折线    │
+│            │ 多时间点冠状 MIP 演变条         │ 特征表 + 折线    │
 └────────────┴──────────────────────────────┴─────────────────┘
 ```
 

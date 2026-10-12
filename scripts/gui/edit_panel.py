@@ -27,6 +27,8 @@ class EditPanel(QWidget):
     relabel_requested = Signal()
     undo_requested = Signal()
     save_requested = Signal()
+    review_requested = Signal()
+    link_requested = Signal()
     lesion_selected = Signal(int)
 
     def __init__(self, parent=None) -> None:
@@ -46,7 +48,10 @@ class EditPanel(QWidget):
         seg_l.addWidget(self.btn_threshold)
         seg_l.addWidget(self.btn_manual)
         seg_l.addWidget(self.btn_other)
-        self.lbl_seg = QLabel("四种入口打开编辑窗。SUV 阈值：41% SUVmax 或滑杆固定值，可在窗内再调。")
+        self.lbl_seg = QLabel(
+            "AutoPET：校验 CT+PET 后在主界面展示。SUV 阈值：先开图像再选手动阈值。"
+            "空白手动 / 载入 mask 打开编辑窗。"
+        )
         self.lbl_seg.setWordWrap(True)
         seg_l.addWidget(self.lbl_seg)
         seg_box.setLayout(seg_l)
@@ -86,13 +91,19 @@ class EditPanel(QWidget):
         self.btn_undo = QPushButton("撤销")
         self.btn_relabel = QPushButton("按体积重新编号")
         self.btn_save = QPushButton("保存调整后的 mask")
+        self.btn_review = QPushButton("核对原始/编辑 mask 并记录质控")
+        self.btn_link = QPushButton("记录当前病灶的纵向对应")
         self.btn_undo.clicked.connect(self.undo_requested.emit)
         self.btn_relabel.clicked.connect(self.relabel_requested.emit)
         self.btn_save.clicked.connect(self.save_requested.emit)
+        self.btn_review.clicked.connect(self.review_requested.emit)
+        self.btn_link.clicked.connect(self.link_requested.emit)
         act.addWidget(self.btn_undo)
         act.addWidget(self.btn_relabel)
         morph_l.addLayout(act)
         morph_l.addWidget(self.btn_save)
+        morph_l.addWidget(self.btn_review)
+        morph_l.addWidget(self.btn_link)
         morph_box.setLayout(morph_l)
 
         list_box = QGroupBox("病灶编号")
@@ -123,6 +134,8 @@ class EditPanel(QWidget):
             self.btn_open,
             self.btn_close,
             self.btn_save,
+            self.btn_review,
+            self.btn_link,
         ):
             b.setEnabled(not busy)
 

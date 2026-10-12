@@ -17,20 +17,38 @@ def threshold_pet_mask(
     *,
     mode: str = "absolute",
     value: float = 2.5,
+    roi_center: tuple[int, int, int] | None = None,
+    roi_radius_mm: float = 30.0,
+    affine: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     SUV 阈值 → 编号 mask。
     absolute: pet >= value；relative: pet >= value * nanmax(pet)（41% 时 value=0.41）。
     """
     data = np.asarray(pet, dtype=np.float32)
+    roi = None
+    if roi_center is not None:
+        spacing = np.linalg.norm(np.asarray(affine)[:3, :3], axis=0) if affine is not None else np.ones(3)
+        radii = np.maximum(1, np.ceil(float(roi_radius_mm) / spacing).astype(int))
+        starts = [max(0, int(c) - int(r)) for c, r in zip(roi_center, radii)]
+        stops = [min(data.shape[a], int(roi_center[a]) + int(radii[a]) + 1) for a in range(3)]
+        blocks = np.ogrid[tuple(slice(starts[a], stops[a]) for a in range(3))]
+        distance = sum(((blocks[a] - roi_center[a]) * spacing[a]) ** 2 for a in range(3))
+        roi = np.zeros(data.shape, dtype=bool)
+        roi[tuple(slice(starts[a], stops[a]) for a in range(3))] = distance <= roi_radius_mm ** 2
     if mode == "relative":
-        peak = float(np.nanmax(data)) if data.size else 0.0
+        selection = data[roi] if roi is not None else data
+        peak = float(np.nanmax(selection)) if selection.size else 0.0
+        if not np.isfinite(peak) or peak <= 0:
+            return np.zeros(data.shape, dtype=np.uint16)
         thr = float(value) * peak
     elif mode == "absolute":
         thr = float(value)
     else:
         raise ValueError(f"未知阈值模式: {mode!r}")
     binary = np.isfinite(data) & (data >= thr)
+    if roi is not None:
+        binary &= roi
     return ensure_labeled(binary.astype(np.uint16))
 
 
@@ -42,7 +60,9 @@ def ensure_labeled(mask: np.ndarray) -> np.ndarray:
     uniq = np.unique(arr[arr > 0])
     if uniq.size == 0:
         return np.zeros(arr.shape, dtype=np.uint16)
-    if uniq.size == 1 and int(uniq[0]) == 1:
+    # 0/1 and 0/255 are common binary exports; other values may be stable
+    # lesion IDs and must retain their identity across edits.
+    if uniq.size == 1 and int(uniq[0]) in (1, 255):
         labeled, _ = ndimage.label(arr > 0)
         return labeled.astype(np.uint16)
     return arr.astype(np.uint16)
@@ -91,21 +111,31 @@ def lesion_stats(
     pet: Optional[np.ndarray],
     voxel_ml: float,
 ) -> list[dict]:
+    """Count labels once, then reduce PET values only inside positive voxels."""
     labeled = np.asarray(mask, dtype=np.uint16)
-    ids = [int(v) for v in np.unique(labeled) if v > 0]
+    flat = labeled.ravel()
+    counts = np.bincount(flat)
+    ids = np.flatnonzero(counts[1:]) + 1
+    suv_vals: Optional[np.ndarray] = None
+    if pet is not None and ids.size:
+        positive = np.flatnonzero(flat)
+        labels = flat[positive]
+        values = np.asarray(pet, dtype=np.float32).ravel()[positive]
+        finite = np.isfinite(values)
+        maxima = np.full(len(counts), -np.inf, dtype=np.float32)
+        np.maximum.at(maxima, labels[finite], values[finite])
+        suv_vals = maxima[ids]
     rows: list[dict] = []
-    for lid in ids:
-        sel = labeled == lid
-        n = int(sel.sum())
-        suv_max = ""
-        if pet is not None and n:
-            vals = pet[sel]
-            vals = vals[np.isfinite(vals)]
-            if vals.size:
-                suv_max = round(float(np.max(vals)), 3)
+    for i, lid in enumerate(ids):
+        n = int(counts[lid])
+        suv_max: float | str = ""
+        if suv_vals is not None:
+            peak = float(suv_vals[i])
+            if np.isfinite(peak):
+                suv_max = round(peak, 3)
         rows.append(
             {
-                "id": lid,
+                "id": int(lid),
                 "n_voxels": n,
                 "volume_ml": round(n * voxel_ml, 3),
                 "suv_max": suv_max,

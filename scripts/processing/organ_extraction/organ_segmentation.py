@@ -7,7 +7,7 @@
 
 @description
     对 data/interim/<PatientID>/<StudyDate>/CT/ 中的原始 CT NIfTI 调用
-    TotalSegmentator 进行器官分割，将结果重标为本研究统一的 9 类器官标签，
+    TotalSegmentator 进行器官分割，将结果重标为本研究统一的 10 类器官标签，
     写入 data/processed/<PatientID>/<StudyDate>/organs/organs.nii.gz。
 
     产出的器官掩码有两个用途：
@@ -15,7 +15,7 @@
            区域等）；
         2. 作为 autoPET3 双头模型微调时 organ head 的监督信号，通过
            combine_lesion_and_organs.py 注入 nnUNet 预处理目录（类别数与
-           autoPET3 预训练权重完全对齐，共 10 类 0–9）。
+           autoPET3 预训练权重的类别关系需单独核对；本脚本输出 0–10 共 11 类）。
 
 @输入 (Input)
     data/interim/<PatientID>/<StudyDate>/CT/*.nii.gz
@@ -25,7 +25,7 @@
 
 @输出 (Output)
     data/processed/<PatientID>/<StudyDate>/organs/organs.nii.gz
-        10 类整数标签（uint8），与输入 CT 空间完全一致（affine/尺寸不变）；
+        11 个整数标签（0–10，uint8），与输入 CT 空间完全一致（affine/尺寸不变）；
         类别编号与 autoPET3 预训练 organ head 完全对齐：
             0  背景（Background）
             1  脾脏（Spleen）
@@ -64,8 +64,8 @@
         8             Submandibular R    10
         9             Submandibular L    10
 
-    类别编号与 autoPET3 原始 lbl_mapping_all / lbl_mapping_head 完全对齐，
-    保证微调时器官头权重可直接复用。
+    映射表按 autoPET3 的 lbl_mapping_all / lbl_mapping_head 编写；
+    微调前仍须与实际模型权重和数据集标签定义逐项核对。
 
 @前提条件
     1. TotalSegmentator 已安装（pip install TotalSegmentator 在 autopet env）：
@@ -239,7 +239,8 @@ class OrganSegmentor:
         if not ct_dir.is_dir():
             return None
         candidates = sorted(ct_dir.glob("*.nii.gz"))
-        return candidates[0] if candidates else None
+        preferred = [path for path in candidates if "WB_Standard" in path.name]
+        return preferred[0] if preferred else (candidates[0] if candidates else None)
 
     def _run_totalseg(self, input_nii: Path, output_path: Path, task: Optional[str] = None) -> None:
         """

@@ -58,11 +58,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DLBCL 纵向 PET/CT 分析软件")
     parser.add_argument("--interim-root", type=Path, default=DEFAULT_INTERIM)
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED)
+    parser.add_argument("--manifest", type=Path, default=None,
+                        help="通用队列 CSV：patient_id,study_date,ct_path,pet_path,pet_units,lesion_mask_path")
     args = parser.parse_args(argv)
 
     app = QApplication(sys.argv)
     app.setApplicationName("DLBCL Longitudinal")
-    win = MainWindow(args.interim_root, args.processed_root)
+    win = MainWindow(args.interim_root, args.processed_root, manifest_path=args.manifest)
     win.show()
     return app.exec()
 

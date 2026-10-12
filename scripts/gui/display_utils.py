@@ -117,20 +117,26 @@ def apply_pet_cmap(
         return apply_pet_gray(values, vmin, vmax)
     lut = PET_CMAPS[name]
     denom = max(vmax - vmin, 1e-6)
-    idx = np.clip((np.asarray(values, dtype=np.float32) - vmin) / denom, 0.0, 1.0)
+    safe = np.nan_to_num(np.asarray(values, dtype=np.float32),
+                         nan=vmin, posinf=vmax, neginf=vmin)
+    idx = np.clip((safe - vmin) / denom, 0.0, 1.0)
     return lut[(idx * (len(lut) - 1)).astype(np.int32)]
 
 
 def apply_pet_gray(values: np.ndarray, vmin: float = 0.0, vmax: float = 6.0) -> np.ndarray:
     """按 SUV 窗归一化后复制到 RGB 三通道，供 GUI 显示。"""
     denom = max(vmax - vmin, 1e-6)
-    n = np.clip((np.asarray(values, dtype=np.float32) - vmin) / denom, 0.0, 1.0)
+    safe = np.nan_to_num(np.asarray(values, dtype=np.float32),
+                         nan=vmin, posinf=vmax, neginf=vmin)
+    n = np.clip((safe - vmin) / denom, 0.0, 1.0)
     return np.stack([n, n, n], axis=-1)
 
 
 def normalize_ct(ct: np.ndarray, window: tuple[float, float] = CT_WINDOW) -> np.ndarray:
     lo, hi = window
-    return np.clip((ct - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
+    safe = np.nan_to_num(np.asarray(ct, dtype=np.float32),
+                         nan=lo, posinf=hi, neginf=lo)
+    return np.clip((safe - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(np.float32)
 
 
 def orient_axial(sl: np.ndarray) -> np.ndarray:
@@ -161,7 +167,8 @@ def slice_sagittal(vol: np.ndarray, i: int) -> np.ndarray:
 
 
 def coronal_mip(vol: np.ndarray) -> np.ndarray:
-    return orient_coronal(np.max(vol, axis=1))
+    safe = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
+    return orient_coronal(np.max(safe, axis=1))
 
 
 def display_to_voxel(
