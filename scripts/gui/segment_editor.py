@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -70,6 +71,7 @@ class SegmentEditorDialog(QDialog):
         pet_cmap: str = DEFAULT_PET_CMAP,
         render_device: str = "cpu",
         reference_mask: np.ndarray | None = None,
+        require_change: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"分割编辑  {vol.patient_id}  {vol.study_date}")
@@ -83,7 +85,9 @@ class SegmentEditorDialog(QDialog):
             patient_id=vol.patient_id,
             affine=vol.affine,
             role=vol.role,
+            pet_units=vol.pet_units,
         )
+        self._require_change = require_change
         self._reference = np.array(reference_mask if reference_mask is not None else vol.native,
                                    copy=True, dtype=np.uint16)
         nx, ny, nz = vol.ct.shape
@@ -199,7 +203,7 @@ class SegmentEditorDialog(QDialog):
         ctrl.addWidget(self.spin_wl)
         ctrl.addWidget(QLabel("窗宽"))
         ctrl.addWidget(self.spin_ww)
-        ctrl.addWidget(QLabel("SUV"))
+        ctrl.addWidget(QLabel("SUV" if vol.pet_units == "SUVbw" else f"PET ({vol.pet_units})"))
         ctrl.addWidget(self.spin_suv_min)
         ctrl.addWidget(self.spin_suv_max)
         ctrl.addWidget(QLabel("融合"))
@@ -226,6 +230,9 @@ class SegmentEditorDialog(QDialog):
         self._thr_group.addButton(self.radio_thr_rel)
         self._thr_group.addButton(self.radio_thr_abs)
         self.radio_thr_none.setChecked(True)
+        if vol.pet_units != "SUVbw":
+            self.radio_thr_rel.setEnabled(False)
+            self.radio_thr_abs.setEnabled(False)
         self.slider_thr = QSlider(Qt.Orientation.Horizontal)
         self.slider_thr.setRange(5, 150)
         self.slider_thr.setValue(25)
@@ -292,7 +299,7 @@ class SegmentEditorDialog(QDialog):
         )
         buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存并关闭")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._accept_edit)
         buttons.rejected.connect(self.reject)
 
         hint = QLabel(
@@ -334,6 +341,12 @@ class SegmentEditorDialog(QDialog):
 
     def edited_mask(self) -> np.ndarray:
         return self._vol.native
+
+    def _accept_edit(self) -> None:
+        if self._require_change and not self._vol.dirty:
+            QMessageBox.warning(self, "尚未生成 mask", "请先选择 SUV 阈值模式或进行手动编辑。")
+            return
+        self.accept()
 
     def _pet_cmap(self) -> str:
         data = self.combo_cmap.currentData()
@@ -399,6 +412,9 @@ class SegmentEditorDialog(QDialog):
         self._apply_threshold()
 
     def _apply_threshold(self) -> None:
+        if self._vol.pet_units != "SUVbw":
+            QMessageBox.warning(self, "SUV 阈值", "当前 PET 单位不是 SUVbw，不能使用 SUV 阈值分割。")
+            return
         if not self.radio_thr_rel.isChecked() and not self.radio_thr_abs.isChecked():
             return
         if self.radio_thr_abs.isChecked() and self.slider_thr.isSliderDown():
@@ -659,7 +675,7 @@ class SegmentEditorDialog(QDialog):
         extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
             f"{_PLANE_LABEL[plane]}  ijk=({self._i},{self._j},{self._k})  "
-            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
+            f"HU={hu:.0f}  {('SUV' if vol.pet_units == 'SUVbw' else 'PET (' + vol.pet_units + ')')}={suv:.2f}{extra}"
         )
         if update_table:
             self._refresh_table()

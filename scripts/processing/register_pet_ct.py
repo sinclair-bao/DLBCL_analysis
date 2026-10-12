@@ -304,7 +304,7 @@ class PetCtRegistrar:
         pet_iso_out = out_dir / "pet_iso_aligned.nii.gz"
         ct_iso_out = out_dir / "ct_iso_reference.nii.gz"
 
-        if pet_iso_out.exists() and mat.exists() and not self.overwrite:
+        if all(path.exists() for path in (pet_iso_out, mat, ct_iso_out)) and not self.overwrite:
             return StageResult(
                 STAGE_NAME, patient_id, study_date, "skipped", str(out_dir),
                 "配准产物已存在，使用 --overwrite 可强制重跑。",

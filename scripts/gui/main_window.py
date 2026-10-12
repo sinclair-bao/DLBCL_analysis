@@ -446,9 +446,17 @@ class MainWindow(QMainWindow):
         self.current_patient = patient_id
         self.current_date = study_date
         session = self._session() or load_session(self.catalog.processed_root, patient_id)
-        vol = self._load_vol(patient_id, study_date, session.baseline)
+        try:
+            vol = self._load_vol(patient_id, study_date, session.baseline)
+        except Exception as exc:  # image/header errors must not terminate the Qt event loop
+            self.ortho.set_volumes(None)
+            self.edit_panel.set_lesions([])
+            self.status.showMessage(f"{patient_id}/{study_date} 载入失败：{exc}")
+            QMessageBox.warning(self, "无法载入检查", f"{patient_id}/{study_date}\n{exc}")
+            return
         if vol is None:
             self.ortho.set_volumes(None)
+            self.edit_panel.set_lesions([])
             self.status.showMessage(f"{patient_id}/{study_date} 缺少工作 CT 或 PET")
             return
         role = session.role_of(study_date)
@@ -854,10 +862,13 @@ class MainWindow(QMainWindow):
             self._load_other_mask()
             return
         if method == "threshold":
+            if vol.pet_units != "SUVbw":
+                QMessageBox.warning(self, "SUV 阈值", "当前 PET 单位不是 SUVbw，不能使用 SUV 阈值分割。")
+                return
             import numpy as np
 
             start = np.zeros(vol.ct.shape, dtype=np.uint16)
-            self._open_segment_editor(start)
+            self._open_segment_editor(start, require_change=True)
             return
         if self.catalog.manifest_path is not None:
             QMessageBox.information(self, "自动分割", "通用清单模式未配置自动分割适配器；请导入已有 mask 或手动编辑。")
@@ -867,17 +878,25 @@ class MainWindow(QMainWindow):
         if assets is None:
             missing.append("检查目录")
         else:
-            if assets.working_ct is None:
-                missing.append("CT")
-            if assets.working_pet is None:
-                missing.append("PET")
+            if assets.ct_iso is None:
+                missing.append("preprocessed/CT")
+            if assets.pet_iso is None:
+                missing.append("preprocessed/PET")
         if missing:
             QMessageBox.warning(
                 self,
                 "AutoPET",
-                "AutoPET 需要成对的 CT 与 PET，当前缺少：\n" + "\n".join(missing),
+                "AutoPET 导出需要成对的预处理 CT 与 PET，当前缺少：\n" + "\n".join(missing),
             )
             return
+        if assets.lesion_auto is not None or assets.lesion_edited is not None:
+            answer = QMessageBox.question(
+                self, "重跑 AutoPET",
+                "将覆盖当前 AutoPET 模型原稿；人工编辑稿会保留并继续优先显示。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self._set_work_busy(True)
         self._show_progress("AutoPET", "正在准备 AutoPET…")
         self._seg_worker = SegmentWorker(
@@ -907,7 +926,7 @@ class MainWindow(QMainWindow):
             return
         self._open_segment_editor(mask)
 
-    def _open_segment_editor(self, mask=None) -> None:
+    def _open_segment_editor(self, mask=None, *, require_change: bool = False) -> None:
         from dataclasses import replace
 
         import numpy as np
@@ -920,18 +939,27 @@ class MainWindow(QMainWindow):
         native = np.asarray(mask if mask is not None else vol.native, dtype=np.uint16).copy()
         work = replace(vol, native=native, dirty=False, _undo=[])
         assets = self.catalog.get_study(vol.patient_id, vol.study_date)
-        original = (load_mask_from_path(assets.lesion_auto, vol)
-                    if assets is not None and assets.lesion_auto is not None else native.copy())
+        try:
+            original = (load_mask_from_path(assets.lesion_auto, vol)
+                        if assets is not None and assets.lesion_auto is not None else native.copy())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法打开编辑窗", f"模型原稿 mask 无效：\n{exc}")
+            return
         dlg = SegmentEditorDialog(
             work,
             self,
             pet_cmap=self.ortho.pet_cmap(),
             render_device=self.ortho.render_device(),
             reference_mask=original,
+            require_change=require_change,
         )
         if dlg.exec() != SegmentEditorDialog.DialogCode.Accepted:
             return
-        vol.native = np.array(dlg.edited_mask(), copy=True, dtype=np.uint16)
+        edited = np.array(dlg.edited_mask(), copy=True, dtype=np.uint16)
+        if assets is not None and assets.working_lesion is not None and np.array_equal(edited, vol.native):
+            self.status.showMessage("mask 未变化，未生成新版本")
+            return
+        vol.native = edited
         vol.dirty = True
         self.ortho.mark_masks_dirty()
         self.ortho.refresh()
@@ -1025,8 +1053,12 @@ class MainWindow(QMainWindow):
             self._on_study(self.current_patient, self.current_date)
             QMessageBox.information(self, "mask 质控", "磁盘 mask 已变化，界面已重新载入；请重新检查后质控。")
             return
-        original = (load_mask_from_path(assets.lesion_auto, vol)
-                    if assets.lesion_auto is not None else vol.native.copy())
+        try:
+            original = (load_mask_from_path(assets.lesion_auto, vol)
+                        if assets.lesion_auto is not None else vol.native.copy())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "mask 质控", f"模型原稿 mask 无效：\n{exc}")
+            return
         dlg = QualityReviewDialog(ct=vol.ct, pet=vol.pet, original_mask=original,
                                   edited_mask=vol.native, parent=self)
         if dlg.exec() == dlg.DialogCode.Accepted and dlg.verdict:

@@ -318,6 +318,7 @@ class OrthoViewer(QWidget):
         self.combo_render.currentIndexChanged.connect(self._on_render_device)
 
         self.lbl_pos = QLabel("—")
+        self.lbl_pet_unit = QLabel("SUV")
         self.lbl_pos.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         for spin in (
             self.spin_alpha,
@@ -362,7 +363,7 @@ class OrthoViewer(QWidget):
         window_row = QHBoxLayout()
         for control in (
             QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
-            QLabel("SUV"),
+            self.lbl_pet_unit,
             self.spin_suv_min,
             self.spin_suv_max,
         ):
@@ -449,6 +450,9 @@ class OrthoViewer(QWidget):
 
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
+        self.lbl_pet_unit.setText(
+            "SUV" if vol is None or vol.pet_units == "SUVbw" else f"PET ({vol.pet_units})"
+        )
         self._gpu_failed = False
         self._masks_dirty = True
         self._shown_ijk = None
@@ -641,7 +645,7 @@ class OrthoViewer(QWidget):
         extra = f"  灶#{lid}" if lid else ""
         self.lbl_pos.setText(
             f"{vol.study_date}  ijk=({self._i},{self._j},{self._k})  "
-            f"HU={hu:.0f}  SUV={suv:.2f}{extra}"
+            f"HU={hu:.0f}  {('SUV' if vol.pet_units == 'SUVbw' else 'PET (' + vol.pet_units + ')')}={suv:.2f}{extra}"
         )
         self._shown_ijk = (self._i, self._j, self._k)
         self._update_crosshairs()

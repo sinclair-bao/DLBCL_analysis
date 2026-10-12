@@ -125,7 +125,9 @@ def _suv_peak(pet: np.ndarray, affine: np.ndarray, mask: np.ndarray) -> float:
     """以 SUVmax 体素为球心、1 cm³ 球内均值（近似 SUVpeak）。"""
     if not np.any(mask):
         return float("nan")
-    masked = np.where(mask, pet, -np.inf)
+    masked = np.where(mask & np.isfinite(pet), pet, -np.inf)
+    if not np.isfinite(masked).any():
+        return float("nan")
     max_idx = np.unravel_index(int(np.argmax(masked)), pet.shape)
     zooms = np.array(nib.affines.voxel_sizes(affine)[:3], dtype=np.float64)
     radius = SUV_PEAK_RADIUS_MM

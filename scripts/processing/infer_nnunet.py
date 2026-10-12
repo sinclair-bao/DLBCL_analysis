@@ -52,7 +52,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -140,22 +139,16 @@ def _run_nnunet_predict(
     if not NNUNET_CLI.exists():
         return False, f"CLI 不存在: {NNUNET_CLI}"
 
-    fold_args = " ".join(str(f) for f in folds)
-    cmd = (
-        f"{NNUNET_CLI} "
-        f"-i {input_folder} "
-        f"-o {output_folder} "
-        f"-m {model_folder} "
-        f"-f {fold_args} "
-        f"-device {device} "
-        f"-npp {num_proc} "
-        f"-nps {num_proc} "
-        f"--disable_progress_bar"
-    )
+    cmd = [
+        str(NNUNET_CLI), "-i", str(input_folder), "-o", str(output_folder),
+        "-m", str(model_folder), "-f", *(str(f) for f in folds),
+        "-device", device, "-npp", str(num_proc), "-nps", str(num_proc),
+        "--disable_progress_bar",
+    ]
     logger.debug("运行: %s", cmd)
     try:
         result = subprocess.run(
-            shlex.split(cmd),
+            cmd,
             capture_output=True,
             text=True,
             check=False,
@@ -178,7 +171,10 @@ def extract_lesion_mask(seg_path: Path, lesion_path: Path, label_id: int = 1) ->
     写成 uint8 二值 NIfTI，与 segmentation.py 产出格式一致。
     """
     seg = nib.load(str(seg_path))
-    data = np.asarray(seg.dataobj, dtype=np.uint8)
+    data = np.asanyarray(seg.dataobj)
+    if (not np.isfinite(data).all() or np.any(data < 0)
+            or np.any(data != np.floor(data))):
+        raise ValueError(f"nnU-Net 输出包含无效标签: {seg_path}")
     lesion = (data == label_id).astype(np.uint8)
     out_img = nib.Nifti1Image(lesion, seg.affine, seg.header)
     out_img.header.set_data_dtype(np.uint8)
@@ -233,9 +229,12 @@ class NnuNetInferrer:
                 str(lesion_mask), "病灶掩码已存在，overwrite=True 可强制重跑。",
             )
 
-        # nnU-Net 需要单独的输入目录（一次只处理一个 case）
-        with tempfile.TemporaryDirectory(prefix=f"nnunet_in_{case_id}_") as tmp_in:
+        # 每次推理使用独立输出目录，避免上次失败残留被当作新结果。
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        with (tempfile.TemporaryDirectory(prefix=f"nnunet_in_{case_id}_") as tmp_in,
+              tempfile.TemporaryDirectory(prefix="_nnunet_raw_", dir=mask_dir) as tmp_out_name):
             tmp_in_path = Path(tmp_in)
+            tmp_out = Path(tmp_out_name)
             # 软链接避免复制大文件
             try:
                 (tmp_in_path / ct_path.name).symlink_to(ct_path)
@@ -245,48 +244,35 @@ class NnuNetInferrer:
                 shutil.copy2(ct_path, tmp_in_path / ct_path.name)
                 shutil.copy2(pet_path, tmp_in_path / pet_path.name)
 
-            tmp_out = mask_dir / "_nnunet_raw_out"
-            tmp_out.mkdir(parents=True, exist_ok=True)
-
             ok, msg = _run_nnunet_predict(
                 tmp_in_path, tmp_out, self.model_folder,
                 self.folds, self.device, self.num_proc,
             )
 
-        if not ok:
-            return StageResult(STAGE_NAME, patient_id, study_date, "error", str(mask_dir), msg)
+            if not ok:
+                return StageResult(STAGE_NAME, patient_id, study_date, "error", str(mask_dir), msg)
 
-        # 将原始输出（case_id.nii.gz）移到 mask_dir，再提取病灶通道
-        raw_out_file = tmp_out / f"{case_id}.nii.gz"
-        if not raw_out_file.exists():
-            # 尝试找 nnU-Net 实际输出的名称（不带通道后缀）
-            candidates = list(tmp_out.glob("*.nii.gz"))
-            if not candidates:
+            raw_out_file = tmp_out / f"{case_id}.nii.gz"
+            if not raw_out_file.exists():
+                candidates = list(tmp_out.glob("*.nii.gz"))
+                if len(candidates) != 1:
+                    return StageResult(
+                        STAGE_NAME, patient_id, study_date, "error", str(mask_dir),
+                        f"nnU-Net 输出数量异常 ({len(candidates)}): {tmp_out}",
+                    )
+                raw_out_file = candidates[0]
+            # 先在临时目录完成提取和校验；失败时保留原有模型原稿。
+            temp_lesion = tmp_out / f"{case_id}_lesion.nii.gz"
+            try:
+                extract_lesion_mask(raw_out_file, temp_lesion)
+                voxels = int(np.count_nonzero(np.asanyarray(nib.load(str(temp_lesion)).dataobj)))
+                raw_out_file.replace(raw_seg)
+                temp_lesion.replace(lesion_mask)
+            except Exception as exc:  # noqa: BLE001
                 return StageResult(
-                    STAGE_NAME, patient_id, study_date, "error", str(mask_dir),
-                    f"nnU-Net 输出目录为空: {tmp_out}",
+                    STAGE_NAME, patient_id, study_date, "error", str(lesion_mask),
+                    f"病灶掩码提取或写入失败: {exc}",
                 )
-            raw_out_file = candidates[0]
-
-        raw_seg.parent.mkdir(parents=True, exist_ok=True)
-        import shutil
-        shutil.move(str(raw_out_file), str(raw_seg))
-
-        # 清理临时输出目录
-        try:
-            shutil.rmtree(tmp_out)
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 提取病灶通道
-        try:
-            extract_lesion_mask(raw_seg, lesion_mask)
-            voxels = int(np.sum(nib.load(str(lesion_mask)).get_fdata() > 0))
-        except Exception as exc:  # noqa: BLE001
-            return StageResult(
-                STAGE_NAME, patient_id, study_date, "error", str(lesion_mask),
-                f"病灶掩码提取失败: {exc}",
-            )
 
         return StageResult(
             STAGE_NAME, patient_id, study_date, "ok",

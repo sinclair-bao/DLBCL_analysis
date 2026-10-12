@@ -60,7 +60,9 @@ def ensure_labeled(mask: np.ndarray) -> np.ndarray:
     uniq = np.unique(arr[arr > 0])
     if uniq.size == 0:
         return np.zeros(arr.shape, dtype=np.uint16)
-    if uniq.size == 1 and int(uniq[0]) == 1:
+    # 0/1 and 0/255 are common binary exports; other values may be stable
+    # lesion IDs and must retain their identity across edits.
+    if uniq.size == 1 and int(uniq[0]) in (1, 255):
         labeled, _ = ndimage.label(arr > 0)
         return labeled.astype(np.uint16)
     return arr.astype(np.uint16)

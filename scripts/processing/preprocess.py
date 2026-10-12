@@ -101,7 +101,8 @@ class ImagePreprocessor:
             if suv_files:
                 return suv_files
             return sorted(modality_dir.glob("*_ACT.nii.gz"))
-        return sorted(modality_dir.glob("*.nii.gz"))
+        ct_files = sorted(modality_dir.glob("*.nii.gz"))
+        return sorted(ct_files, key=lambda path: ("WB_Standard" not in path.name, path.name))
 
     def _resample_isotropic(self, src: Path, dst: Path, order: int) -> nib.Nifti1Image:
         img = nib.load(str(src))

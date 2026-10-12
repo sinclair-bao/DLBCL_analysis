@@ -94,10 +94,8 @@ def _load_pet_mask(
         / f"{patient_id}_{study_date}_lesion.nii.gz"
     )
 
-    # 找 PET（优先 SUVbw）
+    # QC 颜色范围按 SUVbw 定义，不能回退到活度浓度图。
     pet_files = sorted(pet_dir.glob("*_SUVbw.nii.gz")) if pet_dir.is_dir() else []
-    if not pet_files:
-        pet_files = sorted(pet_dir.glob("*.nii.gz")) if pet_dir.is_dir() else []
     if not pet_files:
         logger.warning("未找到预处理 PET：%s/%s", patient_id, study_date)
         return None, None
@@ -109,11 +107,13 @@ def _load_pet_mask(
     mask_img = nib.load(str(mask_path))
 
     pet_data = np.asarray(pet_img.dataobj, dtype=np.float32)
-    mask_data = np.asarray(mask_img.dataobj, dtype=np.uint8)
+    mask_data = np.asanyarray(mask_img.dataobj) > 0
 
-    if pet_data.shape != mask_data.shape:
+    if pet_data.shape != mask_data.shape or not np.allclose(
+        pet_img.affine, mask_img.affine, atol=1e-4
+    ):
         logger.warning(
-            "%s/%s shape 不一致：PET=%s mask=%s，跳过。",
+            "%s/%s PET 与 mask 几何不一致：PET=%s mask=%s，跳过。",
             patient_id, study_date, pet_data.shape, mask_data.shape,
         )
         return None, None

@@ -130,6 +130,8 @@ DLBCL/
 │   │       │   └── organs.nii.gz   # 11 类器官标签
 │   │       ├── masks/               # 病灶分割掩码
 │   │       │   ├── {case}_lesion.nii.gz     # nnU-Net 二值病灶掩码
+│   │       │   ├── {case}_lesion_edited.nii.gz # GUI 人工编辑稿（优先读取）
+│   │       │   ├── versions/                # 编辑版本和覆盖前备份
 │   │       │   ├── {case}.nii.gz            # nnU-Net 原始输出
 │   │       │   └── {PET原名}_mask.nii.gz    # SUV 阈值基线掩码（可选）
 │   │       └── longitudinal/        # 跨检查 CT–CT 映射（随访目录）
@@ -361,6 +363,8 @@ data/interim/<PatientID>/<StudyDate>/
 - 依赖 `dcm2niix`（FSL 自带：`/home/sun/fsl/bin/dcm2niix`）
 - DICOM 目录须符合 PACS 三级结构 `Patient/Study/Series/Image`；IM 文件无扩展名但为标准 DICOM Part 10
 - SUV 换算需要 DICOM 头包含完整的注射剂量/体重/扫描时间信息；前提不满足时仅输出 `_ACT.nii.gz` 并记录 warning
+- 若同一 PET Series 被 `dcm2niix` 拆成多个 NIfTI，转换会报错并停止该 Series，避免只取第一份而丢失床位或帧；须先确认完整覆盖并按扫描协议重建。
+- 当前 SUVbw 使用一个 Series 级采集时刻计算缩放因子；多床位、跨时段数据须与设备导出 SUV 图逐例核对，未经验证不能把该值用于定量终点。
 - 默认源目录 `data/raw/DICOM*`（glob 展开），可通过 `--source` 指定多个路径
 
 ```bash
@@ -650,6 +654,21 @@ conda run -n data-analysis python scripts/visualization/qc_segmentation.py \
 **GUI：** `scripts/gui/app.py`（PySide6 + pyqtgraph）  
 **环境：** `data-analysis`（不进入 `main.py --stage all`，时间点需人工指定）  
 **使用说明：** 脚本职责、操作步骤与后续 Todo 见 [`scripts/gui/README.md`](scripts/gui/README.md)。
+
+**界面选择数据源：** 「文件 → 打开数据目录」可选 `data/`、`data/interim/` 或
+`data/interim/<PatientID>/`；「文件 → 导入清单」可选任意队列的 CSV。目录模式
+按 `interim/<PatientID>/<StudyDate>/` 建立患者列表，`processed/` 中同名层级提供
+配准图和 mask。工作 CT 优先 `processed/.../registration/ct_iso_reference.nii.gz`，
+否则 `interim/.../preprocessed/CT/*.nii.gz`；工作 PET 优先
+`processed/.../registration/pet_iso_aligned.nii.gz`，否则
+`interim/.../preprocessed/PET/*_SUVbw.nii.gz`。仅有原始 `CT/`、`PET/` 时
+仍能看到检查，但不能打开三视图。模型病灶 mask 必须命名
+`<PatientID>_<StudyDate>_lesion.nii.gz`；GUI 编辑稿命名
+`<PatientID>_<StudyDate>_lesion_edited.nii.gz` 并优先显示。
+完整目录树、清单列名、文件匹配、自动分割前提和保存版本逻辑见
+[`GUI README §1.1–1.2`](scripts/gui/README.md#11-输入目录树与文件名)。
+本次软件运行逻辑、mask 保存测试和全项目代码复核见
+[`docs/CODE_REVIEW_2026-10-12.md`](docs/CODE_REVIEW_2026-10-12.md)。
 
 GUI 现支持任意数量的随访勾选和 `--manifest` 外部 PET 队列清单；每次 edited mask
 保留版本快照，原始/编辑 mask 差异和基线 CT warped 棋盘格可供审阅。GUI 特征提取要求

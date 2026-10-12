@@ -45,6 +45,73 @@ python scripts/gui/app.py --manifest /path/to/studies.csv \
 
 缺 CT/PET 的检查无法打开三视图。缺病灶 mask 仍可浏览影像，再用右侧四种分割入口补上。
 
+### 1.1 输入目录树与文件名
+
+目录模式以 `interim/` 为扫描根：其下**一级目录是患者 ID，二级目录是一次检查 ID**。
+本研究约定患者 ID 为 8 位编号、检查 ID 为 `YYYYMMDD`；目录扫描本身不校验日期格式。
+选择 `data/`、`interim/` 或 `interim/<患者ID>/` 均可；直接选择患者目录只显示该患者。
+`processed/` 由软件按相同的患者和检查 ID 查找，不能只选择 `processed/` 来建立患者列表。
+
+```text
+data/
+├── interim/
+│   └── <PatientID>/
+│       └── <StudyDate>/
+│           ├── CT/*.nii.gz                         # 原始 CT；优先含 WB_Standard 的文件
+│           ├── PET/*_SUVbw.nii.gz                 # 原始 SUVbw PET；*_ACT.nii.gz 不用于显示
+│           └── preprocessed/
+│               ├── CT/*.nii.gz                     # 工作 CT；优先含 WB_Standard 的文件
+│               └── PET/*_SUVbw.nii.gz             # 工作 PET
+└── processed/
+    └── <PatientID>/
+        └── <StudyDate>/
+            ├── registration/
+            │   ├── ct_iso_reference.nii.gz         # 优先于 preprocessed/CT
+            │   └── pet_iso_aligned.nii.gz          # 优先于 preprocessed/PET
+            ├── masks/
+            │   ├── <PatientID>_<StudyDate>_lesion.nii.gz
+            │   ├── <PatientID>_<StudyDate>_lesion_edited.nii.gz
+            │   └── versions/                       # 每次保存的编辑稿及覆盖前备份
+            └── organs/organs.nii.gz                # 可选
+```
+
+**最少可浏览输入**：`interim/<PatientID>/<StudyDate>/` 必须存在，且该次检查有一对
+工作 CT/PET（两者分别来自 `registration/` 的优先文件，或 `preprocessed/` 的回退文件）。
+仅有原始 `CT/` 和 `PET/` 会列在患者树中，但无法打开三视图。病灶 mask 可暂缺。
+AutoPET 需要 `preprocessed/CT` 和 `preprocessed/PET` 两个文件，运行时重新导出当前影像、
+再重新推理；已有模型原稿会被覆盖，人工编辑稿保留并优先显示。每个输入目录建议只放一个
+符合规则的 NIfTI；若有多个，当前索引器按文件名排序取第一个，CT 优先选择名称含
+`WB_Standard` 的文件。不要把不同重建序列混放在同一目录。
+
+模型原稿必须精确命名为 `<PatientID>_<StudyDate>_lesion.nii.gz`；人工保存为
+`<PatientID>_<StudyDate>_lesion_edited.nii.gz`，两者位于同一 `masks/` 目录。
+输入 mask 可为 0/1 或 0/255 二值图，也可为正整数病灶编号图；读入时最近邻重采样到
+工作 CT 网格。若已有 edited 文件，它总是优先于模型原稿。`*_mask.nii.gz` 是离线阈值
+基线文件，**不会自动进入 GUI 的工作 mask**；要比较它，请用「其他（载入 mask）」。
+
+### 1.2 清单模式与运行逻辑
+
+对于其他纵向 PET 队列，用 **文件 → 导入清单…** 或启动参数 `--manifest`。
+CSV 必需列：`patient_id,study_date,ct_path,pet_path,pet_units`；可选列：
+`lesion_mask_path,organ_mask_path,tracer`。每一行是一位患者的一次检查；同一患者的
+`study_date` 不能重复。路径可以是绝对路径，或相对 CSV 所在目录；所指文件必须存在。
+患者和检查 ID 只能包含字母、数字、下划线、点和连字符。`pet_units=SUVbw` 才能进入
+现有 SUV 阈值分割和定量特征协议；其他单位只支持浏览、手动编辑与质控。
+清单模式不调用本项目的 AutoPET。
+
+软件运行顺序是：扫描目录或清单 → 患者树显示全部检查及完整性状态 → 选择患者时读取其
+`longitudinal_session.json` 并显示首个检查 → 人工指定 baseline / interim / end 与其他随访
+→ 编辑并保存各次检查的 mask → 审阅 mask → 将基线病灶床映射到随访 CT 并审阅配准
+→ 仅在所需质控均通过且输入文件指纹仍一致时计算 SUV/组学特征。
+三视图使用工作 CT/PET；下方 MIP 在后台预取。切换数据源会先询问如何处理未保存的编辑，
+随后清除旧图像、时间点和缓存；取消或输入无效时保持原数据源。
+
+编辑窗左键涂画、右键擦除，三格共享同一 3D mask；「当前层 2D」形态学只改正在看的层。
+「保存并关闭」把结果写入 `*_lesion_edited.nii.gz`，先备份旧编辑稿，再写新稿与版本快照，
+质控状态重置为待审阅；原始 `*_lesion.nii.gz` 不覆盖。无变化的已有 mask 不生成新版本。
+取消编辑不落盘。阈值入口须先选阈值模式或实际手动修改，不能直接保存空稿。重新打开检查
+优先读取 edited 文件；磁盘源 mask 被外部修改时拒绝覆盖并要求刷新。
+
 ---
 
 ## 2. 推荐工作流

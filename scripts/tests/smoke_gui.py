@@ -22,9 +22,10 @@ from main_window import MainWindow  # noqa: E402
 from review_dialog import QualityReviewDialog  # noqa: E402
 from segment_editor import SegmentEditorDialog  # noqa: E402
 from features import compute_roi_features, write_csv  # noqa: E402
-from quality import review_mask  # noqa: E402
+from quality import fingerprint, mask_review_status, review_mask  # noqa: E402
 from render_backend import gpu_available  # noqa: E402
 from session import LongitudinalSession, save_session  # noqa: E402
+from workers import SegmentWorker  # noqa: E402
 
 
 def main() -> None:
@@ -103,6 +104,8 @@ def main() -> None:
                                    "baseline", include_radiomics=False)
         feature_csv = root / "outputs" / "P1" / "longitudinal_features.csv"
         write_csv([row], feature_csv)
+        win.features.load_csv(feature_csv)
+        assert len(win.features.fig.axes) == 3
         session = LongitudinalSession("P1", baseline="2026-01-01")
         assert win._feature_csv_current(feature_csv, "P1", session)
         nib.save(nib.Nifti1Image(pet + 1, np.eye(4)), str(root / "pet.nii.gz"))
@@ -110,6 +113,53 @@ def main() -> None:
         win._refresh()
         assert win.ortho.volumes() is not vol
         assert win.ortho.volumes().pet[7, 7, 7] == 9.0
+        original_sha = fingerprint(root / "mask.nii.gz")["sha256"]
+        edited_path = root / "outputs" / "P1" / "2026-01-01" / "masks" / "P1_2026-01-01_lesion_edited.nii.gz"
+
+        def paint_and_accept(dialog):
+            from display_utils import voxel_to_display
+
+            x, y = voxel_to_display("axial", 11, 11, dialog._k, dialog._vol.ct.shape)
+            dialog._paint(x, y, False)
+            dialog._end_stroke()
+            return dialog.DialogCode.Accepted
+
+        with patch.object(SegmentEditorDialog, "exec", paint_and_accept):
+            win._open_segment_editor()
+        assert edited_path.is_file()
+        assert fingerprint(root / "mask.nii.gz")["sha256"] == original_sha
+        assert win.catalog.get_study("P1", "2026-01-01").working_lesion == edited_path
+        assert mask_review_status(edited_path) == "pending"
+        first_saved = np.asanyarray(nib.load(str(edited_path)).dataobj)
+        assert np.array_equal(first_saved, win.ortho.volumes().native)
+        versions = edited_path.parent / "versions"
+        assert len(list(versions.glob("*.nii.gz"))) == 1
+        review_mask(edited_path, "R1", "Checked all planes", "approved")
+        with patch.object(SegmentEditorDialog, "exec", lambda dialog: dialog.DialogCode.Accepted):
+            win._open_segment_editor()
+        assert len(list(versions.glob("*.nii.gz"))) == 1
+        assert mask_review_status(edited_path) == "approved"
+        changed = first_saved.copy()
+        changed[11, 11, 8] = 0
+        win.ortho.apply_mask(changed)
+        win._save_edited()
+        assert len(list(versions.glob("*.nii.gz"))) == 3
+        assert mask_review_status(edited_path) == "pending"
+        win._drop_cached(patient_id="P1", study_date="2026-01-01")
+        win.catalog.refresh()
+        win._on_study("P1", "2026-01-01")
+        assert np.array_equal(win.ortho.volumes().native,
+                              np.asanyarray(nib.load(str(edited_path)).dataobj))
+
+        threshold_editor = SegmentEditorDialog(win.ortho.volumes(), require_change=True)
+        with patch("segment_editor.QMessageBox.warning") as warning:
+            threshold_editor._accept_edit()
+        assert warning.called and threshold_editor.result() != threshold_editor.DialogCode.Accepted
+        threshold_editor.radio_thr_rel.setChecked(True)
+        assert threshold_editor._vol.dirty
+        threshold_editor._accept_edit()
+        assert threshold_editor.result() == threshold_editor.DialogCode.Accepted
+        threshold_editor.close()
         interim = root / "data" / "interim"
         patient_dir = interim / "Q1"
         (patient_dir / "20260101" / "preprocessed" / "CT").mkdir(parents=True)
@@ -121,18 +171,57 @@ def main() -> None:
         assert win.catalog.processed_root == root / "data" / "processed"
         assert win.current_patient is None and win.ortho.volumes() is None
         assert win.browser.topLevelItemCount() == 1
+        fake_python = root / "autopet python"
+        fake_python.touch()
+        calls = []
+
+        def fake_run(cmd, label):
+            calls.append(cmd)
+            if "export_nnunet.py" in cmd[1]:
+                export = root / "data" / "nnunet_export"
+                export.mkdir()
+                for channel in ("0000", "0001"):
+                    (export / f"Q1_20260101_{channel}.nii.gz").touch()
+
+        worker = SegmentWorker("autopet", "Q1", "20260101", win.catalog)
+        with patch("workers.AUTOPET_PYTHON", fake_python), patch.object(worker, "_run_cmd", fake_run):
+            worker._run_autopet()
+        assert len(calls) == 2
+        assert str(interim) in calls[0] and "--overwrite" in calls[0]
+        assert str(root / "data" / "processed") in calls[1] and "--overwrite" in calls[1]
         with patch("main_window.QFileDialog.getOpenFileName", return_value=(str(manifest), "CSV")):
             win._import_manifest()
         assert win.catalog.patient_ids() == ["P1"]
         assert win.catalog.processed_root == root / "studies_review_outputs"
         assert win.browser.topLevelItemCount() == 1
+        non_suv = root / "non_suv.csv"
+        with non_suv.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["patient_id", "study_date", "ct_path",
+                                                       "pet_path", "pet_units"])
+            writer.writeheader()
+            writer.writerow({"patient_id": "P2", "study_date": "2026-01-01",
+                             "ct_path": "ct.nii.gz", "pet_path": "pet.nii.gz",
+                             "pet_units": "Bq/mL"})
+        with patch("main_window.QFileDialog.getOpenFileName", return_value=(str(non_suv), "CSV")):
+            win._import_manifest()
+        win._on_patient("P2")
+        assert win.ortho.volumes().pet_units == "Bq/mL"
+        assert win.ortho.lbl_pet_unit.text() == "PET (Bq/mL)"
+        with (patch("main_window.QMessageBox.warning") as warning,
+              patch.object(win, "_open_segment_editor") as open_editor):
+            win._on_segment("threshold")
+        assert warning.called and not open_editor.called
+        non_suv_editor = SegmentEditorDialog(win.ortho.volumes())
+        assert not non_suv_editor.radio_thr_rel.isEnabled()
+        assert not non_suv_editor.radio_thr_abs.isEnabled()
+        non_suv_editor.close()
         empty = root / "empty"
         empty.mkdir()
         with (patch("main_window.QFileDialog.getExistingDirectory", return_value=str(empty)),
               patch("main_window.QMessageBox.warning") as warning):
             win._open_data_directory()
         assert warning.called
-        assert win.catalog.manifest_path == manifest
+        assert win.catalog.manifest_path == non_suv
         editor.close()
         mask_review.close()
         reg_review.close()

@@ -624,12 +624,12 @@ class PacsDicomToNiftiSuvConverter:
         staging_dir = target_dir / f".staging_{stem}"
         try:
             produced = self._run_dcm2niix(job.dicom_dir, staging_dir, "activity_concentration")
-            act_source = produced[0]
-            if len(produced) > 1:
-                logger.warning(
-                    "PET 序列 %s 被 dcm2niix 拆分为 %d 个文件，仅使用第一个: %s",
-                    job.series_uid, len(produced), act_source.name,
+            if len(produced) != 1:
+                raise RuntimeError(
+                    f"PET 序列 {job.series_uid} 被 dcm2niix 拆分为 {len(produced)} 个文件；"
+                    "必须先核对床位/帧并重建完整图像，禁止仅使用其中一份。"
                 )
+            act_source = produced[0]
 
             target_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(act_source, act_path)

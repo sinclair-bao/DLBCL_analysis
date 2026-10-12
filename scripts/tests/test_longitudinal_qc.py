@@ -16,10 +16,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "longitudinal"))
 sys.path.insert(0, str(ROOT / "common"))
 sys.path.insert(0, str(ROOT / "gui"))
+sys.path.insert(0, str(ROOT / "processing"))
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "visualization"))
+sys.path.insert(0, str(ROOT / "processing" / "organ_extraction"))
 
 from catalog import DataCatalog, StudyAssets, resolve_data_directory  # noqa: E402
-from features import compute_roi_features  # noqa: E402
-from mask_ops import lesion_stats, threshold_pet_mask  # noqa: E402
+from display_utils import apply_pet_cmap, coronal_mip, normalize_ct  # noqa: E402
+from export_nnunet import _find_preprocessed_ct, _find_preprocessed_pet  # noqa: E402
+from features import _suv_peak, compute_roi_features  # noqa: E402
+from infer_nnunet import NnuNetInferrer, _run_nnunet_predict  # noqa: E402
+from preprocess import ImagePreprocessor  # noqa: E402
+from pacs_dicom_to_nifti_suv import PacsDicomToNiftiSuvConverter, SeriesJob  # noqa: E402
+from qc_segmentation import _load_pet_mask  # noqa: E402
+from organ_segmentation import OrganSegmentor  # noqa: E402
+from mask_ops import ensure_labeled, lesion_stats, threshold_pet_mask  # noqa: E402
+from segmentation import ThresholdSegmenter, threshold_suv_mask  # noqa: E402
+from volume_io import VolumeSet, load_mask_from_path  # noqa: E402
 from quality import (archive_existing_mask, mapping_status, mask_review_status, record_mask_version,
                      review_mapping, review_mask, write_mapping_manifest)  # noqa: E402
 from session import LongitudinalSession  # noqa: E402
@@ -51,6 +64,159 @@ class LongitudinalQcTests(unittest.TestCase):
         self.assertEqual(catalog.patient_ids(), ["P1"])
         self.assertEqual(catalog.get_patient("P1").study_dates(), ["20260101"])
         self.assertIsNone(catalog.get_patient("P2"))
+
+    def test_binary_255_mask_splits_disconnected_lesions(self) -> None:
+        mask = np.zeros((8, 8, 8), dtype=np.uint8)
+        mask[1, 1, 1] = 255
+        mask[6, 6, 6] = 255
+        labeled = ensure_labeled(mask)
+        self.assertEqual(set(np.unique(labeled)), {0, 1, 2})
+        stable = np.zeros_like(labeled)
+        stable[1, 1, 1] = 2
+        self.assertEqual(int(ensure_labeled(stable)[1, 1, 1]), 2)
+
+    def test_import_rejects_fractional_and_negative_mask_labels(self) -> None:
+        zeros = np.zeros((4, 4, 4), dtype=np.float32)
+        vol = VolumeSet(zeros, zeros, np.zeros_like(zeros, dtype=np.uint16),
+                        None, "T1", affine=np.eye(4))
+        for value in (0.5, -1.0, np.nan):
+            mask = zeros.copy()
+            mask[1, 1, 1] = value
+            path = self._image("invalid_mask.nii.gz", mask, np.eye(4))
+            with self.assertRaises(ValueError):
+                load_mask_from_path(path, vol)
+
+    def test_offline_threshold_and_suv_peak_handle_nonfinite_pet(self) -> None:
+        self.assertEqual(int(threshold_suv_mask(np.zeros((4, 4, 4)), "relative", 0.41).sum()), 0)
+        pet = np.zeros((16, 16, 16), dtype=np.float32)
+        pet[8, 8, 8] = np.nan
+        pet[9, 8, 8] = 9.0
+        mask = np.zeros_like(pet, dtype=bool)
+        mask[8:10, 8, 8] = True
+        self.assertTrue(np.isfinite(_suv_peak(pet, np.eye(4), mask)))
+
+    def test_nonfinite_image_values_remain_displayable(self) -> None:
+        image = np.array([[np.nan, np.inf], [-np.inf, 3.0]], dtype=np.float32)
+        self.assertTrue(np.isfinite(apply_pet_cmap(image)).all())
+        self.assertTrue(np.isfinite(normalize_ct(image)).all())
+        self.assertTrue(np.isfinite(coronal_mip(image[:, :, None])).all())
+
+    def test_nnunet_command_preserves_paths_with_spaces(self) -> None:
+        cli = self.root / "model cli"
+        cli.touch()
+        with patch("infer_nnunet.NNUNET_CLI", cli), patch("infer_nnunet.subprocess.run") as run:
+            run.return_value.returncode = 0
+            ok, _ = _run_nnunet_predict(self.root / "input scans",
+                                        self.root / "output masks", self.root / "model weights",
+                                        [0, 1])
+        self.assertTrue(ok)
+        cmd = run.call_args.args[0]
+        self.assertIn(str(self.root / "input scans"), cmd)
+        self.assertIn(str(self.root / "model weights"), cmd)
+
+    def test_model_export_and_threshold_require_suvbw(self) -> None:
+        study = self.root / "P1" / "T1"
+        ct_dir = study / "preprocessed" / "CT"
+        pet_dir = study / "preprocessed" / "PET"
+        ct_dir.mkdir(parents=True)
+        pet_dir.mkdir(parents=True)
+        (ct_dir / "a_other.nii.gz").touch()
+        preferred = ct_dir / "z_WB_Standard.nii.gz"
+        preferred.touch()
+        (pet_dir / "scan_ACT.nii.gz").touch()
+        self.assertEqual(_find_preprocessed_ct(study), preferred)
+        self.assertIsNone(_find_preprocessed_pet(study))
+        self.assertIsNone(ThresholdSegmenter._find_preprocessed_pet(study))
+        suv = pet_dir / "scan_SUVbw.nii.gz"
+        suv.touch()
+        self.assertEqual(_find_preprocessed_pet(study), suv)
+        self.assertEqual(ThresholdSegmenter._find_preprocessed_pet(study), suv)
+
+    def test_preprocess_prefers_same_ct_series_as_export_and_gui(self) -> None:
+        study = self.root / "study"
+        ct_dir = study / "CT"
+        ct_dir.mkdir(parents=True)
+        other = ct_dir / "a_soft.nii.gz"
+        preferred = ct_dir / "z_WB_Standard.nii.gz"
+        other.touch()
+        preferred.touch()
+        processor = ImagePreprocessor(self.root)
+        self.assertEqual(processor._find_input_files(study, "CT"), [preferred, other])
+        self.assertEqual(OrganSegmentor.__new__(OrganSegmentor)._find_original_ct(study), preferred)
+
+    def test_split_pet_series_cannot_silently_lose_coverage(self) -> None:
+        converter = PacsDicomToNiftiSuvConverter(self.root / "interim")
+        job = SeriesJob(self.root / "dicom", "P1", "20260101", "PET", "uid", "1", "PET")
+        with (patch.object(converter, "read_series_header", return_value=object()),
+              patch.object(converter, "_run_dcm2niix", return_value=[Path("a.nii.gz"), Path("b.nii.gz")])):
+            with self.assertRaisesRegex(RuntimeError, "拆分为 2 个文件"):
+                converter._convert_pet_series(job)
+        self.assertFalse((self.root / "interim" / "P1" / "20260101" / "PET" / "s1_PET_SUVbw.nii.gz").exists())
+
+    def test_qc_requires_suv_and_matching_mask_geometry(self) -> None:
+        interim = self.root / "interim"
+        processed = self.root / "processed"
+        pet_dir = interim / "P1" / "T1" / "preprocessed" / "PET"
+        mask_dir = processed / "P1" / "T1" / "masks"
+        pet_dir.mkdir(parents=True)
+        mask_dir.mkdir(parents=True)
+        data = np.ones((4, 4, 4), dtype=np.float32)
+        mask_path = mask_dir / "P1_T1_lesion.nii.gz"
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(mask_path))
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(pet_dir / "scan_ACT.nii.gz"))
+        self.assertEqual(_load_pet_mask(interim, processed, "P1", "T1"), (None, None))
+        shifted = np.eye(4)
+        shifted[0, 3] = 2.0
+        suv_path = pet_dir / "scan_SUVbw.nii.gz"
+        nib.save(nib.Nifti1Image(data, shifted), str(suv_path))
+        self.assertEqual(_load_pet_mask(interim, processed, "P1", "T1"), (None, None))
+
+    def test_nnunet_rerun_ignores_stale_raw_output(self) -> None:
+        export = self.root / "exports"
+        export.mkdir()
+        for channel in ("0000", "0001"):
+            (export / f"P1_T1_{channel}.nii.gz").touch()
+        masks = self.root / "processed" / "P1" / "T1" / "masks"
+        stale = masks / "_nnunet_raw_out"
+        stale.mkdir(parents=True)
+        (stale / "old.nii.gz").write_bytes(b"stale")
+
+        def predict(_input, output, *_args):
+            array = np.zeros((4, 4, 4), dtype=np.uint8)
+            array[1, 1, 1] = 1
+            nib.save(nib.Nifti1Image(array, np.eye(4)), str(output / "P1_T1.nii.gz"))
+            return True, "ok"
+
+        inferrer = NnuNetInferrer(export, self.root / "processed", self.root / "model",
+                                 overwrite=True)
+        with patch("infer_nnunet._run_nnunet_predict", side_effect=predict):
+            result = inferrer.infer_case("P1", "T1")
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(int(np.asanyarray(nib.load(str(masks / "P1_T1_lesion.nii.gz")).dataobj).sum()), 1)
+        self.assertEqual(len(list(masks.glob("_nnunet_raw_*"))), 1)  # only the pre-existing legacy folder
+
+    def test_nnunet_invalid_output_preserves_prior_lesion_mask(self) -> None:
+        export = self.root / "exports"
+        export.mkdir()
+        for channel in ("0000", "0001"):
+            (export / f"P1_T1_{channel}.nii.gz").touch()
+        masks = self.root / "processed" / "P1" / "T1" / "masks"
+        masks.mkdir(parents=True)
+        prior = masks / "P1_T1_lesion.nii.gz"
+        prior.write_bytes(b"prior model mask")
+
+        def predict(_input, output, *_args):
+            invalid = np.zeros((4, 4, 4), dtype=np.float32)
+            invalid[1, 1, 1] = np.nan
+            nib.save(nib.Nifti1Image(invalid, np.eye(4)), str(output / "P1_T1.nii.gz"))
+            return True, "ok"
+
+        inferrer = NnuNetInferrer(export, self.root / "processed", self.root / "model",
+                                 overwrite=True)
+        with patch("infer_nnunet._run_nnunet_predict", side_effect=predict):
+            result = inferrer.infer_case("P1", "T1")
+        self.assertEqual(result.status, "error")
+        self.assertEqual(prior.read_bytes(), b"prior model mask")
 
     def _image(self, name: str, data: np.ndarray, affine: np.ndarray) -> Path:
         path = self.root / name

@@ -201,7 +201,8 @@ def _compose_gpu(
     pet_cmap: str = DEFAULT_PET_CMAP,
 ):
     lo, hi = ct_window
-    ct_n = cp.clip((ct_sl - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(cp.float32)
+    ct_safe = cp.nan_to_num(ct_sl, nan=lo, posinf=hi, neginf=lo)
+    ct_n = cp.clip((ct_safe - lo) / max(hi - lo, 1e-6), 0.0, 1.0).astype(cp.float32)
     gray = cp.stack([ct_n, ct_n, ct_n], axis=-1)
     pet_rgb = _gpu_pet_cmap(cp, pet_sl, suv_min, suv_max, pet_cmap)
     if mode == "ct":
@@ -232,7 +233,8 @@ def _compose_gpu(
 
 def _gpu_pet_cmap(cp, values, vmin: float, vmax: float, name: str):
     denom = max(vmax - vmin, 1e-6)
-    n = cp.clip((values.astype(cp.float32) - vmin) / denom, 0.0, 1.0)
+    safe = cp.nan_to_num(values.astype(cp.float32), nan=vmin, posinf=vmax, neginf=vmin)
+    n = cp.clip((safe - vmin) / denom, 0.0, 1.0)
     lut_np = PET_CMAPS.get(name)
     if name == "gray" or lut_np is None:
         return cp.stack([n, n, n], axis=-1)

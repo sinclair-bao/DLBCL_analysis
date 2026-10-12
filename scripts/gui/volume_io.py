@@ -27,6 +27,7 @@ class VolumeSet:
     patient_id: str = ""
     affine: Optional[np.ndarray] = None
     role: str = ""
+    pet_units: str = "SUVbw"
     dirty: bool = False
     edited_sha256: Optional[str] = None
     native_source_path: Optional[str] = None
@@ -69,6 +70,22 @@ def _to_ref(
     return np.asanyarray(warped.dataobj, dtype=dtype)
 
 
+def _label_to_ref(src_path, ref_img: nib.Nifti1Image) -> np.ndarray:
+    """Resample a label image without silently truncating invalid values."""
+    src = nib.load(str(src_path))
+    if tuple(src.shape) == tuple(ref_img.shape) and np.allclose(src.affine, ref_img.affine, atol=1e-4):
+        raw = np.asanyarray(src.dataobj)
+    else:
+        warped = resample_from_to(src, (ref_img.shape, ref_img.affine), order=0)
+        raw = np.asanyarray(warped.dataobj)
+    fractional = (np.any(raw != np.floor(raw))
+                  if np.issubdtype(raw.dtype, np.floating) else False)
+    if (not np.isfinite(raw).all() or np.any(raw < 0) or np.any(raw > np.iinfo(np.uint16).max)
+            or fractional):
+        raise ValueError(f"mask 必须是有限、非负的整数标签（0–65535）: {src_path}")
+    return np.asarray(raw, dtype=np.uint16)
+
+
 def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) -> Optional[VolumeSet]:
     if assets.working_ct is None or assets.working_pet is None:
         return None
@@ -79,7 +96,7 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
     pet = _to_ref(assets.working_pet, ref, order=1, dtype=np.float32)
     native = np.zeros(ct.shape, dtype=np.uint16)
     if assets.working_lesion is not None:
-        raw = _to_ref(assets.working_lesion, ref, order=0, dtype=np.uint16)
+        raw = _label_to_ref(assets.working_lesion, ref)
         if not np.any(raw) and np.any(np.asanyarray(nib.load(str(assets.working_lesion)).dataobj)):
             raise ValueError(f"mask 与 CT 空间不重叠: {assets.working_lesion}")
         native = ensure_labeled(raw)
@@ -87,7 +104,7 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
     if baseline_date:
         wp = assets.warped_baseline_mask(baseline_date)
         if wp is not None:
-            mapped = _to_ref(wp, ref, order=0, dtype=np.uint16)
+            mapped = _label_to_ref(wp, ref)
     return VolumeSet(
         ct=ct,
         pet=pet,
@@ -95,6 +112,7 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
         mapped=mapped,
         study_date=assets.study_date,
         patient_id=assets.patient_id,
+        pet_units=assets.pet_units,
         affine=np.asarray(ref.affine),
         edited_sha256=(fingerprint(assets.lesion_edited)["sha256"]
                        if assets.lesion_edited is not None else None),
@@ -109,7 +127,7 @@ def load_mask_from_path(path, vol: VolumeSet) -> np.ndarray:
     if vol.affine is None:
         raise ValueError("体积缺少仿射，无法重采样 mask")
     ref = nib.Nifti1Image(np.zeros(vol.ct.shape, dtype=np.uint16), vol.affine)
-    raw = _to_ref(path, ref, order=0, dtype=np.uint16)
+    raw = _label_to_ref(path, ref)
     if not np.any(raw) and np.any(np.asanyarray(nib.load(str(path)).dataobj)):
         raise ValueError(f"导入 mask 与当前 CT 空间不重叠: {path}")
     return ensure_labeled(raw)

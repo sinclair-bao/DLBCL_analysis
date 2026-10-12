@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
-"""后台线程：跨检查映射、特征提取、AutoPET / 阈值分割。"""
+"""后台线程：跨检查映射、特征提取与 AutoPET 分割。"""
 
 from __future__ import annotations
 
-import shutil
 import os
 import subprocess
 import sys
@@ -15,7 +14,6 @@ from PySide6.QtCore import QThread, Signal
 _SCRIPTS = Path(__file__).resolve().parents[1]
 _LONG = _SCRIPTS / "longitudinal"
 _COMMON = _SCRIPTS / "common"
-_PROJECT = _SCRIPTS.parent
 for _p in (_LONG, _COMMON, _SCRIPTS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -163,8 +161,6 @@ class SegmentWorker(QThread):
         try:
             if self._method == "autopet":
                 self._run_autopet()
-            elif self._method == "threshold":
-                self._run_threshold()
             else:
                 self.failed.emit(f"未知分割方法: {self._method}")
                 return
@@ -182,22 +178,19 @@ class SegmentWorker(QThread):
     def _run_autopet(self) -> None:
         if not AUTOPET_PYTHON.is_file():
             raise RuntimeError(f"未找到 autopet Python: {AUTOPET_PYTHON}")
-        export_root = _PROJECT / "data" / "nnunet_export"
+        export_root = self._catalog.processed_root.parent / "nnunet_export"
+        log_dir = self._catalog.processed_root.parent / "logs"
         case = f"{self._patient_id}_{self._study_date}"
-        if not (export_root / f"{case}_0000.nii.gz").is_file() or not (
-            export_root / f"{case}_0001.nii.gz"
-        ).is_file():
-            self._run_cmd(
-                [
-                    str(DA_PYTHON),
-                    str(_SCRIPTS / "processing" / "export_nnunet.py"),
-                    "--patient-id",
-                    self._patient_id,
-                    "--study-date",
-                    self._study_date,
-                ],
-                "导出 nnU-Net 格式（CT=_0000，PET=_0001）",
-            )
+        self._run_cmd(
+            [
+                str(DA_PYTHON), str(_SCRIPTS / "processing" / "export_nnunet.py"),
+                "--interim-root", str(self._catalog.interim_root),
+                "--export-root", str(export_root), "--log-dir", str(log_dir),
+                "--patient-id", self._patient_id, "--study-date", self._study_date,
+                "--overwrite",
+            ],
+            "导出当前 CT/PET（CT=_0000，PET=_0001）",
+        )
         ct_nii = export_root / f"{case}_0000.nii.gz"
         pet_nii = export_root / f"{case}_0001.nii.gz"
         if not ct_nii.is_file() or not pet_nii.is_file():
@@ -213,37 +206,11 @@ class SegmentWorker(QThread):
             [
                 str(AUTOPET_PYTHON),
                 str(_SCRIPTS / "processing" / "infer_nnunet.py"),
-                "--patient-id",
-                self._patient_id,
-                "--study-date",
-                self._study_date,
+                "--export-root", str(export_root),
+                "--processed-root", str(self._catalog.processed_root),
+                "--log-dir", str(log_dir),
+                "--patient-id", self._patient_id, "--study-date", self._study_date,
+                "--overwrite",
             ],
             "AutoPET 推理（约 1–2 分钟）",
         )
-
-    def _run_threshold(self) -> None:
-        self._run_cmd(
-            [
-                str(DA_PYTHON),
-                str(_SCRIPTS / "processing" / "segmentation.py"),
-                "--method",
-                "threshold",
-                "--patient-id",
-                self._patient_id,
-                "--study-date",
-                self._study_date,
-            ],
-            "SUV 阈值分割",
-        )
-        masks = (
-            self._catalog.processed_root
-            / self._patient_id
-            / self._study_date
-            / "masks"
-        )
-        dest = masks / f"{self._patient_id}_{self._study_date}_lesion_edited.nii.gz"
-        cands = sorted(masks.glob("*_mask.nii.gz")) if masks.is_dir() else []
-        if not cands:
-            raise RuntimeError("SUV 阈值分割未写出 *_mask.nii.gz")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cands[0], dest)
