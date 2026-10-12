@@ -87,6 +87,12 @@ def main() -> None:
         win._set_browser_visible(False)
         app.processEvents()
         assert win._right_panel.width() >= 320
+        tall = win.evolution._views[0]
+        tall.set_rgb(np.zeros((100, 20, 3), dtype=np.float32))
+        app.processEvents()
+        x_range, y_range = tall.box.viewRange()
+        assert x_range[0] <= 1e-6 and x_range[1] >= 20 - 1e-6, x_range
+        assert y_range[0] <= 1e-6 and y_range[1] >= 100 - 1e-6, y_range
         win._on_patient("P1")
         deadline = monotonic() + 5
         while (win._prefetch_worker is not None or win._prefetch_pending) and monotonic() < deadline:
@@ -94,6 +100,22 @@ def main() -> None:
             sleep(0.01)
         app.processEvents()
         assert win.evolution._views[1].item.image is not None
+        current_mip = win.evolution._views[0]
+        other_mip = win.evolution._views[1]
+        assert current_mip.vline.isVisible() and current_mip.hline.isVisible()
+        assert not other_mip.vline.isVisible()
+        win.ortho._set_ijk(3, 4, 5)
+        assert current_mip.vline.value() == 12
+        assert current_mip.hline.value() == 10
+        win.ortho.slider_i.setValue(4)
+        assert current_mip.vline.value() == 11
+        win.ortho.chk_crosshair.setChecked(False)
+        assert not current_mip.vline.isVisible()
+        win.ortho.chk_crosshair.setChecked(True)
+        assert current_mip.vline.isVisible()
+        win._on_study("P1", "2026-06-01")
+        assert not current_mip.vline.isVisible() and other_mip.vline.isVisible()
+        win._on_study("P1", "2026-01-01")
         if gpu_available():
             win.ortho.combo_render.setCurrentIndex(win.ortho.combo_render.findData("gpu"))
             first_gpu_ct = win.ortho._gpu._ct
@@ -223,6 +245,12 @@ def main() -> None:
         win._on_patient("P2")
         assert win.ortho.volumes().pet_units == "Bq/mL"
         assert win.ortho.lbl_pet_unit.text() == "PET (Bq/mL)"
+        deadline = monotonic() + 5
+        while (win._prefetch_worker is not None or win._prefetch_pending) and monotonic() < deadline:
+            app.processEvents()
+            sleep(0.01)
+        assert win.evolution._views[0].item.image is not None
+        assert win.evolution._views[0].vline.isVisible()
         with (patch("main_window.QMessageBox.warning") as warning,
               patch.object(win, "_open_segment_editor") as open_editor):
             win._on_segment("threshold")

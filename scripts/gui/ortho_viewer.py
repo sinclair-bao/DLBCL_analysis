@@ -200,6 +200,7 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
 class OrthoViewer(QWidget):
     mask_changed = Signal()
     role_requested = Signal(str)
+    cursor_changed = Signal(int, int, int, bool)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -446,6 +447,7 @@ class OrthoViewer(QWidget):
             for view in (self.axial, self.coronal, self.sagittal):
                 view.item.clear()
                 view.set_crosshair_visible(False)
+            self.cursor_changed.emit(0, 0, 0, False)
             return
         self._bind_gpu()
         nx, ny, nz = vol.ct.shape
@@ -641,6 +643,7 @@ class OrthoViewer(QWidget):
         on = self.chk_crosshair.isChecked()
         for v in views:
             v.set_crosshair_visible(on)
+        self.cursor_changed.emit(self._i, self._j, self._k, bool(vol is not None and on))
         if vol is None or not on:
             return
         shape = vol.ct.shape

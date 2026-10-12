@@ -44,6 +44,8 @@ class MipData:
     native: np.ndarray
     mapped: Optional[np.ndarray]
     role: str = ""
+    study_date: str = ""
+    volume_shape: tuple[int, int, int] = (0, 0, 0)
 
 
 def build_mip_data(vol: VolumeSet) -> MipData:
@@ -53,6 +55,8 @@ def build_mip_data(vol: VolumeSet) -> MipData:
         native=coronal_mip(vol.native),
         mapped=coronal_mip(vol.mapped) if vol.mapped is not None else None,
         role=vol.role,
+        study_date=vol.study_date,
+        volume_shape=vol.ct.shape,
     )
 
 

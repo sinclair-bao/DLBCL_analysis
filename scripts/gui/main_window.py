@@ -168,6 +168,7 @@ class MainWindow(QMainWindow):
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
         self.ortho.combo_cmap.currentIndexChanged.connect(self._refresh_evolution)
         self.ortho.mask_changed.connect(self._refresh_lesion_table)
+        self.ortho.cursor_changed.connect(self._sync_mip_cursor)
         self.ortho.role_requested.connect(self._on_role_view)
         self.edit_panel.segment_requested.connect(self._on_segment)
         self.edit_panel.morph_requested.connect(self._on_morph)
@@ -513,7 +514,10 @@ class MainWindow(QMainWindow):
         items = []
         pending = []
         labels = {"baseline": "Baseline", "interim": "Interim", "end": "End"}
-        for role, date in session.dates_in_order():
+        display_dates = session.dates_in_order()
+        if self.current_date and self.current_date not in {date for _, date in display_dates}:
+            display_dates.append(("current", self.current_date))
+        for role, date in display_dates:
             key = (self.current_patient, date, session.baseline or "")
             assets = self.catalog.get_study(self.current_patient, date)
             vol = self._vol_cache.get(key)
@@ -531,8 +535,8 @@ class MainWindow(QMainWindow):
                         assets.working_ct is not None and assets.working_pet is not None):
                     pending.append(key)
             if mip is not None:
-                mip.role = role
-            title = f"{labels.get(role, 'Follow-up')}  {date}"
+                mip.role = role if role != "current" else ""
+            title = f"{labels.get(role, '当前检查' if role == 'current' else 'Follow-up')}  {date}"
             if mip is None:
                 if key in self._prefetch_failed:
                     title += "  · 载入失败"
@@ -549,10 +553,16 @@ class MainWindow(QMainWindow):
             show_native=self.ortho.chk_native.isChecked(),
             show_mapped=self.ortho.chk_mapped.isChecked(),
             highlight_role=session.role_of(self.current_date) if self.current_date else None,
+            highlight_date=self.current_date,
             pet_cmap=self.ortho.pet_cmap(),
         )
+        self._sync_mip_cursor(*self.ortho.ijk(),
+                              self.ortho.volumes() is not None and self.ortho.chk_crosshair.isChecked())
         self._prefetch_pending = pending
         self._start_next_prefetch()
+
+    def _sync_mip_cursor(self, i: int, j: int, k: int, visible: bool) -> None:
+        self.evolution.set_cursor(self.current_date, i, j, k, visible)
 
     def _start_next_prefetch(self) -> None:
         if self._prefetch_worker is not None and self._prefetch_worker.isRunning():
