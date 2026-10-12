@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from weakref import ref
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -102,6 +103,8 @@ class MainWindow(QMainWindow):
         self._prefetch_generation = 0
         self._browser_width = 0
         self._busy_dlg: Optional[QProgressDialog] = None
+        self._read_loading = False
+        self._read_progress_epoch = 0
 
         self.browser = PatientBrowser()
         self.timepoints = TimepointPanel()
@@ -116,6 +119,20 @@ class MainWindow(QMainWindow):
         left_l.setContentsMargins(4, 4, 4, 4)
         left_l.addWidget(QLabel("患者"))
         left_l.addWidget(self.browser, 1)
+        self._read_label = QLabel("当前检查读取进度")
+        self._read_label.setWordWrap(True)
+        self._read_progress = QProgressBar()
+        self._read_progress.setRange(0, 4)
+        self._read_progress.setTextVisible(True)
+        self._read_progress.setFormat("%p%")
+        self._read_progress.setStyleSheet(
+            "QProgressBar { border: 1px solid #555; text-align: center; background: #242424; }"
+            "QProgressBar::chunk { background: #2b60a6; }"
+        )
+        left_l.addWidget(self._read_label)
+        left_l.addWidget(self._read_progress)
+        self._read_label.hide()
+        self._read_progress.hide()
 
         right_inner = QWidget()
         right_l = QVBoxLayout(right_inner)
@@ -331,13 +348,59 @@ class MainWindow(QMainWindow):
             self.ortho.chk_edit.setChecked(False)
         self.ortho.chk_edit.setEnabled(not busy)
 
+    def _begin_read_progress(self, patient_id: str) -> None:
+        self._read_progress_epoch += 1
+        self._read_loading = True
+        self._read_label.setText(f"患者 {patient_id}：正在索引文件…")
+        self._read_progress.setValue(0)
+        self._read_progress.setFormat("%p%")
+        self._read_label.show()
+        self._read_progress.show()
+        # Reading NIfTI is synchronous. Paint the selection and progress before it starts.
+        self.browser.viewport().repaint()
+        self._read_label.repaint()
+        self._read_progress.repaint()
+
+    def _update_read_progress(self, step: int, label: str) -> None:
+        if not self._read_loading:
+            return
+        self._read_label.setText(label)
+        self._read_progress.setValue(step)
+        self._read_label.repaint()
+        self._read_progress.repaint()
+
+    def _finish_read_progress(self, *, success: bool = True, hide_browser: bool = False) -> None:
+        if not self._read_loading:
+            return
+        self._read_loading = False
+        if success:
+            self._read_progress.setValue(4)
+            self._read_label.setText("当前检查已载入")
+        else:
+            self._read_label.setText("检查载入未完成")
+            self._read_progress.setFormat("失败")
+        self._read_label.repaint()
+        self._read_progress.repaint()
+        epoch = self._read_progress_epoch
+        def hide_when_current() -> None:
+            if epoch == self._read_progress_epoch and not self._read_loading:
+                self._read_label.hide()
+                self._read_progress.hide()
+                if hide_browser and self.act_auto_hide.isChecked():
+                    self._set_browser_visible(False)
+        QTimer.singleShot(700, hide_when_current)
+
     def _load_vol(self, patient_id: str, study_date: str, baseline_date: Optional[str]):
         key = (patient_id, study_date, baseline_date or "")
         if key in self._vol_cache:
             self._vol_cache.move_to_end(key)
+            self._update_read_progress(4, "检查影像已从缓存读取")
             return self._vol_cache[key]
         assets = self.catalog.get_study(patient_id, study_date)
-        vol = None if assets is None else load_volume_set(assets, baseline_date)
+        vol = None if assets is None else load_volume_set(
+            assets, baseline_date,
+            progress=self._update_read_progress if self._read_loading else None,
+        )
         self._vol_cache[key] = vol
         self._vol_cache.move_to_end(key)
         self._evict_vol_cache()
@@ -373,28 +436,37 @@ class MainWindow(QMainWindow):
     def _on_patient(self, patient_id: str) -> None:
         if patient_id == self.current_patient:
             return
+        self.browser.viewport().repaint()
         if self.current_patient and not self._confirm_navigation():
             self.browser.select_patient(self.current_patient)
             return
-        self._prefetch_generation += 1
-        self._prefetch_pending.clear()
-        self._prefetch_failed.clear()
-        self.catalog.refresh()
-        self.current_patient = patient_id
-        rec = self.catalog.get_patient(patient_id)
-        session = load_session(self.catalog.processed_root, patient_id)
-        dates = rec.study_dates() if rec else []
-        self.timepoints.set_dates(dates, session)
-        feat_csv = self.catalog.processed_root / patient_id / "longitudinal_features.csv"
-        if self._feature_csv_current(feat_csv, patient_id, session):
-            self.features.load_csv(feat_csv)
-        else:
-            self.features.clear("历史特征缺少质控或输入已变化；请重新计算")
-        if dates:
-            self._on_study(patient_id, dates[0])
-        else:
-            self._refresh_evolution()
-        self.status.showMessage(f"患者 {patient_id}  · {len(dates)} 次检查")
+        self._begin_read_progress(patient_id)
+        success = False
+        try:
+            self._prefetch_generation += 1
+            self._prefetch_pending.clear()
+            self._prefetch_failed.clear()
+            self.catalog.refresh()
+            self.current_patient = patient_id
+            self.current_date = None
+            rec = self.catalog.get_patient(patient_id)
+            session = load_session(self.catalog.processed_root, patient_id)
+            dates = rec.study_dates() if rec else []
+            self.timepoints.set_dates(dates, session)
+            feat_csv = self.catalog.processed_root / patient_id / "longitudinal_features.csv"
+            self._update_read_progress(0, "正在核对历史特征")
+            if self._feature_csv_current(feat_csv, patient_id, session):
+                self.features.load_csv(feat_csv)
+            else:
+                self.features.clear("历史特征缺少质控或输入已变化；请重新计算")
+            if dates:
+                self._on_study(patient_id, dates[0])
+                success = self.ortho.volumes() is not None
+            else:
+                self._refresh_evolution()
+            self.status.showMessage(f"患者 {patient_id}  · {len(dates)} 次检查")
+        finally:
+            self._finish_read_progress(success=success)
 
     def _feature_csv_current(self, csv_path: Path, patient_id: str, session) -> bool:
         if not csv_path.is_file():
@@ -444,6 +516,11 @@ class MainWindow(QMainWindow):
         if self.current_date and study_date != self.current_date and not self._confirm_navigation():
             self.browser.select_study(patient_id, self.current_date)
             return
+        own_progress = not self._read_loading
+        if own_progress:
+            self._begin_read_progress(patient_id)
+        self._read_label.setText(f"正在读取检查 {study_date}")
+        self._read_label.repaint()
         self.current_patient = patient_id
         self.current_date = study_date
         session = self._session() or load_session(self.catalog.processed_root, patient_id)
@@ -453,12 +530,16 @@ class MainWindow(QMainWindow):
             self.ortho.set_volumes(None)
             self.edit_panel.set_lesions([])
             self.status.showMessage(f"{patient_id}/{study_date} 载入失败：{exc}")
+            if own_progress:
+                self._finish_read_progress(success=False)
             QMessageBox.warning(self, "无法载入检查", f"{patient_id}/{study_date}\n{exc}")
             return
         if vol is None:
             self.ortho.set_volumes(None)
             self.edit_panel.set_lesions([])
             self.status.showMessage(f"{patient_id}/{study_date} 缺少工作 CT 或 PET")
+            if own_progress:
+                self._finish_read_progress(success=False)
             return
         role = session.role_of(study_date)
         if role:
@@ -466,14 +547,14 @@ class MainWindow(QMainWindow):
         self.ortho.set_volumes(vol)
         self._refresh_lesion_table()
         self._sync_role_buttons()
-        if self.act_auto_hide.isChecked():
-            self._set_browser_visible(False)
         self._refresh_evolution()
         assets = self.catalog.get_study(patient_id, study_date)
         if assets is not None and assets.working_lesion is None:
             self.status.showMessage(
                 f"{patient_id}/{study_date} 尚无病灶 mask，可用 AutoPET / 阈值 / 空白手动分割"
             )
+        if own_progress:
+            self._finish_read_progress(hide_browser=True)
 
     def _on_session_edit(self) -> None:
         if not self.current_patient:

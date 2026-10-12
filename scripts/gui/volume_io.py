@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import nibabel as nib
 import numpy as np
@@ -90,26 +90,38 @@ def _label_to_ref(src_path, ref_img: nib.Nifti1Image) -> np.ndarray:
     return np.asarray(raw, dtype=np.uint16)
 
 
-def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) -> Optional[VolumeSet]:
+def load_volume_set(
+    assets: StudyAssets,
+    baseline_date: Optional[str] = None,
+    progress: Optional[Callable[[int, str], None]] = None,
+) -> Optional[VolumeSet]:
     if assets.working_ct is None or assets.working_pet is None:
         return None
+    if progress:
+        progress(0, "读取 CT")
     ref = nib.as_closest_canonical(nib.load(str(assets.working_ct)))
     if not np.isfinite(ref.affine).all() or abs(np.linalg.det(ref.affine[:3, :3])) < 1e-8:
         raise ValueError(f"CT 几何信息无效: {assets.working_ct}")
     ct = np.asanyarray(ref.dataobj, dtype=np.float32)
+    if progress:
+        progress(1, "CT 已读取，读取 PET")
     pet = _to_ref(assets.working_pet, ref, order=1, dtype=np.float32)
+    if progress:
+        progress(2, "PET 已读取，读取病灶 mask")
     native = np.zeros(ct.shape, dtype=np.uint16)
     if assets.working_lesion is not None:
         raw = _label_to_ref(assets.working_lesion, ref)
         if not np.any(raw) and np.any(np.asanyarray(nib.load(str(assets.working_lesion)).dataobj)):
             raise ValueError(f"mask 与 CT 空间不重叠: {assets.working_lesion}")
         native = ensure_labeled(raw)
+    if progress:
+        progress(3, "病灶 mask 已检查，读取映射 mask")
     mapped = None
     if baseline_date:
         wp = assets.warped_baseline_mask(baseline_date)
         if wp is not None:
             mapped = _label_to_ref(wp, ref)
-    return VolumeSet(
+    volume = VolumeSet(
         ct=ct,
         pet=pet,
         native=native,
@@ -124,6 +136,9 @@ def load_volume_set(assets: StudyAssets, baseline_date: Optional[str] = None) ->
         native_source_sha256=(fingerprint(assets.working_lesion)["sha256"]
                               if assets.working_lesion else None),
     )
+    if progress:
+        progress(4, "检查影像读取完成")
+    return volume
 
 
 def load_mask_from_path(path, vol: VolumeSet) -> np.ndarray:

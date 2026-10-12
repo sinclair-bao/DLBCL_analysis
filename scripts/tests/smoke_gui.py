@@ -25,6 +25,7 @@ from features import compute_roi_features, write_csv  # noqa: E402
 from quality import fingerprint, mask_review_status, review_mask  # noqa: E402
 from render_backend import gpu_available  # noqa: E402
 from session import LongitudinalSession, save_session  # noqa: E402
+from volume_io import load_volume_set  # noqa: E402
 from workers import SegmentWorker  # noqa: E402
 
 
@@ -93,7 +94,26 @@ def main() -> None:
         x_range, y_range = tall.box.viewRange()
         assert x_range[0] <= 1e-6 and x_range[1] >= 20 - 1e-6, x_range
         assert y_range[0] <= 1e-6 and y_range[1] >= 100 - 1e-6, y_range
-        win._on_patient("P1")
+        win._set_browser_visible(True)
+        app.processEvents()
+        read_steps = []
+
+        def check_selection_before_read(assets, baseline_date=None, progress=None):
+            selected = win.browser.currentItem()
+            assert selected is not None and selected.text(0) == "P1" and selected.isSelected()
+            assert win._read_progress.isVisible() and win._read_progress.value() == 0
+            def report(step, label):
+                read_steps.append(step)
+                if progress:
+                    progress(step, label)
+            return load_volume_set(assets, baseline_date, progress=report)
+
+        with patch("main_window.load_volume_set", side_effect=check_selection_before_read):
+            win.browser.select_patient("P1")
+        assert read_steps == [0, 1, 2, 3, 4], read_steps
+        assert win.browser.currentItem().isSelected()
+        assert win.browser.isVisible()
+        assert win._read_progress.value() == 4
         deadline = monotonic() + 5
         while (win._prefetch_worker is not None or win._prefetch_pending) and monotonic() < deadline:
             app.processEvents()

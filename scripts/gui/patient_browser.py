@@ -26,6 +26,9 @@ class PatientBrowser(QTreeWidget):
         self.setHeaderLabels(["患者 / 检查", "状态"])
         self.setColumnWidth(0, 160)
         self.setAnimated(True)
+        self.setStyleSheet(
+            "QTreeWidget::item:selected { background: #2b60a6; color: #ffffff; }"
+        )
         self.itemSelectionChanged.connect(self._on_select)
 
     def populate(self, catalog: DataCatalog) -> None:
