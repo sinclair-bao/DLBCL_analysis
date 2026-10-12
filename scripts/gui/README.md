@@ -26,6 +26,12 @@ python scripts/gui/app.py --manifest /path/to/studies.csv \
 
 默认读取项目下 `data/interim/` 与 `data/processed/`。需要图形界面；SSH 时请开 X11 转发。
 
+也可在运行中用 **文件 → 打开数据目录…** 选择 `data/`、`interim/` 或
+`interim/<患者ID>/`。选择单个患者目录时，列表只显示该患者；结果写入同一
+`data/processed/`。**文件 → 导入清单…** 可载入下述 CSV，无需固定文件树；
+结果默认写入清单旁的 `<清单文件名>_review_outputs/`。切换数据源时会先处理
+未保存的 mask，随后清除旧影像和缓存并刷新患者列表。取消选择或导入失败不会切换。
+
 **可配置依赖：**
 
 | 用途 | 路径 |
@@ -91,7 +97,9 @@ python scripts/gui/app.py --manifest /path/to/studies.csv \
 
 | 位置 | 操作 |
 |------|------|
-| 文件 → 刷新目录 | 重新扫描 interim / processed |
+| 文件 → 打开数据目录 | 选择 `data/`、`interim/` 或一个患者目录；`Ctrl+O` |
+| 文件 → 导入清单 | 选择通用队列 CSV，并单独保存审阅结果 |
+| 文件 → 刷新目录 | 重新扫描当前目录或清单及其结果目录 |
 | 文件 → 导出特征 CSV | `Ctrl+S`，复制该患者 `longitudinal_features.csv` |
 | 文件 → 导出 MIP 演变图 | 把下方所有时间点的 MIP 存成 PNG |
 | 文件 → 导出特征折线 | 把右下角折线存成 PNG |

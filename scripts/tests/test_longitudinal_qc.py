@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "longitudinal"))
 sys.path.insert(0, str(ROOT / "common"))
 sys.path.insert(0, str(ROOT / "gui"))
 
-from catalog import DataCatalog, StudyAssets  # noqa: E402
+from catalog import DataCatalog, StudyAssets, resolve_data_directory  # noqa: E402
 from features import compute_roi_features  # noqa: E402
 from mask_ops import lesion_stats, threshold_pet_mask  # noqa: E402
 from quality import (archive_existing_mask, mapping_status, mask_review_status, record_mask_version,
@@ -32,6 +32,25 @@ class LongitudinalQcTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_data_directory_selection_and_patient_filter(self) -> None:
+        interim = self.root / "data" / "interim"
+        for patient in ("P1", "P2"):
+            (interim / patient / "20260101" / "preprocessed" / "CT").mkdir(parents=True)
+        processed = self.root / "data" / "processed"
+        for selected in (self.root / "data", interim):
+            self.assertEqual(resolve_data_directory(selected), (interim, processed, None))
+        self.assertEqual(
+            resolve_data_directory(interim / "P1"), (interim, processed, "P1")
+        )
+        custom_patient = self.root / "custom" / "P3"
+        (custom_patient / "T1" / "PET").mkdir(parents=True)
+        self.assertEqual(resolve_data_directory(custom_patient),
+                         (custom_patient.parent, custom_patient.parent / "processed", "P3"))
+        catalog = DataCatalog(interim, processed, patient_filter="P1")
+        self.assertEqual(catalog.patient_ids(), ["P1"])
+        self.assertEqual(catalog.get_patient("P1").study_dates(), ["20260101"])
+        self.assertIsNone(catalog.get_patient("P2"))
 
     def _image(self, name: str, data: np.ndarray, affine: np.ndarray) -> Path:
         path = self.root / name

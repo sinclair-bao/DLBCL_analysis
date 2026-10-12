@@ -40,10 +40,10 @@ for _p in (str(_LONG), str(_COMMON), str(_SCRIPTS / "gui"), str(_SCRIPTS)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from catalog import DataCatalog  # noqa: E402
+from catalog import DataCatalog, resolve_data_directory  # noqa: E402
 from quality import (archive_existing_mask, fingerprint, mapping_status, mask_review_status,
                      record_lesion_link, record_mask_version, review_mapping, review_mask)  # noqa: E402
-from session import load_session, save_session  # noqa: E402
+from session import LongitudinalSession, load_session, save_session  # noqa: E402
 
 from busy import busy_progress, make_progress  # noqa: E402
 from edit_panel import EditPanel  # noqa: E402
@@ -184,9 +184,20 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
+        act_open_data = QAction("打开数据目录…", self)
+        act_open_data.setShortcut(QKeySequence.StandardKey.Open)
+        act_open_data.triggered.connect(self._open_data_directory)
+        file_menu.addAction(act_open_data)
+
+        act_import_manifest = QAction("导入清单…", self)
+        act_import_manifest.triggered.connect(self._import_manifest)
+        file_menu.addAction(act_import_manifest)
+
         act_refresh = QAction("刷新目录", self)
         act_refresh.triggered.connect(self._refresh)
         file_menu.addAction(act_refresh)
+
+        file_menu.addSeparator()
 
         act_export_csv = QAction("导出特征 CSV…", self)
         act_export_csv.setShortcut(QKeySequence.StandardKey.Save)
@@ -1120,6 +1131,70 @@ class MainWindow(QMainWindow):
             "「将基线病灶映射到中期/末期」使用 edited 优先的基线 mask。\n"
             "红 = 本底 mask，黄 = 当前选中灶，青 = 映射的基线病灶床。",
         )
+
+    def _switch_catalog(self, catalog: DataCatalog, source: Path) -> None:
+        if not self._confirm_navigation():
+            return
+        self._prefetch_generation += 1
+        self._prefetch_pending.clear()
+        self._prefetch_failed.clear()
+        self._vol_cache.clear()
+        self._mip_cache.clear()
+        self.current_patient = None
+        self.current_date = None
+        self.catalog = catalog
+        self.ortho.set_volumes(None)
+        self.edit_panel.set_lesions([])
+        self.evolution.clear()
+        self.features.clear()
+        self.timepoints.set_dates([], LongitudinalSession(patient_id=""))
+        self.browser.populate(catalog)
+        self._set_browser_visible(True)
+        self.status.showMessage(
+            f"已打开 {source} · {len(catalog.patient_ids())} 名患者 · 结果目录 {catalog.processed_root}"
+        )
+
+    def _open_data_directory(self) -> None:
+        start = self.catalog.interim_root
+        if not start.is_dir():
+            start = start.parent
+        selected = QFileDialog.getExistingDirectory(self, "打开数据目录", str(start))
+        if not selected:
+            return
+        try:
+            interim, processed, patient_filter = resolve_data_directory(selected)
+            catalog = DataCatalog(interim, processed, patient_filter=patient_filter)
+            if not catalog.patient_ids():
+                raise ValueError("未发现患者检查目录；请选择 data、interim 或 interim/患者ID 目录。")
+            if not any(
+                any((study.ct_orig, study.pet_orig, study.ct_iso, study.pet_iso,
+                     study.ct_reference, study.pet_aligned))
+                for patient in catalog.patients.values() for study in patient.studies
+            ):
+                raise ValueError("目录中未找到 CT/PET NIfTI；请选择包含患者检查的 interim 目录。")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法打开数据目录", str(exc))
+            return
+        self._switch_catalog(catalog, Path(selected))
+
+    def _import_manifest(self) -> None:
+        start = self.catalog.manifest_path or self.catalog.interim_root.parent
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "导入检查清单", str(start), "CSV 清单 (*.csv);;所有文件 (*)"
+        )
+        if not selected:
+            return
+        manifest = Path(selected).expanduser().resolve()
+        processed = (self.catalog.processed_root if manifest == self.catalog.manifest_path
+                     else manifest.parent / f"{manifest.stem}_review_outputs")
+        try:
+            catalog = DataCatalog(self.catalog.interim_root, processed, manifest)
+            if not catalog.patient_ids():
+                raise ValueError("清单中没有患者检查。")
+        except (OSError, ValueError, KeyError, csv.Error) as exc:
+            QMessageBox.warning(self, "无法导入清单", str(exc))
+            return
+        self._switch_catalog(catalog, manifest)
 
     def _refresh(self) -> None:
         if not self._confirm_navigation():

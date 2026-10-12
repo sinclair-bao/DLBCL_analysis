@@ -31,6 +31,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INTERIM_ROOT = PROJECT_ROOT / "data" / "interim"
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
 
+
+def resolve_data_directory(directory: Path | str) -> tuple[Path, Path, str | None]:
+    """Resolve a data/, interim/, or single-patient directory for the GUI."""
+    selected = Path(directory).expanduser().resolve()
+    if not selected.is_dir():
+        raise ValueError(f"数据目录不存在：{selected}")
+    if (selected / "interim").is_dir():
+        return selected / "interim", selected / "processed", None
+    if selected.name == "interim":
+        return selected, selected.parent / "processed", None
+    study_dirs = [child for child in selected.iterdir() if child.is_dir()]
+    is_patient = selected.parent.name == "interim" or any(
+        any((study / name).is_dir() for name in ("CT", "PET", "preprocessed"))
+        for study in study_dirs
+    )
+    if is_patient:
+        processed = (selected.parent.parent / "processed" if selected.parent.name == "interim"
+                     else selected.parent / "processed")
+        return selected.parent, processed, selected.name
+    return selected, selected.parent / "processed", None
+
 # 器官标签（与 organ_segmentation.py 一致）
 ORGAN_SPLEEN = 1
 ORGAN_LIVER = 3
@@ -181,10 +202,13 @@ class DataCatalog:
         interim_root: Path | str = DEFAULT_INTERIM_ROOT,
         processed_root: Path | str = DEFAULT_PROCESSED_ROOT,
         manifest_path: Path | str | None = None,
+        *,
+        patient_filter: str | None = None,
     ) -> None:
         self.interim_root = Path(interim_root)
         self.processed_root = Path(processed_root)
         self.manifest_path = Path(manifest_path) if manifest_path else None
+        self.patient_filter = patient_filter
         self.patients: dict[str, PatientRecord] = {}
         self.refresh()
 
@@ -194,6 +218,8 @@ class DataCatalog:
             self._scan_manifest()
             return
         for patient_id, study_date, study_dir in discover_subject_studies(self.interim_root):
+            if self.patient_filter is not None and patient_id != self.patient_filter:
+                continue
             assets = self._scan_study(patient_id, study_date, study_dir)
             rec = self.patients.setdefault(patient_id, PatientRecord(patient_id))
             rec.studies.append(assets)

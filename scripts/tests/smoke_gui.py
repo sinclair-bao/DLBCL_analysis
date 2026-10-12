@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from time import monotonic, sleep
+from unittest.mock import patch
 
 import nibabel as nib
 import numpy as np
@@ -109,6 +110,29 @@ def main() -> None:
         win._refresh()
         assert win.ortho.volumes() is not vol
         assert win.ortho.volumes().pet[7, 7, 7] == 9.0
+        interim = root / "data" / "interim"
+        patient_dir = interim / "Q1"
+        (patient_dir / "20260101" / "preprocessed" / "CT").mkdir(parents=True)
+        (patient_dir / "20260101" / "preprocessed" / "CT" / "ct.nii.gz").touch()
+        (interim / "Q2" / "20260101" / "preprocessed" / "CT").mkdir(parents=True)
+        with patch("main_window.QFileDialog.getExistingDirectory", return_value=str(patient_dir)):
+            win._open_data_directory()
+        assert win.catalog.patient_ids() == ["Q1"]
+        assert win.catalog.processed_root == root / "data" / "processed"
+        assert win.current_patient is None and win.ortho.volumes() is None
+        assert win.browser.topLevelItemCount() == 1
+        with patch("main_window.QFileDialog.getOpenFileName", return_value=(str(manifest), "CSV")):
+            win._import_manifest()
+        assert win.catalog.patient_ids() == ["P1"]
+        assert win.catalog.processed_root == root / "studies_review_outputs"
+        assert win.browser.topLevelItemCount() == 1
+        empty = root / "empty"
+        empty.mkdir()
+        with (patch("main_window.QFileDialog.getExistingDirectory", return_value=str(empty)),
+              patch("main_window.QMessageBox.warning") as warning):
+            win._open_data_directory()
+        assert warning.called
+        assert win.catalog.manifest_path == manifest
         editor.close()
         mask_review.close()
         reg_review.close()
