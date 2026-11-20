@@ -126,6 +126,11 @@ def stations_compatible(left: int, right: int) -> bool:
     return int(right) in _ADJACENT.get(int(left), ())
 
 
+def stations_same(left: int, right: int) -> bool:
+    """匈牙利配对的硬约束：必须是同一个站点编号。"""
+    return int(left) == int(right)
+
+
 def build_station_mask(totalseg: np.ndarray, affine: np.ndarray) -> np.ndarray:
     """把已重采样到目标网格的 TotalSegmentator 标签写成站点图。"""
     labels = np.rint(np.asarray(totalseg)).astype(np.int16)

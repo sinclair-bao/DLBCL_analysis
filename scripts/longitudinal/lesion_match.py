@@ -5,14 +5,18 @@
 
 固定图像是中期 2 mm CT，移动图像是基线 2 mm CT。形变不使用 PET。
 人工勾画的 mask 不参与。过大或 SUV 不可能的连通域记为 invalid。
-同一或相邻站点、20 mm 内记为 matched；20–40 mm 记为 review。
-大灶按表面距离可对应多块小灶。残余 SUV 取病灶核心，并排除脑、肾、膀胱和心脏；
-只有接近肝脏本底才记为 resolved，其余未配上的基线灶记为 unmatched。
-中期未能配对的病灶记为 new。
+
+两种配对用 --pairing 选择，默认 greedy：
+    greedy     同一或相邻站点。小灶一一对应，大灶可对应多块小灶。
+    hungarian  必须同一站点。匈牙利一对一，配不上的灶进入 dummy。
+    both       同一套 SyN 结果各算一遍。
+20 mm 内记为 matched，20–40 mm 记为 review。残余 SUV 取病灶核心，
+并排除脑、肾、膀胱和心脏；只有接近肝脏本底才记为 resolved。
 
 产物：
     data/processed/<ID>/<中期日期>/longitudinal/match/
     results/tables/lesion_match_pilot.csv
+    results/tables/lesion_response_pilot.csv
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import nibabel as nib
 import numpy as np
 from nibabel.processing import resample_from_to
 from scipy import ndimage
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 _SCRIPTS = Path(__file__).resolve().parents[1]
@@ -43,7 +48,24 @@ from pipeline_utils import setup_logging  # noqa: E402
 
 from ants_runner import resolve_ants_bin  # noqa: E402
 from catalog import ORGAN_LIVER, DataCatalog, StudyAssets  # noqa: E402
-from stations import ST_BONE, build_station_mask, station_name, stations_compatible  # noqa: E402
+from features import _extract_radiomics, _pyradiomics_available, _suv_peak  # noqa: E402
+from quant import (  # noqa: E402
+    RESPONSE_FIELDS,
+    apply_study_metrics,
+    blood_pool_suv,
+    liver_reference,
+    load_pet_demographics,
+    percent_change,
+    scale_from_demographics,
+    summarize_percist,
+)
+from stations import (  # noqa: E402
+    ST_BONE,
+    build_station_mask,
+    station_name,
+    stations_compatible,
+    stations_same,
+)
 
 logger = logging.getLogger("lesion_match")
 
@@ -51,6 +73,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INTERIM_ROOT = PROJECT_ROOT / "data" / "interim"
 DEFAULT_PROCESSED_ROOT = PROJECT_ROOT / "data" / "processed"
 DEFAULT_RESULTS_CSV = PROJECT_ROOT / "results" / "tables" / "lesion_match_pilot.csv"
+DEFAULT_RESPONSE_CSV = PROJECT_ROOT / "results" / "tables" / "lesion_response_pilot.csv"
+DEFAULT_RADIOMICS_CSV = PROJECT_ROOT / "results" / "tables" / "lesion_radiomics_pilot.csv"
 
 PILOT_PAIRS = (
     ("00136597", "20220425", "20220728"),
@@ -94,6 +118,39 @@ MATCH_FIELDS = [
     "residual_suv_mean",
     "liver_suv_mean",
     "suv_max_liver_ratio",
+    "pairing",
+    "lifecycle",
+    "fusion",
+    "baseline_suv_peak",
+    "interim_suv_peak",
+    "baseline_tlg",
+    "interim_tlg",
+    "pct_delta_suv_max",
+    "pct_delta_mtv",
+    "pct_delta_tlg",
+    "qpet_baseline",
+    "qpet_interim",
+    "baseline_sul_peak",
+    "interim_sul_peak",
+    "pct_delta_sul_peak",
+    "baseline_measurable",
+    "deauville_surrogate",
+    "quantitative_outlier",
+    "reverse_iou",
+    "reverse_residual_suv_max",
+]
+
+RADIOMICS_FIELDS = [
+    "patient_id",
+    "baseline_date",
+    "interim_date",
+    "pairing",
+    "timepoint",
+    "study_date",
+    "lesion_id",
+    "lifecycle",
+    "match_status",
+    "station",
 ]
 
 
@@ -123,11 +180,15 @@ def measure_components(labels: np.ndarray, pet: np.ndarray, affine: np.ndarray) 
         values = pet[selected]
         values = values[np.isfinite(values)]
         n_voxels = int(selected.sum())
+        suv_mean = float(values.mean()) if values.size else float("nan")
+        mtv_ml = voxel_ml * n_voxels
         measured[label_id] = {
             "n_voxels": n_voxels,
-            "mtv_ml": voxel_ml * n_voxels,
+            "mtv_ml": mtv_ml,
             "suv_max": float(values.max()) if values.size else float("nan"),
-            "suv_mean": float(values.mean()) if values.size else float("nan"),
+            "suv_mean": suv_mean,
+            "suv_peak": _suv_peak(pet, affine, selected),
+            "tlg": suv_mean * mtv_ml if math.isfinite(suv_mean) else float("nan"),
         }
     return measured
 
@@ -158,6 +219,8 @@ def build_match_rows(
     liver_suv_mean: float,
     organs: np.ndarray | None = None,
     *,
+    pairing: str = "greedy",
+    baseline_liver_suv_mean: float = float("nan"),
     max_distance_mm: float = MAX_DISTANCE_MM,
     review_distance_mm: float = REVIEW_DISTANCE_MM,
     w_distance: float = W_DISTANCE,
@@ -175,7 +238,10 @@ def build_match_rows(
         label_id: geom for label_id, geom in interim_geom.items()
         if not _component_is_invalid(interim_meta.get(label_id, {}))
     }
-    matched, review = _assign_pairs(
+    assign = _assign_hungarian if pairing == "hungarian" else _assign_pairs
+    if pairing not in ("greedy", "hungarian"):
+        raise ValueError(f"未知配对方法 {pairing!r}")
+    matched, review = assign(
         valid_baseline, valid_interim, baseline_meta, interim_meta,
         baseline_labels, interim_labels, affine,
         max_distance_mm=max_distance_mm, review_distance_mm=review_distance_mm,
@@ -215,11 +281,11 @@ def build_match_rows(
                 base, {}, float("nan"), float("nan"), liver_suv_mean, float("nan"),
             ))
             continue
-        residual_max, residual_mean = _core_residual(
+        residual_max, residual_mean, residual_peak = _core_residual(
             interim_pet, geom["coords"], geom["centroid"], affine, organs,
         )
         status = "resolved" if _near_background(residual_max, liver_suv_mean) else "unmatched"
-        rows.append(_row(
+        row = _row(
             status,
             baseline_id,
             None,
@@ -233,7 +299,9 @@ def build_match_rows(
             residual_mean,
             liver_suv_mean,
             _ratio(residual_max, liver_suv_mean),
-        ))
+        )
+        row["_residual_suv_peak"] = residual_peak
+        rows.append(row)
 
     for interim_id, geom in interim_geom.items():
         if interim_id in used_interim:
@@ -255,6 +323,7 @@ def build_match_rows(
             liver_suv_mean,
             _ratio(follow.get("suv_max", float("nan")), liver_suv_mean),
         ))
+    _finalize_rows(rows, pairing, liver_suv_mean, baseline_liver_suv_mean)
     return rows
 
 
@@ -275,29 +344,11 @@ def _assign_pairs(
     """小灶一一配对；大灶可以用表面距离接受多块对侧小灶。"""
     if not baseline_geom or not interim_geom:
         return [], []
-    candidates: list[tuple] = []
-    for baseline_id, baseline in baseline_geom.items():
-        for interim_id, interim in interim_geom.items():
-            compatible = stations_compatible(baseline["station"], interim["station"])
-            distance = _lesion_distance(
-                baseline, interim,
-                _is_large(baseline_meta.get(baseline_id, {})),
-                _is_large(interim_meta.get(interim_id, {})),
-                affine,
-            )
-            overlap = 0.0
-            if compatible and distance <= review_distance_mm:
-                overlap = _iou(baseline_labels, baseline_id, interim_labels, interim_id)
-            value = pair_cost(
-                distance, overlap, compatible,
-                max_distance_mm=review_distance_mm, w_distance=w_distance, w_iou=w_iou,
-            )
-            if value is None:
-                continue
-            candidates.append((
-                value, distance, overlap, baseline_id, interim_id,
-                _is_large(baseline_meta.get(baseline_id, {})),
-            ))
+    candidates = _collect_candidates(
+        baseline_geom, interim_geom, baseline_meta, interim_meta,
+        baseline_labels, interim_labels, affine, stations_compatible,
+        review_distance_mm=review_distance_mm, w_distance=w_distance, w_iou=w_iou,
+    )
     matched = _take_pairs(candidates, max_distance_mm)
     used_baseline = {item[0] for item in matched if not _is_large(baseline_meta.get(item[0], {}))}
     used_interim = {item[1] for item in matched}
@@ -308,6 +359,112 @@ def _assign_pairs(
         used_interim=used_interim,
     )
     return matched, review
+
+
+def _assign_hungarian(
+    baseline_geom: dict[int, dict],
+    interim_geom: dict[int, dict],
+    baseline_meta: dict[int, dict],
+    interim_meta: dict[int, dict],
+    baseline_labels: np.ndarray,
+    interim_labels: np.ndarray,
+    affine: np.ndarray,
+    *,
+    max_distance_mm: float,
+    review_distance_mm: float,
+    w_distance: float,
+    w_iou: float,
+) -> tuple[list[tuple], list[tuple]]:
+    """同站点硬约束下的一对一配对。每个灶都有 dummy，落选即为消失或新生。"""
+    if not baseline_geom or not interim_geom:
+        return [], []
+    candidates = _collect_candidates(
+        baseline_geom, interim_geom, baseline_meta, interim_meta,
+        baseline_labels, interim_labels, affine, stations_same,
+        review_distance_mm=review_distance_mm, w_distance=w_distance, w_iou=w_iou,
+    )
+    baseline_ids = list(baseline_geom)
+    interim_ids = list(interim_geom)
+    index_baseline = {label: index for index, label in enumerate(baseline_ids)}
+    index_interim = {label: index for index, label in enumerate(interim_ids)}
+    n_baseline = len(baseline_ids)
+    n_interim = len(interim_ids)
+    big = 1.0e6
+    dummy = _dummy_cost(review_distance_mm, w_distance, w_iou)
+    cost = np.full((n_baseline + n_interim, n_baseline + n_interim), big, dtype=np.float64)
+    info: dict[tuple[int, int], tuple] = {}
+    for value, distance, overlap, baseline_id, interim_id, _baseline_large in candidates:
+        row = index_baseline[baseline_id]
+        column = index_interim[interim_id]
+        cost[row, column] = value
+        info[(row, column)] = (baseline_id, interim_id, distance, overlap, value)
+    for row in range(n_baseline):
+        cost[row, n_interim + row] = dummy
+    for column in range(n_interim):
+        cost[n_baseline + column, column] = dummy
+    cost[n_baseline:, n_interim:] = 0.0
+    matched: list[tuple] = []
+    review: list[tuple] = []
+    for row, column in zip(*linear_sum_assignment(cost)):
+        record = info.get((int(row), int(column)))
+        if record is None:
+            continue
+        baseline_id, interim_id, distance, overlap, value = record
+        item = (baseline_id, interim_id, distance, overlap, value)
+        if distance <= max_distance_mm:
+            matched.append(item)
+        elif distance <= review_distance_mm:
+            review.append(item)
+    return matched, review
+
+
+def _collect_candidates(
+    baseline_geom: dict[int, dict],
+    interim_geom: dict[int, dict],
+    baseline_meta: dict[int, dict],
+    interim_meta: dict[int, dict],
+    baseline_labels: np.ndarray,
+    interim_labels: np.ndarray,
+    affine: np.ndarray,
+    compatible,
+    *,
+    review_distance_mm: float,
+    w_distance: float,
+    w_iou: float,
+) -> list[tuple]:
+    candidates: list[tuple] = []
+    for baseline_id, baseline in baseline_geom.items():
+        for interim_id, interim in interim_geom.items():
+            same_or_adjacent = bool(compatible(baseline["station"], interim["station"]))
+            distance = _lesion_distance(
+                baseline, interim,
+                _is_large(baseline_meta.get(baseline_id, {})),
+                _is_large(interim_meta.get(interim_id, {})),
+                affine,
+            )
+            overlap = 0.0
+            if same_or_adjacent and distance <= review_distance_mm:
+                overlap = _iou(baseline_labels, baseline_id, interim_labels, interim_id)
+            value = pair_cost(
+                distance, overlap, same_or_adjacent,
+                max_distance_mm=review_distance_mm, w_distance=w_distance, w_iou=w_iou,
+            )
+            if value is None:
+                continue
+            candidates.append((
+                value, distance, overlap, baseline_id, interim_id,
+                _is_large(baseline_meta.get(baseline_id, {})),
+            ))
+    return candidates
+
+
+def _dummy_cost(
+    review_distance_mm: float = REVIEW_DISTANCE_MM,
+    w_distance: float = W_DISTANCE,
+    w_iou: float = W_IOU,
+) -> float:
+    """高于 40 mm、IoU 为 0 的最大合法代价，合法配对总会优先于 dummy。"""
+    return w_distance * float(review_distance_mm) + w_iou + 1.0
 
 
 def _take_pairs(
@@ -429,7 +586,7 @@ def _core_residual(
     centroid: np.ndarray,
     affine: np.ndarray,
     organs: np.ndarray | None,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """在病灶核心内取残余 SUV，并去掉脑、肾、膀胱和心脏。"""
     world = nib.affines.apply_affine(affine, coords.astype(np.float64))
     core = np.linalg.norm(world - centroid, axis=1) <= CORE_RADIUS_MM
@@ -444,10 +601,12 @@ def _core_residual(
         keep = np.ones(len(coords), dtype=bool)
     selected = coords[keep]
     values = np.asarray(pet, dtype=np.float64)[selected[:, 0], selected[:, 1], selected[:, 2]]
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return float("nan"), float("nan")
-    return float(values.max()), float(values.mean())
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    peak_mask = np.zeros(pet.shape, dtype=bool)
+    peak_mask[selected[:, 0], selected[:, 1], selected[:, 2]] = True
+    return float(finite.max()), float(finite.mean()), _suv_peak(pet, affine, peak_mask)
 
 
 def _ratio(suv_max: float, liver_suv_mean: float) -> float:
@@ -485,14 +644,92 @@ def _row(
         "baseline_mtv_ml": _round(baseline_meta.get("mtv_ml")),
         "baseline_suv_max": _round(baseline_meta.get("suv_max")),
         "baseline_suv_mean": _round(baseline_meta.get("suv_mean")),
+        "baseline_suv_peak": _round(baseline_meta.get("suv_peak")),
+        "baseline_tlg": _round(baseline_meta.get("tlg")),
         "interim_mtv_ml": _round(interim_mtv),
         "interim_suv_max": _round(interim_meta.get("suv_max")),
         "interim_suv_mean": _round(interim_meta.get("suv_mean")),
+        "interim_suv_peak": _round(interim_meta.get("suv_peak")),
+        "interim_tlg": _round(interim_meta.get("tlg")),
         "residual_suv_max": _round(residual_max if status in ("resolved", "unmatched") else None),
         "residual_suv_mean": _round(residual_mean if status in ("resolved", "unmatched") else None),
         "liver_suv_mean": _round(liver_suv_mean),
         "suv_max_liver_ratio": _round(ratio),
     }
+
+
+def _finalize_rows(
+    rows: list[dict],
+    pairing: str,
+    liver_suv_mean: float,
+    baseline_liver_suv_mean: float,
+) -> None:
+    paired_counts: dict[object, int] = {}
+    for row in rows:
+        if row["match_status"] in ("matched", "review") and row["baseline_lesion_id"] != "":
+            paired_counts[row["baseline_lesion_id"]] = paired_counts.get(row["baseline_lesion_id"], 0) + 1
+    for row in rows:
+        row["pairing"] = pairing
+        row["fusion"] = ""
+        status = row["match_status"]
+        if status in ("matched", "review"):
+            row["lifecycle"] = "split" if paired_counts.get(row["baseline_lesion_id"], 0) > 1 else "persist"
+        else:
+            row["lifecycle"] = status
+        row["quantitative_outlier"] = _outlier_flag(row)
+        _fill_changes(row, status, liver_suv_mean, baseline_liver_suv_mean)
+        for key in (
+            "baseline_sul_peak", "interim_sul_peak", "pct_delta_sul_peak",
+            "baseline_measurable", "deauville_surrogate", "reverse_iou", "reverse_residual_suv_max",
+        ):
+            row.setdefault(key, "")
+
+
+def _outlier_flag(row: dict) -> int:
+    if row["match_status"] not in ("unmatched", "new"):
+        return 0
+    try:
+        ratio = float(row.get("suv_max_liver_ratio"))
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(ratio):
+        return 0
+    return 1 if ratio >= RESIDUAL_LIVER_RATIO else 0
+
+
+def _fill_changes(row: dict, status: str, liver_suv_mean: float, baseline_liver_suv_mean: float) -> None:
+    baseline_max = _numeric(row.get("baseline_suv_max"))
+    interim_max = _numeric(row.get("interim_suv_max"))
+    baseline_mtv = _numeric(row.get("baseline_mtv_ml"))
+    interim_mtv = _numeric(row.get("interim_mtv_ml"))
+    baseline_tlg = _numeric(row.get("baseline_tlg"))
+    interim_tlg = _numeric(row.get("interim_tlg"))
+    baseline_peak = _numeric(row.get("baseline_suv_peak"))
+    interim_peak = _numeric(row.get("interim_suv_peak"))
+    if status in ("matched", "review"):
+        row["pct_delta_suv_max"] = _round(percent_change(baseline_max, interim_max))
+        row["pct_delta_mtv"] = _round(percent_change(baseline_mtv, interim_mtv))
+        row["pct_delta_tlg"] = _round(percent_change(baseline_tlg, interim_tlg))
+    elif status == "resolved":
+        row["pct_delta_suv_max"] = ""
+        row["pct_delta_mtv"] = _round(percent_change(baseline_mtv, 0.0))
+        row["pct_delta_tlg"] = ""
+    else:
+        row["pct_delta_suv_max"] = ""
+        row["pct_delta_mtv"] = ""
+        row["pct_delta_tlg"] = ""
+    row["qpet_baseline"] = _round(_ratio(baseline_peak, baseline_liver_suv_mean))
+    row["qpet_interim"] = _round(_ratio(interim_peak, liver_suv_mean))
+
+
+def _numeric(value: object) -> float:
+    if value is None or value == "":
+        return float("nan")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number
 
 
 def _round(value: object, digits: int = 4) -> str | float:
@@ -521,6 +758,10 @@ def _affine_path(out_dir: Path, baseline_date: str) -> Path:
 
 def _warp_path(out_dir: Path, baseline_date: str) -> Path:
     return out_dir / f"{_prefix(baseline_date)}1Warp.nii.gz"
+
+
+def _inverse_warp_path(out_dir: Path, baseline_date: str) -> Path:
+    return out_dir / f"{_prefix(baseline_date)}1InverseWarp.nii.gz"
 
 
 def register_and_warp(
@@ -679,6 +920,38 @@ def _apply(
         _run_logged(command("NearestNeighbor"), apply_transforms.parent, f"apply {output.name}")
 
 
+def _apply_inverse(
+    apply_transforms: Path,
+    moving: Path,
+    reference: Path,
+    output: Path,
+    inverse_warp: Path,
+    affine: Path,
+    interpolation: str,
+) -> None:
+    """把中期网格上的图像变回基线。先用逆场，再用仿射的逆。"""
+    def command(interp: str) -> list[str]:
+        return [
+            str(apply_transforms),
+            "-d", "3",
+            "-i", str(moving),
+            "-r", str(reference),
+            "-o", str(output),
+            "-t", f"[{affine},1]",
+            "-t", str(inverse_warp),
+            "-n", interp,
+            "-v", "1",
+        ]
+
+    try:
+        _run_logged(command(interpolation), apply_transforms.parent, f"inverse {output.name}")
+    except RuntimeError:
+        if interpolation != "GenericLabel":
+            raise
+        logger.warning("GenericLabel 不可用，改用 NearestNeighbor: %s", output.name)
+        _run_logged(command("NearestNeighbor"), apply_transforms.parent, f"inverse {output.name}")
+
+
 def _run_logged(command: list[str], ants_bin: Path, label: str) -> None:
     env = os.environ.copy()
     env["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = env.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "8")
@@ -737,13 +1010,16 @@ def match_pair(
     interim: StudyAssets,
     ants_bin: Path,
     *,
+    pairing: str = "greedy",
+    radiomics: bool = True,
     threads: int = 8,
     overwrite: bool = False,
-) -> list[dict]:
+) -> dict:
+    if pairing not in ("greedy", "hungarian", "both"):
+        raise ValueError(f"未知配对方法 {pairing!r}")
     if baseline.lesion_auto is None or interim.lesion_auto is None:
         raise FileNotFoundError("基线或中期缺少 AutoPET 病灶 mask")
     out_dir = register_and_warp(baseline, interim, ants_bin, threads=threads, overwrite=overwrite)
-    matches_path = out_dir / "matches.csv"
     reference = nib.load(str(interim.ct_iso))
     _pet_image, interim_pet = _load_array(interim.pet_iso)
     if interim_pet.shape != reference.shape or not np.allclose(_pet_image.affine, reference.affine, atol=1e-3):
@@ -769,7 +1045,8 @@ def match_pair(
 
     interim_mask = _on_reference(interim.lesion_auto, reference)
     interim_labels = label_lesions(interim_mask)
-    _save_image(interim_labels, reference, out_dir / "components_interim.nii.gz")
+    interim_labels_path = out_dir / "components_interim.nii.gz"
+    _save_image(interim_labels, reference, interim_labels_path)
     interim_meta = measure_components(interim_labels, interim_pet, reference.affine)
 
     totalseg_path = interim.processed_dir / "organs" / "_totalseg_staging" / "totalseg_wholebody.nii.gz"
@@ -780,31 +1057,280 @@ def match_pair(
     _save_image(stations, reference, out_dir / "stations.nii.gz")
 
     liver = _liver_mean(interim, reference, interim_pet)
-    organs = None
-    if interim.organs is not None and interim.organs.is_file():
-        organs = resample_nearest(nib.load(str(interim.organs)), reference)
-    rows = build_match_rows(
-        warped, interim_labels, baseline_meta, interim_meta, interim_pet, stations,
-        reference.affine, liver, organs,
+    baseline_liver = _liver_mean(baseline, baseline_pet_image, baseline_pet)
+    organs = _organs_on(interim, reference)
+    baseline_organs = _organs_on(baseline, baseline_pet_image)
+    interim_liver_mean, interim_liver_sd = liver_reference(interim_pet, organs, interim_labels, ORGAN_LIVER)
+    baseline_liver_mean, baseline_liver_sd = liver_reference(
+        baseline_pet, baseline_organs, baseline_labels, ORGAN_LIVER,
     )
+    pool = blood_pool_suv(interim_pet, totalseg, interim_labels)
+    deauville_liver = interim_liver_mean if math.isfinite(interim_liver_mean) else liver
+    baseline_demo = load_pet_demographics(
+        baseline.patient_id, baseline.study_date, baseline.processed_dir, PROJECT_ROOT,
+    )
+    interim_demo = load_pet_demographics(
+        interim.patient_id, interim.study_date, interim.processed_dir, PROJECT_ROOT,
+    )
+    baseline_scale = scale_from_demographics(baseline_demo)
+    interim_scale = scale_from_demographics(interim_demo)
+    reverse = _reverse_images(
+        baseline, interim, out_dir, ants_bin, baseline_pet_image, reference,
+        interim_labels_path, interim_pet,
+    )
+    feature_map = {}
+    if radiomics:
+        feature_map = _radiomics_catalog(
+            baseline, interim, baseline_labels, baseline_meta, baseline_pet_image,
+            interim_labels, interim_meta, reference, interim_pet,
+        )
+
+    modes = ["greedy", "hungarian"] if pairing == "both" else [pairing]
+    rows_by_mode: dict[str, list[dict]] = {}
+    responses: list[dict] = []
+    radio_rows: list[dict] = []
+    for mode in modes:
+        rows = build_match_rows(
+            warped, interim_labels, baseline_meta, interim_meta, interim_pet, stations,
+            reference.affine, liver, organs,
+            pairing=mode, baseline_liver_suv_mean=baseline_liver,
+        )
+        for row in rows:
+            row["patient_id"] = interim.patient_id
+            row["baseline_date"] = baseline.study_date
+            row["interim_date"] = interim.study_date
+        apply_study_metrics(
+            rows,
+            baseline_scale=baseline_scale,
+            interim_scale=interim_scale,
+            blood_pool=pool,
+            deauville_liver=deauville_liver,
+            baseline_liver_mean=baseline_liver_mean,
+            baseline_liver_sd=baseline_liver_sd,
+        )
+        if reverse is not None:
+            _annotate_reverse(rows, baseline_labels, reverse[0], reverse[1], baseline_organs)
+        matches_path = out_dir / ("matches.csv" if mode == "greedy" else "matches_hungarian.csv")
+        _write_rows(rows, matches_path)
+        _log_counts(interim.patient_id, baseline.study_date, interim.study_date, mode, rows)
+        responses.append(summarize_percist(
+            rows,
+            patient_id=interim.patient_id,
+            baseline_date=baseline.study_date,
+            interim_date=interim.study_date,
+            pairing=mode,
+            baseline_scale=baseline_scale,
+            interim_scale=interim_scale,
+            baseline_liver_mean=baseline_liver_mean,
+            baseline_liver_sd=baseline_liver_sd,
+            interim_liver_mean=interim_liver_mean,
+            interim_liver_sd=interim_liver_sd,
+            blood_pool=pool,
+        ))
+        radio_rows.extend(_stamp_radiomics(rows, feature_map, mode))
+        rows_by_mode[mode] = rows
+    return {"rows": rows_by_mode, "response": responses, "radiomics": radio_rows}
+
+
+def _organs_on(study: StudyAssets, reference: nib.Nifti1Image) -> np.ndarray | None:
+    if study.organs is None or not study.organs.is_file():
+        return None
+    return resample_nearest(nib.load(str(study.organs)), reference)
+
+
+def _reverse_images(
+    baseline: StudyAssets,
+    interim: StudyAssets,
+    out_dir: Path,
+    ants_bin: Path,
+    baseline_pet_image: nib.Nifti1Image,
+    interim_reference: nib.Nifti1Image,
+    interim_labels_path: Path,
+    interim_pet: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    inverse = _inverse_warp_path(out_dir, baseline.study_date)
+    if not inverse.is_file() or baseline.pet_iso is None:
+        logger.info("没有逆场，跳过反向 VOI: %s", inverse.name)
+        return None
+    labels_out = out_dir / "interim_labels_on_baseline.nii.gz"
+    pet_out = out_dir / "interim_pet_on_baseline.nii.gz"
+    pet_source = _pet_file_on_reference(
+        interim.pet_iso, interim_pet, interim_reference, out_dir / "interim_pet_on_ct.nii.gz",
+    )
+    _registration, apply_transforms, _convert = resolve_ants_bin(ants_bin)
+    affine = _affine_path(out_dir, baseline.study_date)
+    try:
+        _apply_inverse(
+            apply_transforms, interim_labels_path, baseline.pet_iso, labels_out,
+            inverse, affine, "GenericLabel",
+        )
+        _apply_inverse(
+            apply_transforms, pet_source, baseline.pet_iso, pet_out,
+            inverse, affine, "Linear",
+        )
+    except RuntimeError as exc:
+        logger.warning("反向映射失败，跳过: %s", exc)
+        return None
+    labels = resample_nearest(nib.load(str(labels_out)), baseline_pet_image)
+    labels = np.clip(labels, 0, None).astype(np.uint16)
+    pet_image, pet = _load_array(pet_out)
+    pet = np.asarray(pet, dtype=np.float64)
+    if pet.shape != baseline_pet_image.shape or not np.allclose(pet_image.affine, baseline_pet_image.affine, atol=1e-3):
+        pet = np.asarray(
+            resample_from_to(pet_image, (baseline_pet_image.shape, baseline_pet_image.affine), order=1).dataobj,
+            dtype=np.float64,
+        )
+    return labels, pet
+
+
+def _pet_file_on_reference(
+    pet_path: Path,
+    pet_array: np.ndarray,
+    reference: nib.Nifti1Image,
+    out_path: Path,
+) -> Path:
+    image = nib.load(str(pet_path))
+    if image.shape == reference.shape and np.allclose(image.affine, reference.affine, atol=1e-3):
+        return pet_path
+    _save_image(np.asarray(pet_array, dtype=np.float32), reference, out_path)
+    return out_path
+
+
+def _annotate_reverse(
+    rows: list[dict],
+    baseline_labels: np.ndarray,
+    interim_labels: np.ndarray,
+    interim_pet: np.ndarray,
+    organs: np.ndarray | None,
+) -> None:
+    if interim_labels.shape != baseline_labels.shape or interim_pet.shape != baseline_labels.shape:
+        logger.warning("反向图像与基线网格不一致，跳过反向定量")
+        return
     for row in rows:
-        row["patient_id"] = interim.patient_id
-        row["baseline_date"] = baseline.study_date
-        row["interim_date"] = interim.study_date
-    _write_rows(rows, matches_path)
+        baseline_id = row.get("baseline_lesion_id")
+        interim_id = row.get("interim_lesion_id")
+        if baseline_id != "" and interim_id != "" and row["match_status"] in ("matched", "review"):
+            row["reverse_iou"] = _round(_iou(
+                baseline_labels, int(baseline_id), interim_labels, int(interim_id),
+            ))
+        if baseline_id == "" or row["match_status"] not in ("resolved", "unmatched"):
+            continue
+        mask = baseline_labels == int(baseline_id)
+        if organs is not None and organs.shape == mask.shape:
+            kept = mask & ~np.isin(organs, PHYSIOLOGIC_ORGANS)
+            if np.any(kept):
+                mask = kept
+        values = np.asarray(interim_pet, dtype=np.float64)[mask]
+        values = values[np.isfinite(values)]
+        row["reverse_residual_suv_max"] = _round(float(values.max()) if values.size else float("nan"))
+
+
+def _radiomics_catalog(
+    baseline: StudyAssets,
+    interim: StudyAssets,
+    baseline_labels: np.ndarray,
+    baseline_meta: dict[int, dict],
+    baseline_pet_image: nib.Nifti1Image,
+    interim_labels: np.ndarray,
+    interim_meta: dict[int, dict],
+    interim_reference: nib.Nifti1Image,
+    interim_pet: np.ndarray,
+) -> dict[tuple[str, int], dict]:
+    if not _pyradiomics_available():
+        logger.warning("未安装 pyradiomics，跳过组学")
+        return {}
+    catalog: dict[tuple[str, int], dict] = {}
+    catalog.update(_radiomics_for_timepoint(
+        "baseline", baseline.pet_iso, baseline.ct_iso, baseline_labels, baseline_meta, baseline_pet_image,
+    ))
+    interim_pet_path = _pet_file_on_reference(
+        interim.pet_iso, interim_pet, interim_reference,
+        interim.processed_dir / "longitudinal" / "match" / "interim_pet_on_ct.nii.gz",
+    )
+    catalog.update(_radiomics_for_timepoint(
+        "interim", interim_pet_path, interim.ct_iso, interim_labels, interim_meta, interim_reference,
+    ))
+    return catalog
+
+
+def _radiomics_for_timepoint(
+    timepoint: str,
+    pet_path: Path | None,
+    ct_path: Path | None,
+    labels: np.ndarray,
+    meta: dict[int, dict],
+    reference: nib.Nifti1Image,
+) -> dict[tuple[str, int], dict]:
+    import tempfile
+
+    if pet_path is None or not pet_path.is_file():
+        return {}
+    ct = ct_path if ct_path is not None and ct_path.is_file() else None
+    found: dict[tuple[str, int], dict] = {}
+    lesion_ids = [label_id for label_id, component in meta.items() if not _component_is_invalid(component)]
+    logger.info("提取 %s 组学，%d 个灶", timepoint, len(lesion_ids))
+    with tempfile.TemporaryDirectory(prefix=f"rad_{timepoint}_") as tmp:
+        mask_path = Path(tmp) / "mask.nii.gz"
+        for label_id in lesion_ids:
+            mask = np.asarray(labels == label_id, dtype=np.uint8)
+            if int(mask.sum()) == 0:
+                continue
+            _save_image(mask, reference, mask_path)
+            features = _extract_radiomics(pet_path, ct, mask_path, label=1)
+            if features:
+                found[(timepoint, int(label_id))] = features
+    return found
+
+
+def _stamp_radiomics(rows: list[dict], features_by_lesion: dict, pairing: str) -> list[dict]:
+    stamped: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        if row["match_status"] == "invalid":
+            continue
+        for timepoint, id_key, date_key in (
+            ("baseline", "baseline_lesion_id", "baseline_date"),
+            ("interim", "interim_lesion_id", "interim_date"),
+        ):
+            lesion_id = row.get(id_key)
+            if lesion_id == "" or lesion_id is None:
+                continue
+            key = (timepoint, int(lesion_id))
+            if key in seen or key not in features_by_lesion:
+                continue
+            seen.add(key)
+            record = {
+                "patient_id": row.get("patient_id", ""),
+                "baseline_date": row.get("baseline_date", ""),
+                "interim_date": row.get("interim_date", ""),
+                "pairing": pairing,
+                "timepoint": timepoint,
+                "study_date": row.get(date_key, ""),
+                "lesion_id": int(lesion_id),
+                "lifecycle": row.get("lifecycle", ""),
+                "match_status": row.get("match_status", ""),
+                "station": row.get("station", ""),
+            }
+            record.update(features_by_lesion[key])
+            stamped.append(record)
+    return stamped
+
+
+def _log_counts(patient_id: str, baseline_date: str, interim_date: str, pairing: str, rows: list[dict]) -> None:
     logger.info(
-        "%s %s→%s 匹配 %d，复核 %d，缓解 %d，未配上 %d，新发 %d，无效 %d",
-        interim.patient_id,
-        baseline.study_date,
-        interim.study_date,
+        "%s %s→%s %s 匹配 %d，复核 %d，缓解 %d，未配上 %d，新发 %d，无效 %d，分裂行 %d",
+        patient_id,
+        baseline_date,
+        interim_date,
+        pairing,
         sum(row["match_status"] == "matched" for row in rows),
         sum(row["match_status"] == "review" for row in rows),
         sum(row["match_status"] == "resolved" for row in rows),
         sum(row["match_status"] == "unmatched" for row in rows),
         sum(row["match_status"] == "new" for row in rows),
         sum(row["match_status"] == "invalid" for row in rows),
+        sum(row["lifecycle"] == "split" for row in rows),
     )
-    return rows
 
 
 def _write_rows(rows: list[dict], path: Path) -> None:
@@ -814,6 +1340,26 @@ def _write_rows(rows: list[dict], path: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in MATCH_FIELDS})
+
+
+def _write_flexible(rows: list[dict], path: Path, preferred: list[str]) -> None:
+    if not rows:
+        return
+    extra = sorted({
+        key for row in rows for key in row
+        if key not in preferred and not str(key).startswith("_")
+    })
+    fields = list(preferred) + extra
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fields})
+
+
+def _hungarian_results_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_hungarian{path.suffix}")
 
 
 def _read_rows(path: Path) -> list[dict]:
@@ -829,6 +1375,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interim-root", type=Path, default=DEFAULT_INTERIM_ROOT)
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT)
     parser.add_argument("--results-csv", type=Path, default=DEFAULT_RESULTS_CSV)
+    parser.add_argument("--response-csv", type=Path, default=DEFAULT_RESPONSE_CSV)
+    parser.add_argument("--radiomics-csv", type=Path, default=DEFAULT_RADIOMICS_CSV)
+    parser.add_argument("--pairing", choices=("greedy", "hungarian", "both"), default="greedy")
+    parser.add_argument("--no-radiomics", action="store_true", help="跳过 pyradiomics")
     parser.add_argument("--ants-bin", type=Path, default=None)
     parser.add_argument("--patient-id", default=None)
     parser.add_argument("--baseline", default=None)
@@ -859,7 +1409,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         from ants_runner import DEFAULT_ANTS_BIN
         ants_bin = DEFAULT_ANTS_BIN
 
-    all_rows: list[dict] = []
+    greedy_rows: list[dict] = []
+    hungarian_rows: list[dict] = []
+    response_rows: list[dict] = []
+    radio_rows: list[dict] = []
     failed = False
     for patient_id, baseline_date, interim_date in pairs:
         baseline = catalog.get_study(patient_id, baseline_date)
@@ -870,22 +1423,41 @@ def main(argv: Optional[list[str]] = None) -> int:
             continue
         if args.dry_run:
             logger.info(
-                "[DRY-RUN] %s %s→%s ct=%s mask=%s",
-                patient_id, baseline_date, interim_date, interim.ct_iso, baseline.lesion_auto,
+                "[DRY-RUN] %s %s→%s pairing=%s ct=%s mask=%s",
+                patient_id, baseline_date, interim_date, args.pairing, interim.ct_iso, baseline.lesion_auto,
             )
             continue
         try:
-            all_rows.extend(match_pair(
-                baseline, interim, ants_bin, threads=args.threads, overwrite=args.overwrite,
-            ))
+            result = match_pair(
+                baseline, interim, ants_bin,
+                pairing=args.pairing,
+                radiomics=not args.no_radiomics,
+                threads=args.threads,
+                overwrite=args.overwrite,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("匹配失败 %s %s→%s: %s", patient_id, baseline_date, interim_date, exc)
             failed = True
+            continue
+        greedy_rows.extend(result["rows"].get("greedy", []))
+        hungarian_rows.extend(result["rows"].get("hungarian", []))
+        response_rows.extend(result["response"])
+        radio_rows.extend(result["radiomics"])
     if args.dry_run:
         return 0
-    if all_rows:
-        _write_rows(all_rows, args.results_csv)
-        logger.info("汇总 %d 行 -> %s", len(all_rows), args.results_csv)
+    if greedy_rows:
+        _write_rows(greedy_rows, args.results_csv)
+        logger.info("贪心汇总 %d 行 -> %s", len(greedy_rows), args.results_csv)
+    if hungarian_rows:
+        hungarian_path = _hungarian_results_path(args.results_csv)
+        _write_rows(hungarian_rows, hungarian_path)
+        logger.info("匈牙利汇总 %d 行 -> %s", len(hungarian_rows), hungarian_path)
+    if response_rows:
+        _write_flexible(response_rows, args.response_csv, RESPONSE_FIELDS)
+        logger.info("PERCIST 汇总 %d 行 -> %s", len(response_rows), args.response_csv)
+    if radio_rows:
+        _write_flexible(radio_rows, args.radiomics_csv, RADIOMICS_FIELDS)
+        logger.info("组学汇总 %d 行 -> %s", len(radio_rows), args.radiomics_csv)
     return 1 if failed else 0
 
 

@@ -106,6 +106,9 @@ class LesionMatchTests(unittest.TestCase):
             follow_pet, stations, affine, liver_suv_mean=2.0,
         )
         self.assertEqual([row["match_status"] for row in rows], ["matched"])
+        self.assertEqual(rows[0]["lifecycle"], "persist")
+        self.assertEqual(rows[0]["pct_delta_suv_max"], 50.0)
+        self.assertEqual(rows[0]["qpet_interim"], 3.0)
         self.assertEqual(rows[0]["baseline_lesion_id"], 1)
         self.assertEqual(rows[0]["interim_lesion_id"], 1)
         self.assertEqual(rows[0]["station"], "mediastinum")
@@ -192,6 +195,71 @@ class LesionMatchTests(unittest.TestCase):
         self.assertEqual(len(matched), 2)
         self.assertEqual({row["baseline_lesion_id"] for row in matched}, {1})
         self.assertEqual({row["interim_lesion_id"] for row in matched}, {1, 2})
+        self.assertEqual({row["lifecycle"] for row in matched}, {"split"})
+        self.assertEqual({row["fusion"] for row in matched}, {""})
+
+    def test_hungarian_keeps_one_partner_for_a_large_lesion(self) -> None:
+        shape = (40, 40, 40)
+        baseline = np.zeros(shape, dtype=np.uint16)
+        interim = np.zeros(shape, dtype=np.uint16)
+        baseline[10:24, 10:24, 10:24] = 1
+        interim[1:4, 10:13, 10:13] = 1
+        interim[30:33, 10:13, 10:13] = 2
+        stations = np.full(shape, ST_MEDIASTINUM, dtype=np.uint8)
+        affine = _affine()
+        pet = np.full(shape, 4.0, dtype=np.float32)
+        rows = build_match_rows(
+            baseline, interim,
+            measure_components(baseline, pet, affine),
+            measure_components(interim, pet, affine),
+            pet, stations, affine, liver_suv_mean=2.0,
+            pairing="hungarian",
+        )
+        matched = [row for row in rows if row["match_status"] == "matched"]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["lifecycle"], "persist")
+        self.assertEqual(matched[0]["baseline_lesion_id"], 1)
+        self.assertEqual(sum(row["match_status"] == "new" for row in rows), 1)
+
+    def test_hungarian_hard_station_rejects_bone_and_mediastinum(self) -> None:
+        shape = (16, 16, 16)
+        baseline = np.zeros(shape, dtype=np.uint16)
+        interim = np.zeros(shape, dtype=np.uint16)
+        baseline[2:6, 8:12, 8:12] = 1
+        interim[6:10, 8:12, 8:12] = 1
+        stations = np.zeros(shape, dtype=np.uint8)
+        stations[2:6, 8:12, 8:12] = ST_MEDIASTINUM
+        stations[6:10, 8:12, 8:12] = ST_BONE
+        affine = _affine()
+        pet = np.full(shape, 4.0, dtype=np.float32)
+        rows = build_match_rows(
+            baseline, interim,
+            measure_components(baseline, pet, affine),
+            measure_components(interim, pet, affine),
+            pet, stations, affine, liver_suv_mean=2.0,
+            pairing="hungarian",
+        )
+        self.assertEqual({row["match_status"] for row in rows}, {"unmatched", "new"})
+        self.assertTrue(all(row["quantitative_outlier"] == 1 for row in rows))
+
+    def test_hungarian_dummy_does_not_force_a_distant_pair(self) -> None:
+        shape = (12, 12, 48)
+        baseline = np.zeros(shape, dtype=np.uint16)
+        interim = np.zeros(shape, dtype=np.uint16)
+        baseline[2:6, 2:6, 2:6] = 1
+        interim[2:6, 2:6, 40:44] = 1
+        stations = np.full(shape, ST_MEDIASTINUM, dtype=np.uint8)
+        affine = _affine()
+        pet = np.ones(shape, dtype=np.float32)
+        rows = build_match_rows(
+            baseline, interim,
+            measure_components(baseline, pet, affine),
+            measure_components(interim, pet, affine),
+            pet, stations, affine, liver_suv_mean=1.0,
+            pairing="hungarian",
+        )
+        self.assertEqual({row["match_status"] for row in rows}, {"resolved", "new"})
+        self.assertFalse(any(row["match_status"] == "matched" for row in rows))
 
     def test_extreme_suv_component_is_invalid(self) -> None:
         shape = (12, 12, 12)
