@@ -12,8 +12,9 @@ data/DLBCL预后评估与多维分析技术路线升级版.rtf 的第五至第�
 连通灶少于 10 个体素的不计入，并记录被部分容积效应影响的小灶。
 
 第六阶段：Dmax、病灶数 NOL、脾脏离散度 Spread-Spleen，以及 TMTV/MBV 的
-球形度、GLCM Correlation、GLSZM GrayLevelVariance。PET 固定 bin width
-0.25 SUV，CT 固定 25 HU。Dmax 同时给出除以身高的值。
+全套 IBSI 特征。只在原始图像上计算，特征族为 shape、firstorder、glcm、
+glrlm、glszm、gldm、ngtdm。PET 固定 bin width 0.25 SUV，CT 固定 25 HU，
+不用固定阶数。Dmax 同时给出除以身高的值。
 
 第七阶段：只在 L3 椎体中点层面计算 SMA、SMI、VATI、SATI 和肌肉 SUV。
 层面主导椎体不是 L3 时不计算体成分。肌肉 SUV 去掉病灶重叠和灶内高摄取。
@@ -69,6 +70,19 @@ logger = logging.getLogger("stages_5_8")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PROTOCOL = "stages_5_8_v1"
+IBSI_PROTOCOL = "ibsi_original_v1"
+IBSI_FILTERED_PROTOCOL = "ibsi_wavelet_log_v1"
+IBSI_CLASSES = ("shape", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm")
+# PyRadiomics 默认：一层 coif1 小波得到 8 个子带；LoG 的 sigma 为毫米。
+# 形状特征只来自掩码，不在滤波图像上重复计算。
+# 每个图像因此是 107（原始）+ 8×93（小波）+ 5×93（LoG）= 1316。
+WAVELET_NAME = "coif1"
+LOG_SIGMA_MM = (1.0, 2.0, 3.0, 4.0, 5.0)
+IBSI_BASE_FIELDS = [
+    "患者ID", "姓名", "检查日期", "时间点", "状态", "说明",
+    "掩码来源", "特征数", "单图像特征数", "图像类型", "特征类", "小波", "LoG尺度_mm",
+    "PET分箱宽度", "CT分箱宽度", "协议",
+]
 MIN_VOXELS = 10
 PVE_VOLUME_CM3 = 4.2
 SUV_FRACTION = 0.41
@@ -339,43 +353,85 @@ def _organ_arrays(pet_img: nib.Nifti1Image, organs_path: Path | None, totalseg_p
     return liver, spleen, physio
 
 
-def _radiomics(image_path: Path, mask: np.ndarray, reference: nib.Nifti1Image, bin_width: float) -> dict[str, float]:
-    features = {
-        "sphericity": float("nan"),
-        "glcm_correlation": float("nan"),
-        "glszm_variance": float("nan"),
-    }
+def _radiomics(
+    image_path: Path,
+    mask: np.ndarray,
+    reference: nib.Nifti1Image,
+    bin_width: float,
+    *,
+    filtered: bool = False,
+) -> dict[str, float]:
+    """IBSI 特征族。分箱宽度固定，不重采样，不归一化。filtered 时加上小波和 LoG。"""
     if int(mask.sum()) < MIN_VOXELS:
-        return features
+        return {}
     try:
         from radiomics.featureextractor import RadiomicsFeatureExtractor
     except ImportError:
-        return features
+        return {}
     logging.getLogger("radiomics").setLevel(logging.ERROR)
     import tempfile
 
     extractor = RadiomicsFeatureExtractor()
     extractor.disableAllFeatures()
-    extractor.enableFeaturesByName(
-        shape=["Sphericity"],
-        glcm=["Correlation"],
-        glszm=["GrayLevelVariance"],
-    )
+    extractor.disableAllImageTypes()
+    for feature_class in IBSI_CLASSES:
+        extractor.enableFeatureClassByName(feature_class)
+    if filtered:
+        extractor.enableImageTypes(
+            Original={},
+            Wavelet={"wavelet": WAVELET_NAME, "start_level": 0, "level": 1},
+            LoG={"sigma": list(LOG_SIGMA_MM)},
+        )
+    else:
+        extractor.enableImageTypeByName("Original")
     extractor.settings["binWidth"] = float(bin_width)
+    extractor.settings["normalize"] = False
+    extractor.settings["resampledPixelSpacing"] = None
     extractor.settings["additionalInfo"] = False
     extractor.settings["correctMask"] = True
+    if filtered:
+        extractor.settings["padDistance"] = 10
     try:
         with tempfile.TemporaryDirectory(prefix="stage6_") as tmp:
+            image_for_extract = image_path
+            mask_for_extract = mask
+            affine = reference.affine
+            if filtered:
+                image_for_extract, mask_for_extract, affine = _crop_for_filters(image_path, mask, reference, Path(tmp), pad=10)
             mask_path = Path(tmp) / "mask.nii.gz"
-            nib.save(nib.Nifti1Image(mask.astype(np.uint8), reference.affine), str(mask_path))
-            result = extractor.execute(str(image_path), str(mask_path), label=1)
+            nib.save(nib.Nifti1Image(mask_for_extract.astype(np.uint8), affine), str(mask_path))
+            result = extractor.execute(str(image_for_extract), str(mask_path), label=1)
     except Exception as exc:  # noqa: BLE001 - 单组特征失败时留空并继续
         logger.warning("组学提取失败 %s: %s", image_path, exc)
-        return features
-    features["sphericity"] = float(result.get("original_shape_Sphericity", float("nan")))
-    features["glcm_correlation"] = float(result.get("original_glcm_Correlation", float("nan")))
-    features["glszm_variance"] = float(result.get("original_glszm_GrayLevelVariance", float("nan")))
+        return {}
+    features: dict[str, float] = {}
+    for key, value in result.items():
+        name = str(key)
+        if not (name.startswith("original_") or name.startswith("wavelet-") or name.startswith("log-sigma-")):
+            continue
+        try:
+            features[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
     return features
+
+
+def _crop_for_filters(image_path: Path, mask: np.ndarray, reference: nib.Nifti1Image, tmp: Path, pad: int) -> tuple[Path, np.ndarray, np.ndarray]:
+    """把图像裁到病灶外接盒加 pad，避免小波和 LoG 在全身体积上滤波。"""
+    image = nib.load(str(image_path))
+    if image.shape != mask.shape:
+        raise ValueError(f"图像与掩码尺寸不一致 {image.shape} {mask.shape}")
+    coords = np.argwhere(mask > 0)
+    low = np.maximum(coords.min(axis=0) - pad, 0)
+    high = np.minimum(coords.max(axis=0) + pad + 1, np.array(mask.shape))
+    slices = tuple(slice(int(start), int(stop)) for start, stop in zip(low, high))
+    cropped = np.asanyarray(image.dataobj[slices])
+    affine = image.affine.copy()
+    origin = image.affine @ np.array([low[0], low[1], low[2], 1.0], dtype=float)
+    affine[:3, 3] = origin[:3]
+    out = tmp / "image.nii.gz"
+    nib.save(nib.Nifti1Image(cropped, affine), str(out))
+    return out, np.asanyarray(mask[slices]), affine
 
 
 def _slice_axis(affine: np.ndarray) -> int:
@@ -752,37 +808,56 @@ def _fill_study(stage5, stage6, stage7, study_dir, processed, patient_id, study_
     _fill_body(stage7, ct_orig, total_path if total_path.is_file() else None, pet_img, suv, filtered, demo, notes, stage5)
 
 
-def _fill_radiomics(stage6, suv_path, ct_pre, pet_img, filtered, bulk, notes: list[str]) -> None:
+def _is_feature_column(key: str) -> bool:
+    return "_original_" in key or "_wavelet-" in key or "_log-sigma-" in key
+
+
+def _stamp_features(row: dict[str, object], prefix: str, features: dict[str, float]) -> None:
+    for key, value in features.items():
+        row[f"{prefix}_{key}"] = _num(value, 6)
+
+
+def _fill_radiomics(stage6, suv_path, ct_pre, pet_img, filtered, bulk, notes: list[str], *, use_filters: bool = False) -> None:
     if int(filtered.sum()) < MIN_VOXELS:
         notes.append("无足够病灶体素，未提取组学")
         return
-    pet_all = _radiomics(suv_path, filtered, pet_img, 0.25)
-    pet_bulk = _radiomics(suv_path, bulk, pet_img, 0.25)
-    ct_all = {"glcm_correlation": float("nan"), "glszm_variance": float("nan")}
-    ct_bulk = dict(ct_all)
+    pet_all = _radiomics(suv_path, filtered, pet_img, 0.25, filtered=use_filters)
+    pet_bulk = _radiomics(suv_path, bulk, pet_img, 0.25, filtered=use_filters)
+    ct_all: dict[str, float] = {}
+    ct_bulk: dict[str, float] = {}
     if ct_pre is not None and ct_pre.is_file():
         ct_img = _load(ct_pre)
-        ct_mask = filtered
-        ct_bulk_mask = bulk
         if not _same_grid(ct_img, pet_img):
             notes.append("预处理 CT 与 SUV 网格不一致，CT 组学留空")
         else:
-            ct_all = _radiomics(ct_pre, ct_mask, ct_img, 25.0)
-            ct_bulk = _radiomics(ct_pre, ct_bulk_mask, ct_img, 25.0)
+            ct_all = _radiomics(ct_pre, filtered, ct_img, 25.0, filtered=use_filters)
+            ct_bulk = _radiomics(ct_pre, bulk, ct_img, 25.0, filtered=use_filters)
     else:
         notes.append("缺少预处理体部 CT，CT 组学留空")
-    stage6.update({
-        "TMTV_球形度": _num(pet_all["sphericity"]),
-        "TMTV_PET_GLCM相关": _num(pet_all["glcm_correlation"]),
-        "TMTV_PET_GLSZM灰度方差": _num(pet_all["glszm_variance"]),
-        "TMTV_CT_GLCM相关": _num(ct_all["glcm_correlation"]),
-        "TMTV_CT_GLSZM灰度方差": _num(ct_all["glszm_variance"]),
-        "MBV_球形度": _num(pet_bulk["sphericity"]),
-        "MBV_PET_GLCM相关": _num(pet_bulk["glcm_correlation"]),
-        "MBV_PET_GLSZM灰度方差": _num(pet_bulk["glszm_variance"]),
-        "MBV_CT_GLCM相关": _num(ct_bulk["glcm_correlation"]),
-        "MBV_CT_GLSZM灰度方差": _num(ct_bulk["glszm_variance"]),
-    })
+    _stamp_features(stage6, "TMTV_PET", pet_all)
+    _stamp_features(stage6, "MBV_PET", pet_bulk)
+    _stamp_features(stage6, "TMTV_CT", ct_all)
+    _stamp_features(stage6, "MBV_CT", ct_bulk)
+    stage6["TMTV_球形度"] = stage6.get("TMTV_PET_original_shape_Sphericity", "")
+    stage6["TMTV_PET_GLCM相关"] = stage6.get("TMTV_PET_original_glcm_Correlation", "")
+    stage6["TMTV_PET_GLSZM灰度方差"] = stage6.get("TMTV_PET_original_glszm_GrayLevelVariance", "")
+    stage6["TMTV_CT_GLCM相关"] = stage6.get("TMTV_CT_original_glcm_Correlation", "")
+    stage6["TMTV_CT_GLSZM灰度方差"] = stage6.get("TMTV_CT_original_glszm_GrayLevelVariance", "")
+    stage6["MBV_球形度"] = stage6.get("MBV_PET_original_shape_Sphericity", "")
+    stage6["MBV_PET_GLCM相关"] = stage6.get("MBV_PET_original_glcm_Correlation", "")
+    stage6["MBV_PET_GLSZM灰度方差"] = stage6.get("MBV_PET_original_glszm_GrayLevelVariance", "")
+    stage6["MBV_CT_GLCM相关"] = stage6.get("MBV_CT_original_glcm_Correlation", "")
+    stage6["MBV_CT_GLSZM灰度方差"] = stage6.get("MBV_CT_original_glszm_GrayLevelVariance", "")
+    stage6["特征数"] = sum(1 for key, value in stage6.items() if _is_feature_column(key) and value != "")
+    stage6["单图像特征数"] = sum(
+        1 for key, value in stage6.items() if key.startswith("TMTV_PET_") and _is_feature_column(key) and value != ""
+    )
+    stage6["图像类型"] = "Original,Wavelet,LoG" if use_filters else "Original"
+    stage6["特征类"] = ",".join(IBSI_CLASSES)
+    if use_filters:
+        stage6["小波"] = f"{WAVELET_NAME} level 1，8 个子带"
+        stage6["LoG尺度_mm"] = ",".join(str(sigma) for sigma in LOG_SIGMA_MM)
+        stage6["协议"] = IBSI_FILTERED_PROTOCOL
 
 
 def _fill_body(stage7, ct_orig, total_path, pet_img, suv, lesion, demo, notes: list[str], stage5=None) -> None:
@@ -976,8 +1051,15 @@ def _map_baseline_roi(patient_id: str, baseline_date: str, interim_date: str, ro
 
 def _write_table(path: Path, fields: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    extras: list[str] = []
+    seen = set(fields)
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                extras.append(key)
+                seen.add(key)
     with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=list(fields) + sorted(extras), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1016,6 +1098,152 @@ def _assign_roles(studies: list[dict]) -> None:
                 item[key]["时间点"] = role
 
 
+def _timepoint_lookup(output_dir: Path) -> dict[tuple[str, str], str]:
+    path = output_dir / "stage5_metabolic.csv"
+    if not path.is_file():
+        return {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        return {
+            (row["患者ID"], row["检查日期"]): row.get("时间点", "")
+            for row in csv.DictReader(handle)
+        }
+
+
+def ibsi_for_study(payload: dict) -> dict[str, object]:
+    """只重算第六阶段的全套 IBSI 特征，不改代谢负荷和体成分。"""
+    patient_id = payload["patient_id"]
+    study_date = payload["study_date"]
+    study_dir = Path(payload["study_dir"])
+    processed = Path(payload["processed_root"])
+    row = _blank(IBSI_BASE_FIELDS)
+    row.update({
+        "患者ID": patient_id,
+        "姓名": payload["name"],
+        "检查日期": study_date,
+        "时间点": payload.get("timepoint", ""),
+        "图像类型": "Original",
+        "特征类": ",".join(IBSI_CLASSES),
+        "PET分箱宽度": 0.25,
+        "CT分箱宽度": 25,
+        "协议": IBSI_FILTERED_PROTOCOL if payload.get("use_filters") else IBSI_PROTOCOL,
+        "状态": "ok",
+    })
+    notes: list[str] = []
+    try:
+        suv_path = _wb_suv(study_dir)
+        ct_pre = _wb_ct(study_dir, preprocessed=True)
+        mask_path, mask_source = _lesion_path(processed, patient_id, study_date)
+        organs_path = processed / patient_id / study_date / "organs" / "organs.nii.gz"
+        total_path = processed / patient_id / study_date / "organs" / "_totalseg_staging" / "totalseg_wholebody.nii.gz"
+        row["掩码来源"] = mask_source
+        if suv_path is None:
+            row["状态"] = "warning"
+            row["说明"] = "缺少体部 SUVbw"
+            return row
+        pet_img = _load(suv_path)
+        suv = _finite(np.asanyarray(pet_img.dataobj))
+        lesion = np.zeros(pet_img.shape, dtype=bool)
+        raw_voxels = 0
+        if mask_path is not None:
+            mask_img = _load(mask_path)
+            if not _same_grid(mask_img, pet_img):
+                mask_img = resample_from_to(mask_img, (pet_img.shape, pet_img.affine), order=0)
+                notes.append("病灶掩码已重采样到 SUV 网格")
+            lesion = np.asanyarray(mask_img.dataobj) > 0
+            raw_voxels = int(lesion.sum())
+        if raw_voxels == 0:
+            liver, _spleen, physio = _organ_arrays(
+                pet_img,
+                organs_path if organs_path.is_file() else None,
+                total_path if total_path.is_file() else None,
+            )
+            liver_mean, liver_q3 = _liver_stats(suv, liver, lesion)
+            lesion, _threshold, basis = _fallback_mask(suv, liver_mean, liver_q3, physio)
+            row["掩码来源"] = "fallback_41pct_liver" if int(lesion.sum()) else "fallback_empty"
+            if row["掩码来源"] == "fallback_empty":
+                notes.append(basis or "降级分割未得到病灶")
+        filtered, _kept, dropped = _components(lesion, MIN_VOXELS)
+        if drop := dropped:
+            notes.append(f"剔除小于 {MIN_VOXELS} 体素的连通灶 {drop} 个")
+        bulk = _bulk_mask(filtered)
+        _fill_radiomics(row, suv_path, ct_pre, pet_img, filtered, bulk, notes, use_filters=bool(payload.get("use_filters")))
+        if int(row.get("特征数") or 0) == 0:
+            row["状态"] = "warning"
+    except Exception as exc:  # noqa: BLE001 - 单例失败继续
+        logger.error("%s %s IBSI 失败: %s", patient_id, study_date, exc)
+        row["状态"] = "error"
+        notes.append(f"{type(exc).__name__}: {exc}")
+    if notes:
+        row["说明"] = "；".join(notes)
+    return row
+
+
+def run_ibsi(args: argparse.Namespace, names: dict[str, str], *, filtered: bool = False) -> int:
+    protocol = IBSI_FILTERED_PROTOCOL if filtered else IBSI_PROTOCOL
+    image_types = "Original、Wavelet(coif1 八个子带)、LoG sigma 1–5 mm" if filtered else "原始图像"
+    logger.info("IBSI 协议 %s，特征类 %s，图像 %s", protocol, ",".join(IBSI_CLASSES), image_types)
+    studies = discover_subject_studies(args.interim_root)
+    if args.patient_id:
+        studies = [item for item in studies if item[0] == args.patient_id]
+    stem = "stage6_ibsi_filtered" if filtered else "stage6_ibsi"
+    jsonl_path = args.output_dir / f"{stem}.jsonl"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    done: set[tuple[str, str]] = set()
+    rows: list[dict] = []
+    if args.resume and jsonl_path.is_file():
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            key = (record["患者ID"], record["检查日期"])
+            if key in done:
+                continue
+            done.add(key)
+            rows.append(record)
+        logger.info("续跑，已有 IBSI %d 次检查", len(done))
+    elif jsonl_path.exists() and not args.patient_id:
+        jsonl_path.unlink()
+    roles = _timepoint_lookup(args.output_dir)
+    studies = [item for item in studies if (item[0], item[1]) not in done]
+    logger.info("待提取 IBSI %d", len(studies))
+    payloads = []
+    for patient_id, study_date, study_dir in studies:
+        payloads.append({
+            "patient_id": patient_id,
+            "study_date": study_date,
+            "study_dir": str(study_dir),
+            "processed_root": str(args.processed_root),
+            "name": names.get(patient_id.lstrip("0") or "0", ""),
+            "timepoint": roles.get((patient_id, study_date), ""),
+            "use_filters": filtered,
+        })
+
+    def store(record: dict) -> None:
+        rows.append(record)
+        with jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    if args.workers > 1:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(ibsi_for_study, payload) for payload in payloads]
+            for finished, future in enumerate(as_completed(futures), start=1):
+                store(future.result())
+                if finished % 10 == 0 or finished == len(futures):
+                    logger.info("IBSI 已完成 %d/%d", finished, len(futures))
+    else:
+        for index, payload in enumerate(payloads, start=1):
+            store(ibsi_for_study(payload))
+            logger.info("IBSI 已完成 %d/%d %s %s", index, len(payloads), payload["patient_id"], payload["study_date"])
+    rows.sort(key=lambda item: (item["患者ID"], item["检查日期"]))
+    csv_path = args.output_dir / f"{stem}_radiomics.csv"
+    _write_table(csv_path, IBSI_BASE_FIELDS, rows)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[str(row["状态"])] = counts.get(str(row["状态"]), 0) + 1
+    logger.info("IBSI %s，写出 %s", counts, csv_path)
+    return 1 if counts.get("error") else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="提取第五至第八阶段量化指标。")
     parser.add_argument("--interim-root", type=Path, default=PROJECT_ROOT / "data" / "interim")
@@ -1026,7 +1254,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--patient-id", default=None)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--skip-radiomics", action="store_true")
-    parser.add_argument("--resume", action="store_true", help="跳过 studies.jsonl 里已经完成的检查")
+    parser.add_argument("--resume", action="store_true", help="跳过已经完成的检查")
+    parser.add_argument("--radiomics-only", action="store_true", help="只重算第六阶段的全套 IBSI 原始特征")
+    parser.add_argument("--radiomics-filtered", action="store_true", help="提取原始、小波和 LoG 的高通量 IBSI 特征")
     args = parser.parse_args(argv)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1047,6 +1277,8 @@ def main(argv: list[str] | None = None) -> int:
 
     names, sexes = _read_excel(args.excel)
     logger.info("Excel 姓名 %d 条", len(names))
+    if args.radiomics_filtered or args.radiomics_only:
+        return run_ibsi(args, names, filtered=args.radiomics_filtered)
     demographics = _dicom_demographics(args.data_root)
     logger.info("DICOM 人口学 %d 次检查", len(demographics))
     args.output_dir.mkdir(parents=True, exist_ok=True)
