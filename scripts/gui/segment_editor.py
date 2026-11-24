@@ -117,6 +117,7 @@ class SegmentEditorDialog(QDialog):
             view.item.paint_at.connect(lambda x, y, er: self._paint(x, y, er))
             view.item.stroke_finished.connect(self._end_stroke)
             view.slice_scroll.connect(self._scroll_slice)
+            view._zoom.zoom_changed.connect(self._sync_zoom)
             view.set_wheel_dpi(wheel_dpi)
             self._cells[mode] = view
             views_row.addWidget(view, 1)
@@ -217,7 +218,7 @@ class SegmentEditorDialog(QDialog):
         self.spin_dpi.setRange(10, 400)
         self.spin_dpi.setSingleStep(10)
         self.spin_dpi.setValue(int(np.clip(wheel_dpi, 10, 400)))
-        self.spin_dpi.setToolTip("100 约为一格滚轮翻一层。数值越小，翻层越慢。")
+        self.spin_dpi.setToolTip("每一格滚轮只翻一层。数值越小，下一层要等得越久。")
         self.spin_dpi.valueChanged.connect(self._apply_wheel_dpi)
         ctrl.addWidget(QLabel("鼠标 DPI"))
         ctrl.addWidget(self.spin_dpi)
@@ -349,6 +350,11 @@ class SegmentEditorDialog(QDialog):
         super().showEvent(ev)
         for view in self._cells.values():
             view.set_zoom(view._zoom_percent)
+
+    def _sync_zoom(self, percent: int) -> None:
+        for view in self._cells.values():
+            if view._zoom_percent != int(percent):
+                view.set_zoom(int(percent))
 
     def _apply_wheel_dpi(self, dpi: int) -> None:
         for view in self._cells.values():

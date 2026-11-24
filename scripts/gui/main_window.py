@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QToolBar,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 _SCRIPTS = Path(__file__).resolve().parents[1]
@@ -184,9 +185,11 @@ class MainWindow(QMainWindow):
         self.ortho.chk_native.toggled.connect(self._refresh_evolution)
         self.ortho.chk_mapped.toggled.connect(self._refresh_evolution)
         self.ortho.combo_cmap.currentIndexChanged.connect(self._refresh_evolution)
+        self.ortho.display_params_changed.connect(self._refresh_evolution)
         self.ortho.mask_changed.connect(self._refresh_lesion_table)
         self.ortho.cursor_changed.connect(self._sync_mip_cursor)
         self.ortho.role_requested.connect(self._on_role_view)
+        self.ortho.tool_hint_changed.connect(self._on_tool_hint)
         self.edit_panel.segment_requested.connect(self._on_segment)
         self.edit_panel.morph_requested.connect(self._on_morph)
         self.edit_panel.relabel_requested.connect(self._on_relabel)
@@ -199,6 +202,14 @@ class MainWindow(QMainWindow):
         self.browser.populate(self.catalog)
         n = len(self.catalog.patient_ids())
         self.status.showMessage(f"已索引 {n} 名患者")
+
+    def _on_tool_hint(self, hint: str) -> None:
+        previous = getattr(self, "_tool_hint_text", "")
+        self._tool_hint_text = hint
+        if hint:
+            self.status.showMessage(hint)
+        elif self.status.currentMessage() == previous:
+            self.status.clearMessage()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
@@ -235,6 +246,8 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
 
+        self._build_settings_menu()
+
         view_menu = self.menuBar().addMenu("视图")
         self.act_show_browser = QAction("显示患者列表", self)
         self.act_show_browser.setCheckable(True)
@@ -248,10 +261,43 @@ class MainWindow(QMainWindow):
         self.act_auto_hide.setChecked(True)
         view_menu.addAction(self.act_auto_hide)
 
+        self.act_show_mip = QAction("显示 MIP", self)
+        self.act_show_mip.setCheckable(True)
+        self.act_show_mip.setChecked(True)
+        self.act_show_mip.toggled.connect(self._set_mip_visible)
+        view_menu.addAction(self.act_show_mip)
+
         help_menu = self.menuBar().addMenu("帮助")
         act_about = QAction("关于", self)
         act_about.triggered.connect(self._about)
         help_menu.addAction(act_about)
+
+    def _build_settings_menu(self) -> None:
+        menu = self.menuBar().addMenu("设置")
+        self.act_crosshair = QAction("十字线", self)
+        self.act_crosshair.setCheckable(True)
+        self.act_crosshair.setChecked(self.ortho.chk_crosshair.isChecked())
+        self.act_crosshair.toggled.connect(self.ortho.chk_crosshair.setChecked)
+        menu.addAction(self.act_crosshair)
+
+        dpi_host = QWidget()
+        dpi_row = QHBoxLayout(dpi_host)
+        dpi_row.setContentsMargins(12, 4, 12, 4)
+        dpi_row.addWidget(QLabel("鼠标 DPI"))
+        dpi_row.addWidget(self.ortho.spin_dpi)
+        dpi_action = QWidgetAction(self)
+        dpi_action.setDefaultWidget(dpi_host)
+        menu.addAction(dpi_action)
+
+        render_host = QWidget()
+        render_row = QHBoxLayout(render_host)
+        render_row.setContentsMargins(12, 4, 12, 4)
+        render_row.addWidget(QLabel("渲染"))
+        render_row.addWidget(self.ortho.combo_render)
+        render_row.addWidget(self.ortho.lbl_cuda)
+        render_action = QWidgetAction(self)
+        render_action.setDefaultWidget(render_host)
+        menu.addAction(render_action)
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("视图")
@@ -263,6 +309,14 @@ class MainWindow(QMainWindow):
         self.btn_patients.setToolTip("显示 / 隐藏患者列表（F2）")
         self.btn_patients.clicked.connect(self._set_browser_visible)
         tb.addWidget(self.btn_patients)
+        self.btn_mip = QPushButton("MIP")
+        self.btn_mip.setCheckable(True)
+        self.btn_mip.setChecked(True)
+        self.btn_mip.setToolTip("显示或关闭下方 MIP 窗口")
+        self.btn_mip.toggled.connect(self._set_mip_visible)
+        tb.addWidget(self.btn_mip)
+        tb.addWidget(self.ortho.control_bar)
+        self._mip_height = 0
 
     def _set_browser_visible(self, visible: bool) -> None:
         sizes = self._main_split.sizes()
@@ -292,6 +346,28 @@ class MainWindow(QMainWindow):
         self.btn_patients.blockSignals(True)
         self.btn_patients.setChecked(bool(visible))
         self.btn_patients.blockSignals(False)
+
+    def _set_mip_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        self.act_show_mip.blockSignals(True)
+        self.btn_mip.blockSignals(True)
+        self.act_show_mip.setChecked(visible)
+        self.btn_mip.setChecked(visible)
+        self.act_show_mip.blockSignals(False)
+        self.btn_mip.blockSignals(False)
+        if self.evolution.isVisible() == visible:
+            return
+        sizes = self._center_split.sizes()
+        total = max(sum(sizes), self._center_split.height(), 1)
+        self.evolution.setVisible(visible)
+        if visible:
+            mip_h = self._mip_height or max(int(total * 0.22), 160)
+            self._center_split.setSizes([max(total - mip_h, 1), mip_h])
+            self._refresh_evolution()
+        else:
+            if sizes[1] > 12:
+                self._mip_height = sizes[1]
+            self._center_split.setSizes([total, 0])
 
     def _fit_to_screen(self) -> None:
         """按当前显示器可用区域缩放窗口，并设置分栏比例。"""
@@ -588,6 +664,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"已保存会话 {self.current_patient}")
 
     def _refresh_evolution(self) -> None:
+        if not self.evolution.isVisible():
+            return
         if not self.current_patient:
             self.evolution.clear()
             return
