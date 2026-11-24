@@ -4,26 +4,15 @@
 autoPET/
 
 # =============================================
-# 原始 / 中间 / 处理后数据（体积大，不上传）
+# 数据与结果目录（本地保留，不上传）
+# 已经入库的 .gitkeep 和讲课材料仍保留在历史中
 # =============================================
-data/raw/**
-!data/raw/.gitkeep
-data/interim/**
-!data/interim/.gitkeep
-data/processed/**
-!data/processed/.gitkeep
-data/nnunet_export/**
-!data/nnunet_export/.gitkeep
-data/qc/**
-!data/qc/.gitkeep
-
-# 结果中的大文件与模型权重（表格/小图可按需取消忽略）
-results/models/**
-!results/models/.gitkeep
-results/figures/**
-!results/figures/.gitkeep
-results/tables/**
-!results/tables/.gitkeep
+data/**
+!data/**/
+!data/**/.gitkeep
+results/**
+!results/**/
+!results/**/.gitkeep
 
 # =============================================
 # 医学影像与 DICOM 相关
