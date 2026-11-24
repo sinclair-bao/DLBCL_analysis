@@ -52,7 +52,7 @@ from mask_ops import (
     relabel_by_volume,
     threshold_pet_mask,
 )
-from ortho_viewer import _RgbView, configure_render_combo
+from ortho_viewer import _RgbView, configure_render_combo, DEFAULT_WHEEL_DPI
 from render_backend import GpuVolumeCache, compose_plane_cpu, gpu_available
 from volume_io import VolumeSet
 
@@ -70,6 +70,7 @@ class SegmentEditorDialog(QDialog):
         *,
         pet_cmap: str = DEFAULT_PET_CMAP,
         render_device: str = "cpu",
+        wheel_dpi: int = DEFAULT_WHEEL_DPI,
         reference_mask: np.ndarray | None = None,
         require_change: bool = False,
     ) -> None:
@@ -116,6 +117,7 @@ class SegmentEditorDialog(QDialog):
             view.item.paint_at.connect(lambda x, y, er: self._paint(x, y, er))
             view.item.stroke_finished.connect(self._end_stroke)
             view.slice_scroll.connect(self._scroll_slice)
+            view.set_wheel_dpi(wheel_dpi)
             self._cells[mode] = view
             views_row.addWidget(view, 1)
 
@@ -167,7 +169,7 @@ class SegmentEditorDialog(QDialog):
         for label, key in PET_CMAP_CHOICES:
             self.combo_cmap.addItem(label, key)
         idx = self.combo_cmap.findData(pet_cmap)
-        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
+        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 0)
         for w in (self.spin_wl, self.spin_ww, self.spin_suv_min, self.spin_suv_max, self.spin_alpha):
             w.valueChanged.connect(lambda _: self.refresh(False))
         self.combo_cmap.currentIndexChanged.connect(lambda _: self.refresh(False))
@@ -211,6 +213,14 @@ class SegmentEditorDialog(QDialog):
         ctrl.addWidget(self.spin_alpha)
         ctrl.addWidget(QLabel("配色"))
         ctrl.addWidget(self.combo_cmap)
+        self.spin_dpi = QSpinBox()
+        self.spin_dpi.setRange(10, 400)
+        self.spin_dpi.setSingleStep(10)
+        self.spin_dpi.setValue(int(np.clip(wheel_dpi, 10, 400)))
+        self.spin_dpi.setToolTip("100 约为一格滚轮翻一层。数值越小，翻层越慢。")
+        self.spin_dpi.valueChanged.connect(self._apply_wheel_dpi)
+        ctrl.addWidget(QLabel("鼠标 DPI"))
+        ctrl.addWidget(self.spin_dpi)
         ctrl.addWidget(QLabel("渲染"))
         ctrl.addWidget(self.combo_render)
         ctrl.addWidget(self.lbl_cuda)
@@ -338,7 +348,11 @@ class SegmentEditorDialog(QDialog):
     def showEvent(self, ev) -> None:
         super().showEvent(ev)
         for view in self._cells.values():
-            view.set_zoom(100)
+            view.set_zoom(view._zoom_percent)
+
+    def _apply_wheel_dpi(self, dpi: int) -> None:
+        for view in self._cells.values():
+            view.set_wheel_dpi(int(dpi))
 
     def edited_mask(self) -> np.ndarray:
         return self._vol.native
@@ -450,7 +464,7 @@ class SegmentEditorDialog(QDialog):
             view.set_laterality(plane)
         self.refresh(update_table=False, force=True)
         for view in self._cells.values():
-            view.set_zoom(100)
+            view.set_zoom(view._zoom_percent)
 
     def _set_ijk(self, i: int, j: int, k: int) -> None:
         self.slider_i.blockSignals(True)

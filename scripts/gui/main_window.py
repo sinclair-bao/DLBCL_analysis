@@ -1041,6 +1041,7 @@ class MainWindow(QMainWindow):
             self,
             pet_cmap=self.ortho.pet_cmap(),
             render_device=self.ortho.render_device(),
+            wheel_dpi=self.ortho.wheel_dpi(),
             reference_mask=original,
             require_change=require_change,
         )

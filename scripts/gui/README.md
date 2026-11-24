@@ -179,7 +179,7 @@ CSV 必需列：`patient_id,study_date,ct_path,pet_path,pet_units`；可选列�
 | 视图 → 选择检查后自动隐藏患者列表 | 默认开启 |
 | 帮助 → 关于 | 简要说明 overlay 颜色与映射 |
 
-三视图滚轮翻动当前视图的层面（向上层号加一，向下减一）；缩放用百分比框。MIP 条滚轮仍改统一缩放（50%–400%）。
+三视图滚轮翻动当前视图的层面。工具栏 **鼠标 DPI** 调节快慢：100 约为一格滚轮翻一层，默认 40，数值越小翻得越慢。每个视图右上角是该视图的缩放百分比，鼠标放在数字上按住左键向右放大、向左缩小（50%–400%）。MIP 条滚轮仍改统一缩放。
 
 ### 3.2 Overlay 与朝向
 
@@ -189,7 +189,7 @@ CSV 必需列：`patient_id,study_date,ct_path,pet_path,pet_units`；可选列�
 | 当前选中灶 | 黄 | 编号表里选中的连通域 |
 | 映射 mask | 青 | 基线病灶床 warp 到**当前随访** |
 
-PET 与 MIP 默认 **PET 热金** 伪彩色（工具栏 **配色** 可选灰度 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。工具栏 **渲染** 可在 CPU / GPU 间切换：仍画到现有 pyqtgraph `ImageItem`；GPU 用 CuPy 缓存最近两次检查的 CT/PET/mask，滚层只改切片下标，合成 RGB 后再下载。无 CuPy/CUDA 时 GPU 项禁用，旁注「无 CUDA」。
+PET 与 MIP 默认 **灰度**（工具栏 **配色** 可选 PET 热金 / Hot / Jet / Inferno）；mask 仍用红/黄/青。融合图里的 PET 与「仅 PET」共用该 LUT。工具栏 **渲染** 可在 CPU / GPU 间切换：仍画到现有 pyqtgraph `ImageItem`；GPU 用 CuPy 缓存最近两次检查的 CT/PET/mask，滚层只改切片下标，合成 RGB 后再下载。无 CuPy/CUDA 时 GPU 项禁用，旁注「无 CUDA」。
 
 朝向为放射科惯例（RAS 体积，画面左 = 患者右）：
 

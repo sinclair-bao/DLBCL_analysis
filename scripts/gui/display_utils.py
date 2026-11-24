@@ -98,7 +98,7 @@ PET_CMAP_CHOICES: tuple[tuple[str, str], ...] = (
     ("Jet", "jet"),
     ("Inferno", "inferno"),
 )
-DEFAULT_PET_CMAP = "pet"
+DEFAULT_PET_CMAP = "gray"
 
 
 def ct_window_from_wl(wl: float, ww: float) -> tuple[float, float]:

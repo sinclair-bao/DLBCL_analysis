@@ -47,6 +47,67 @@ _LAT_STYLE = (
     "QLabel { color: #f2f2f2; background: rgba(10, 10, 10, 165); "
     "padding: 1px 6px; border-radius: 3px; font-weight: 600; font-size: 12px; }"
 )
+_ZOOM_STYLE = (
+    "QLabel { color: #f2f2f2; background: rgba(10, 10, 10, 165); "
+    "padding: 2px 8px; border-radius: 3px; font-weight: 600; font-size: 12px; }"
+)
+ZOOM_MIN = 50
+ZOOM_MAX = 400
+DEFAULT_WHEEL_DPI = 40
+WHEEL_DPI_MIN = 10
+WHEEL_DPI_MAX = 400
+
+
+class _ZoomBadge(QLabel):
+    """视口右上角的缩放值。按住左键向右放大，向左缩小。"""
+
+    zoom_changed = Signal(int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__("100%", parent)
+        self._percent = 100
+        self._origin_x = 0.0
+        self._origin_percent = 100
+        self._dragging = False
+        self.setStyleSheet(_ZOOM_STYLE)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip("按住左键向右放大，向左缩小")
+        self.adjustSize()
+
+    def percent(self) -> int:
+        return self._percent
+
+    def set_percent(self, percent: int) -> None:
+        percent = int(np.clip(percent, ZOOM_MIN, ZOOM_MAX))
+        if percent == self._percent and self.text() == f"{percent}%":
+            return
+        self._percent = percent
+        self.setText(f"{percent}%")
+        self.adjustSize()
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(ev)
+            return
+        self._dragging = True
+        self._origin_x = float(ev.globalPosition().x())
+        self._origin_percent = self._percent
+        ev.accept()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if not self._dragging:
+            super().mouseMoveEvent(ev)
+            return
+        dx = float(ev.globalPosition().x()) - self._origin_x
+        percent = int(np.clip(round(self._origin_percent + dx / 2.0), ZOOM_MIN, ZOOM_MAX))
+        if percent != self._percent:
+            self.set_percent(percent)
+            self.zoom_changed.emit(percent)
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        self._dragging = False
+        ev.accept()
 
 
 class _LateralityMixin:
@@ -161,6 +222,12 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         self.box.addItem(self.hline)
         self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
         self._init_laterality(view_name)
+        self._zoom_percent = 100
+        self.wheel_dpi = DEFAULT_WHEEL_DPI
+        self._wheel_acc = 0.0
+        self._zoom = _ZoomBadge(self)
+        self._zoom.zoom_changed.connect(self.set_zoom)
+        self._place_zoom()
 
     def wheelEvent(self, ev) -> None:
         delta = ev.angleDelta().y()
@@ -169,14 +236,29 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         if delta == 0:
             ev.ignore()
             return
-        steps = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        self._wheel_acc += float(delta)
+        threshold = 12000.0 / max(int(self.wheel_dpi), 1)
+        steps = int(self._wheel_acc / threshold)
         if steps:
+            self._wheel_acc -= steps * threshold
             self.slice_scroll.emit(steps)
         ev.accept()
+
+    def set_wheel_dpi(self, dpi: int) -> None:
+        self.wheel_dpi = int(np.clip(dpi, WHEEL_DPI_MIN, WHEEL_DPI_MAX))
+        self._wheel_acc = 0.0
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
         self._place_laterality()
+        self._place_zoom()
+
+    def _place_zoom(self) -> None:
+        if not hasattr(self, "_zoom"):
+            return
+        margin = 8
+        self._zoom.move(max(margin, self.width() - self._zoom.width() - margin), margin)
+        self._zoom.raise_()
 
     def set_crosshair(self, col: float, row: float) -> None:
         pos = (float(col), float(row))
@@ -198,8 +280,14 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
             self.item.updateImage()
         else:
             self.item.setImage(img, autoLevels=False)
+            self.set_zoom(self._zoom_percent)
 
     def set_zoom(self, percent: int) -> None:
+        percent = int(np.clip(percent, ZOOM_MIN, ZOOM_MAX))
+        self._zoom_percent = percent
+        if hasattr(self, "_zoom"):
+            self._zoom.set_percent(percent)
+            self._place_zoom()
         if self.item.image is None:
             return
         h, w = self.item.image.shape[:2]
@@ -313,13 +401,13 @@ class OrthoViewer(QWidget):
         self.spin_wl.valueChanged.connect(lambda *_: self.refresh(True))
         self.spin_ww.valueChanged.connect(lambda *_: self.refresh(True))
 
-        self.spin_zoom = QSpinBox()
-        self.spin_zoom.setRange(50, 400)
-        self.spin_zoom.setValue(100)
-        self.spin_zoom.setSuffix("%")
-        self.spin_zoom.valueChanged.connect(self._apply_zoom)
-        self.btn_zoom_reset = QPushButton("复位")
-        self.btn_zoom_reset.clicked.connect(lambda: self.spin_zoom.setValue(100))
+        self.spin_dpi = QSpinBox()
+        self.spin_dpi.setRange(WHEEL_DPI_MIN, WHEEL_DPI_MAX)
+        self.spin_dpi.setSingleStep(10)
+        self.spin_dpi.setValue(DEFAULT_WHEEL_DPI)
+        self.spin_dpi.setToolTip("100 约为一格滚轮翻一层。数值越小，翻层越慢。")
+        self.spin_dpi.valueChanged.connect(self._apply_wheel_dpi)
+        self._apply_wheel_dpi(self.spin_dpi.value())
 
         self.spin_brush = QSpinBox()
         self.spin_brush.setRange(3, 15)
@@ -330,7 +418,7 @@ class OrthoViewer(QWidget):
         for label, key in PET_CMAP_CHOICES:
             self.combo_cmap.addItem(label, key)
         idx = self.combo_cmap.findData(DEFAULT_PET_CMAP)
-        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 1)
+        self.combo_cmap.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo_cmap.currentIndexChanged.connect(lambda *_: self.refresh(True))
 
         self.combo_render = QComboBox()
@@ -346,7 +434,7 @@ class OrthoViewer(QWidget):
             self.spin_suv_max,
             self.spin_wl,
             self.spin_ww,
-            self.spin_zoom,
+            self.spin_dpi,
             self.spin_brush,
         ):
             spin.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -378,7 +466,7 @@ class OrthoViewer(QWidget):
         add_section(QLabel("窗位"), self.spin_wl, QLabel("窗宽"), self.spin_ww,
                     self.lbl_pet_unit, self.spin_suv_min, self.spin_suv_max)
         add_section(QLabel("配色"), self.combo_cmap, QLabel("融合"), self.spin_alpha,
-                    QLabel("缩放"), self.spin_zoom, self.btn_zoom_reset,
+                    QLabel("鼠标 DPI"), self.spin_dpi,
                     QLabel("渲染"), self.combo_render, self.lbl_cuda)
 
         self._control_scroll = QScrollArea()
@@ -482,7 +570,8 @@ class OrthoViewer(QWidget):
         self.slider_j.blockSignals(False)
         self.slider_k.blockSignals(False)
         self.refresh(True)
-        self._apply_zoom(self.spin_zoom.value())
+        for view in (self.axial, self.coronal, self.sagittal):
+            view.set_zoom(view._zoom_percent)
 
     def volumes(self) -> Optional[VolumeSet]:
         return self._vol
@@ -598,9 +687,12 @@ class OrthoViewer(QWidget):
     def ijk(self) -> tuple[int, int, int]:
         return self._i, self._j, self._k
 
-    def _apply_zoom(self, percent: int) -> None:
-        for v in (self.axial, self.coronal, self.sagittal):
-            v.set_zoom(int(percent))
+    def wheel_dpi(self) -> int:
+        return int(self.spin_dpi.value())
+
+    def _apply_wheel_dpi(self, dpi: int) -> None:
+        for view in (self.axial, self.coronal, self.sagittal):
+            view.set_wheel_dpi(int(dpi))
 
     def refresh(self, force: bool = True) -> None:
         vol = self._vol
