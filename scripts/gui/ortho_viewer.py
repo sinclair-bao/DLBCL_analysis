@@ -137,6 +137,10 @@ class _PaintItem(pg.ImageItem):
 
 
 class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
+    """一个断面视图。滚轮改变该断面的层号，不缩放。"""
+
+    slice_scroll = Signal(int)
+
     def __init__(self, title: str, view_name: str) -> None:
         super().__init__()
         self.view_name = view_name
@@ -157,6 +161,18 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         self.box.addItem(self.hline)
         self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
         self._init_laterality(view_name)
+
+    def wheelEvent(self, ev) -> None:
+        delta = ev.angleDelta().y()
+        if delta == 0:
+            delta = ev.pixelDelta().y()
+        if delta == 0:
+            ev.ignore()
+            return
+        steps = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        if steps:
+            self.slice_scroll.emit(steps)
+        ev.accept()
 
     def resizeEvent(self, ev) -> None:
         super().resizeEvent(ev)
@@ -224,6 +240,7 @@ class OrthoViewer(QWidget):
             v.item.clicked_xy.connect(lambda x, y, vv=v: self._click(vv.view_name, x, y))
             v.item.paint_at.connect(lambda x, y, er, vv=v: self._paint(vv.view_name, x, y, er))
             v.item.stroke_finished.connect(self._end_stroke)
+            v.slice_scroll.connect(lambda steps, vv=v: self._scroll_slice(vv.view_name, steps))
 
         views = QHBoxLayout()
         views.addWidget(self.axial, 1)
@@ -490,6 +507,19 @@ class OrthoViewer(QWidget):
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
         self.refresh(False)
+
+    def _scroll_slice(self, which: str, steps: int) -> None:
+        if self._vol is None or not steps:
+            return
+        i, j, k = self._i, self._j, self._k
+        if which == "axial":
+            k += steps
+        elif which == "coronal":
+            j += steps
+        else:
+            i += steps
+        self.active_view = which
+        self._set_ijk(i, j, k)
 
     def _click(self, which: str, x: float, y: float) -> None:
         self.active_view = which

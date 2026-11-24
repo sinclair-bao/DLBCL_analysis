@@ -115,6 +115,7 @@ class SegmentEditorDialog(QDialog):
             view.item.clicked_xy.connect(lambda x, y: self._click(x, y))
             view.item.paint_at.connect(lambda x, y, er: self._paint(x, y, er))
             view.item.stroke_finished.connect(self._end_stroke)
+            view.slice_scroll.connect(self._scroll_slice)
             self._cells[mode] = view
             views_row.addWidget(view, 1)
 
@@ -471,6 +472,18 @@ class SegmentEditorDialog(QDialog):
         self._j = self.slider_j.value()
         self._k = self.slider_k.value()
         self.refresh(update_table=False, force=False)
+
+    def _scroll_slice(self, steps: int) -> None:
+        if self._vol is None or not steps:
+            return
+        i, j, k = self._i, self._j, self._k
+        if self.plane == "axial":
+            k += steps
+        elif self.plane == "coronal":
+            j += steps
+        else:
+            i += steps
+        self._set_ijk(i, j, k)
 
     def _click(self, x: float, y: float) -> None:
         from display_utils import display_to_voxel

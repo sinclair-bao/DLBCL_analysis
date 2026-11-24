@@ -174,7 +174,7 @@ def _gpu_slice(cp, vol, plane: str, i: int, j: int, k: int):
     nx, ny, nz = vol.shape
     if plane == "axial":
         kk = int(np.clip(k, 0, nz - 1))
-        return cp.rot90(vol[:, :, kk], 1)
+        return cp.rot90(vol[:, :, kk], 1)[:, ::-1]
     if plane == "coronal":
         jj = int(np.clip(j, 0, ny - 1))
         return vol[:, jj, :].T[::-1, ::-1]

@@ -140,7 +140,12 @@ def normalize_ct(ct: np.ndarray, window: tuple[float, float] = CT_WINDOW) -> np.
 
 
 def orient_axial(sl: np.ndarray) -> np.ndarray:
-    return np.rot90(sl, 1)
+    """RAS 轴位切片 → 放射科显示：画面左为患者右，画面上为前。
+
+    输入 sl[i, j]，i 向患者右、j 向前。只做 rot90 时画面左是患者左，
+    与冠状位和 R/L 标记相反，所以再左右翻转。
+    """
+    return np.rot90(sl, 1)[:, ::-1]
 
 
 def orient_coronal(sl: np.ndarray) -> np.ndarray:
@@ -185,7 +190,7 @@ def display_to_voxel(
     col_i = int(round(col))
     row_i = int(round(row))
     if view == "axial":
-        ii, jj, kk = nx - 1 - col_i, row_i, k
+        ii, jj, kk = nx - 1 - col_i, ny - 1 - row_i, k
     elif view == "coronal":
         ii, jj, kk = nx - 1 - col_i, j, nz - 1 - row_i
     else:
@@ -207,7 +212,7 @@ def voxel_to_display(
     """RAS 体素 (i, j, k) → 显示图 (col, row)。"""
     nx, ny, nz = shape
     if view == "axial":
-        return float(nx - 1 - i), float(j)
+        return float(nx - 1 - i), float(ny - 1 - j)
     if view == "coronal":
         return float(nx - 1 - i), float(nz - 1 - k)
     return float(j), float(nz - 1 - k)
