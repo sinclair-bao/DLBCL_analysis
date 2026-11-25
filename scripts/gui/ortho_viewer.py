@@ -65,7 +65,7 @@ _ZOOM_STYLE = (
 )
 ZOOM_MIN = 50
 ZOOM_MAX = 400
-DEFAULT_WHEEL_DPI = 40
+DEFAULT_WHEEL_DPI = 10
 WHEEL_DPI_MIN = 10
 WHEEL_DPI_MAX = 400
 
@@ -122,6 +122,68 @@ class _ZoomBadge(QLabel):
         ev.accept()
 
 
+_PLANE_ORDER = ("axial", "coronal", "sagittal")
+_PLANE_LABELS = {"axial": "轴位", "coronal": "冠状位", "sagittal": "矢状位"}
+
+
+class _PlaneTitle(QLabel):
+    """断面名称。单击切换下一个，按住左键左右拖动可来回选择。"""
+
+    plane_changed = Signal(str)
+
+    def __init__(self, parent: QWidget, plane: str) -> None:
+        super().__init__(_PLANE_LABELS[plane], parent)
+        self._plane = plane
+        self._dragging = False
+        self._moved = False
+        self._origin_x = 0.0
+        self._origin_index = 0
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setToolTip("单击切换断面。按住左键向右、向左拖动，可在轴位、冠状位、矢状位之间调整。")
+        self.setStyleSheet(
+            "QLabel { color: #f2f2f2; background: transparent; font-size: 13px; padding: 0 6px; }"
+        )
+        self.adjustSize()
+
+    def set_plane(self, plane: str) -> None:
+        self._plane = plane
+        self.setText(_PLANE_LABELS[plane])
+        self.adjustSize()
+
+    def _emit_index(self, index: int) -> None:
+        plane = _PLANE_ORDER[int(index) % len(_PLANE_ORDER)]
+        if plane == self._plane:
+            return
+        self.set_plane(plane)
+        self.plane_changed.emit(plane)
+
+    def mousePressEvent(self, ev) -> None:
+        if ev.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(ev)
+            return
+        self._dragging = True
+        self._moved = False
+        self._origin_x = float(ev.globalPosition().x())
+        self._origin_index = _PLANE_ORDER.index(self._plane)
+        ev.accept()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if not self._dragging:
+            super().mouseMoveEvent(ev)
+            return
+        dx = float(ev.globalPosition().x()) - self._origin_x
+        if abs(dx) >= 8:
+            self._moved = True
+        self._emit_index(self._origin_index + int(np.trunc(dx / 48.0)))
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._dragging and not self._moved:
+            self._emit_index(self._origin_index + 1)
+        self._dragging = False
+        ev.accept()
+
+
 class _LateralityMixin:
     """视口左右标记：轴位/冠状/MIP 为 R·L，矢状为 P·A。贴在屏幕边，不随缩放走。"""
 
@@ -174,6 +236,8 @@ class _LateralityMixin:
             self._lat_right.move(self._lat_right.x(), max(top, floor_right - self._lat_right.height()))
         if hasattr(self, "_zoom"):
             self._zoom.raise_()
+        if getattr(self, "_title", None) is not None:
+            self._place_title()
 
 
 _HUD_STYLE = """
@@ -526,10 +590,12 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
     """一个断面视图。滚轮改变该断面的层号，不缩放。"""
 
     slice_scroll = Signal(int)
+    plane_changed = Signal(str)
 
-    def __init__(self, title: str, view_name: str) -> None:
+    def __init__(self, title: str, view_name: str, *, plane_switch: bool = False) -> None:
         super().__init__()
         self.view_name = view_name
+        self._plane_switch = plane_switch
         self.setMinimumHeight(120)
         self.box = self.addViewBox(lockAspect=True, invertY=True)
         self.box.setMenuEnabled(False)
@@ -563,7 +629,12 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         self.box.addItem(self.roi_line)
         self.box.addItem(self.roi_anchors)
         self.box.addItem(self.roi_marks)
-        self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
+        self._title: Optional[_PlaneTitle] = None
+        if plane_switch:
+            self._title = _PlaneTitle(self, view_name)
+            self._title.plane_changed.connect(self._on_title_plane)
+        else:
+            self.addItem(pg.LabelItem(title, color="#dddddd"), row=1, col=0)
         self._init_laterality(view_name)
         self._zoom_percent = 100
         self.wheel_dpi = DEFAULT_WHEEL_DPI
@@ -572,6 +643,7 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         self._zoom = _ZoomBadge(self)
         self._zoom.zoom_changed.connect(self.set_zoom)
         self._place_zoom()
+        self._place_title()
 
     def wheelEvent(self, ev) -> None:
         delta = ev.angleDelta().y()
@@ -599,6 +671,23 @@ class _RgbView(_LateralityMixin, pg.GraphicsLayoutWidget):
         self._place_zoom()
         self._place_hud()
         self._place_laterality()
+        self._place_title()
+
+    def _on_title_plane(self, plane: str) -> None:
+        self.view_name = plane
+        self.set_laterality(plane)
+        self.plane_changed.emit(plane)
+
+    def _place_title(self) -> None:
+        title = getattr(self, "_title", None)
+        if title is None:
+            return
+        title.adjustSize()
+        title.move(
+            max(0, (self.width() - title.width()) // 2),
+            max(0, self.height() - title.height() - 2),
+        )
+        title.raise_()
 
     def _place_hud(self) -> None:
         if not hasattr(self, "_id"):
@@ -696,6 +785,7 @@ class OrthoViewer(QWidget):
         self._stroke_erase = False
         self._tool_hint_sent = ""
         self._pen_points: list[tuple[float, float]] = []
+        self._pen_placing = False
         self._pen_view = "axial"
         self._pen_ijk = (0, 0, 0)
         self._pen_ignore_until = 0.0
@@ -714,17 +804,21 @@ class OrthoViewer(QWidget):
         self._shown_ijk: Optional[tuple[int, int, int]] = None
         self._hud_lock = False
 
-        self.axial = _RgbView("Axial", "axial")
-        self.coronal = _RgbView("Coronal", "coronal")
-        self.sagittal = _RgbView("Sagittal", "sagittal")
+        self.axial = _RgbView("轴位", "axial", plane_switch=True)
+        self.coronal = _RgbView("冠状位", "coronal", plane_switch=True)
+        self.sagittal = _RgbView("矢状位", "sagittal", plane_switch=True)
+        self._active_host: Optional[_RgbView] = self.axial
+        self._pen_host: Optional[_RgbView] = None
+        self._poly_host: Optional[_RgbView] = None
         for v in (self.axial, self.coronal, self.sagittal):
-            v.item.clicked_xy.connect(lambda x, y, vv=v: self._click(vv.view_name, x, y))
-            v.item.paint_at.connect(lambda x, y, er, vv=v: self._paint(vv.view_name, x, y, er))
+            v.item.clicked_xy.connect(lambda x, y, vv=v: self._click(vv, x, y))
+            v.item.paint_at.connect(lambda x, y, er, vv=v: self._paint(vv, x, y, er))
             v.item.stroke_finished.connect(self._end_stroke)
             v.item.gesture.connect(
-                lambda x, y, phase, subtract, vv=v: self._gesture(vv.view_name, x, y, phase, subtract)
+                lambda x, y, phase, subtract, vv=v: self._gesture(vv, x, y, phase, subtract)
             )
-            v.slice_scroll.connect(lambda steps, vv=v: self._scroll_slice(vv.view_name, steps))
+            v.slice_scroll.connect(lambda steps, vv=v: self._scroll_slice(vv, steps))
+            v.plane_changed.connect(lambda _plane, vv=v: self._on_view_plane(vv))
             v._zoom.zoom_changed.connect(self._sync_zoom)
             v.attach_hud()
 
@@ -809,7 +903,7 @@ class OrthoViewer(QWidget):
         self.spin_dpi.setRange(WHEEL_DPI_MIN, WHEEL_DPI_MAX)
         self.spin_dpi.setSingleStep(10)
         self.spin_dpi.setValue(DEFAULT_WHEEL_DPI)
-        self.spin_dpi.setToolTip("每一格滚轮只翻一层。数值越小，下一层要等得越久。")
+        self.spin_dpi.setToolTip("每一格滚轮只翻一层。默认 10，大约 0.6 秒才能再翻一层。")
         self.spin_dpi.valueChanged.connect(self._apply_wheel_dpi)
         self._apply_wheel_dpi(self.spin_dpi.value())
 
@@ -866,7 +960,7 @@ class OrthoViewer(QWidget):
         self.btn_pen = self._make_tool_button(
             "画笔",
             "按住左键沿边缘画一圈，松开后封闭并加入当前病灶。"
-            "连续单击时，终点必须回到起点才封闭。"
+            "连续单击没有点数上限，只有点中绿色空心方块起点才封闭。"
             "按住 Shift 松开则把这块从当前病灶中去掉。"
             "没连成封闭图形会自动取消。再按一次按钮可退出。右键单击撤销上一步。",
         )
@@ -1003,7 +1097,7 @@ class OrthoViewer(QWidget):
         mode = self._tool_mode()
         if mode == "pen":
             return (
-                "画笔：拖动松开后封闭并加入当前病灶；连续单击须点回绿色起点。"
+                "画笔：拖动松开后封闭并加入当前病灶；连续单击须点中绿色空心方块起点，没有点数上限。"
                 "按住 Shift 去掉这块。右键撤销。"
             )
         if mode == "polygon":
@@ -1013,7 +1107,10 @@ class OrthoViewer(QWidget):
     def set_volumes(self, vol: Optional[VolumeSet]) -> None:
         self._vol = vol
         self._pen_points = []
+        self._pen_placing = False
+        self._pen_host = None
         self._poly_paths = []
+        self._poly_host = None
         self._poly_drag = None
         self._poly_base = None
         self._poly_undo = False
@@ -1090,9 +1187,11 @@ class OrthoViewer(QWidget):
         self._drop_polygon_if_slice_moved()
         self.refresh(False)
 
-    def _scroll_slice(self, which: str, steps: int) -> None:
+    def _scroll_slice(self, view: _RgbView, steps: int) -> None:
         if self._vol is None or not steps:
             return
+        which = view.view_name
+        self._active_host = view
         i, j, k = self._i, self._j, self._k
         if which == "axial":
             k += steps
@@ -1103,7 +1202,9 @@ class OrthoViewer(QWidget):
         self.active_view = which
         self._set_ijk(i, j, k)
 
-    def _click(self, which: str, x: float, y: float) -> None:
+    def _click(self, view: _RgbView, x: float, y: float) -> None:
+        which = view.view_name
+        self._active_host = view
         self.active_view = which
         if self._vol is None:
             return
@@ -1139,10 +1240,12 @@ class OrthoViewer(QWidget):
             self._redraw_overlay()
         self.mask_changed.emit()
 
-    def _paint(self, which: str, x: float, y: float, erase: bool) -> None:
+    def _paint(self, view: _RgbView, x: float, y: float, erase: bool) -> None:
         vol = self._vol
         if vol is None:
             return
+        which = view.view_name
+        self._active_host = view
         self.active_view = which
         if vol.native is None:
             vol.native = np.zeros(vol.ct.shape, dtype=np.uint16)
@@ -1218,10 +1321,15 @@ class OrthoViewer(QWidget):
         )
         native = vol.native
         prev = self._shown_ijk
+        slice_index = {"axial": self._k, "coronal": self._j, "sagittal": self._i}
+        prev_index = None if prev is None else {"axial": prev[2], "coronal": prev[1], "sagittal": prev[0]}
         planes = [
-            (self.axial, "axial", prev is None or force or prev[2] != self._k),
-            (self.coronal, "coronal", prev is None or force or prev[1] != self._j),
-            (self.sagittal, "sagittal", prev is None or force or prev[0] != self._i),
+            (
+                view,
+                view.view_name,
+                prev_index is None or force or prev_index[view.view_name] != slice_index[view.view_name],
+            )
+            for view in (self.axial, self.coronal, self.sagittal)
         ]
         need = [(view, name) for view, name, yes in planes if yes]
         if need:
@@ -1343,7 +1451,21 @@ class OrthoViewer(QWidget):
             view.item.tool = mode
 
     def _view(self, name: str) -> _RgbView:
-        return {"axial": self.axial, "coronal": self.coronal, "sagittal": self.sagittal}[name]
+        matches = [view for view in (self.axial, self.coronal, self.sagittal) if view.view_name == name]
+        for host in (self._poly_host, self._pen_host, self._active_host):
+            if host in matches:
+                return host
+        return matches[0] if matches else self.axial
+
+    def _on_view_plane(self, view: _RgbView) -> None:
+        self._active_host = view
+        self.active_view = view.view_name
+        if self._pen_host is view:
+            self._pen_points = []
+            self._pen_host = None
+        if self._poly_host is view and self.btn_poly.isChecked():
+            self._load_polygon_from_mask()
+        self.refresh(True)
 
     def _on_pen_toggled(self, on: bool) -> None:
         if on and self.btn_poly.isChecked():
@@ -1352,6 +1474,7 @@ class OrthoViewer(QWidget):
             self.btn_poly.blockSignals(False)
             self._poly_paths = []
         self._pen_points = []
+        self._pen_host = None
         self._poly_drag = None
         self._apply_tool()
         self._redraw_overlay()
@@ -1369,6 +1492,7 @@ class OrthoViewer(QWidget):
             self._load_polygon_from_mask()
         else:
             self._poly_paths = []
+            self._poly_host = None
             self._redraw_overlay()
         self.refresh(True)
 
@@ -1412,26 +1536,27 @@ class OrthoViewer(QWidget):
         view.roi_line.setData(pts[:, 0], pts[:, 1])
         xs = [float(pts[0, 0])]
         ys = [float(pts[0, 1])]
-        symbols = ["o"]
-        pens = [pg.mkPen("#7dff6a", width=2)]
-        brushes = [pg.mkBrush(125, 255, 106)]
-        sizes = [7]
+        symbols = ["s"]
+        pens = [pg.mkPen("#7dff6a", width=1)]
+        brushes = [pg.mkBrush(0, 0, 0, 0)]
+        sizes = [8]
         same = len(pts) > 1 and float(np.hypot(pts[-1, 0] - pts[0, 0], pts[-1, 1] - pts[0, 1])) <= 0.5
         if len(pts) > 1 and not same:
             xs.append(float(pts[-1, 0]))
             ys.append(float(pts[-1, 1]))
-            symbols.append("o")
-            pens.append(pg.mkPen("#ffb020", width=2))
-            brushes.append(pg.mkBrush(255, 176, 32))
-            sizes.append(7)
+            symbols.append("s")
+            pens.append(pg.mkPen("#ffb020", width=1))
+            brushes.append(pg.mkBrush(0, 0, 0, 0))
+            sizes.append(8)
         view.roi_marks.setData(x=xs, y=ys, symbol=symbols, pen=pens, brush=brushes, size=sizes)
 
     def _redraw_overlay(self) -> None:
         if self.btn_pen.isChecked() and self._pen_points:
-            self._show_pen(self._view(self._pen_view), self._pen_points)
+            self._show_pen(self._pen_host or self._view(self._pen_view), self._pen_points)
             return
         if self.btn_poly.isChecked() and self._poly_paths:
-            self._show_paths(self._view(self._poly_plane), self._poly_paths, anchors=True, close=True)
+            host = self._poly_host or self._view(self._poly_plane)
+            self._show_paths(host, self._poly_paths, anchors=True, close=True)
             return
         self._clear_roi_graphics()
 
@@ -1445,7 +1570,24 @@ class OrthoViewer(QWidget):
 
     def _cancel_pen(self) -> None:
         self._pen_points = []
+        self._pen_placing = False
+        self._pen_host = None
         self._redraw_overlay()
+
+    def _hits_pen_start(self, x: float, y: float) -> bool:
+        if not self._pen_points:
+            return False
+        sx, sy = self._pen_points[0]
+        tol = 2.0
+        view = self._pen_host
+        if view is not None:
+            try:
+                px, py = view.box.viewPixelSize()
+                tol = max(5.0 * float(px), 5.0 * float(py))
+            except Exception:
+                tol = 2.0
+        tol = float(np.clip(tol, 1.5, 4.0))
+        return float(np.hypot(sx - x, sy - y)) <= tol
 
     def _drop_pen_if_slice_moved(self) -> None:
         if not self._pen_points:
@@ -1490,18 +1632,21 @@ class OrthoViewer(QWidget):
             return dominant_label(vol.native, which, self._i, self._j, self._k)
         return 1
 
-    def _gesture(self, which: str, x: float, y: float, phase: str, subtract: bool) -> None:
+    def _gesture(self, view: _RgbView, x: float, y: float, phase: str, subtract: bool) -> None:
         if not self.chk_edit.isChecked():
             return
+        self._active_host = view
+        which = view.view_name
         if phase == "undo":
             self._cancel_pen()
             self.undo()
             return
         self.active_view = which
         if self._tool_mode() == "pen":
+            self._pen_host = view
             self._pen_gesture(which, x, y, phase, subtract)
         elif self._tool_mode() == "polygon":
-            self._poly_gesture(which, x, y, phase)
+            self._poly_gesture(view, x, y, phase)
 
     def _pen_gesture(self, which: str, x: float, y: float, phase: str, subtract: bool) -> None:
         if phase == "click":
@@ -1511,19 +1656,25 @@ class OrthoViewer(QWidget):
                 len(self._pen_points) >= 3
                 and which == self._pen_view
                 and self._pen_same_slice()
-                and float(np.hypot(self._pen_points[0][0] - x, self._pen_points[0][1] - y)) <= 8.0
+                and self._hits_pen_start(x, y)
             ):
                 self._pen_points.append(self._pen_points[0])
+                self._pen_placing = False
                 self._commit_pen(subtract)
                 return
             if which != self._pen_view or not self._pen_same_slice():
                 self._pen_points = []
             self._pen_view = which
             self._pen_ijk = (self._i, self._j, self._k)
+            self._pen_placing = True
             self._pen_points.append((float(x), float(y)))
             self._redraw_overlay()
             return
         if phase == "start":
+            if self._pen_placing and self._pen_points and which == self._pen_view and self._pen_same_slice():
+                self._redraw_overlay()
+                return
+            self._pen_placing = False
             self._pen_view = which
             self._pen_ijk = (self._i, self._j, self._k)
             self._pen_points = [(float(x), float(y))]
@@ -1540,6 +1691,9 @@ class OrthoViewer(QWidget):
             return
         if phase == "finish":
             self._pen_ignore_until = time.monotonic() + 0.25
+            if self._pen_placing:
+                self._redraw_overlay()
+                return
             if len(self._pen_points) >= 3 and which == self._pen_view and self._pen_same_slice():
                 self._commit_pen(subtract)
             else:
@@ -1585,7 +1739,9 @@ class OrthoViewer(QWidget):
         if vol is None or vol.native is None:
             self._reject_polygon()
             return
-        plane = self.active_view
+        host = self._active_host if self._active_host is not None else self._view(self.active_view)
+        plane = host.view_name
+        self.active_view = plane
         label = int(self.current_label)
         if label <= 0:
             label = dominant_label(vol.native, plane, self._i, self._j, self._k)
@@ -1607,6 +1763,7 @@ class OrthoViewer(QWidget):
             self._reject_polygon()
             return
         self._poly_paths = paths
+        self._poly_host = host
         self._poly_plane = plane
         self._poly_ijk = (self._i, self._j, self._k)
         self._poly_label = label
@@ -1616,6 +1773,7 @@ class OrthoViewer(QWidget):
 
     def _reject_polygon(self) -> None:
         self._poly_paths = []
+        self._poly_host = None
         if self.btn_poly.isChecked():
             self.btn_poly.blockSignals(True)
             self.btn_poly.setChecked(False)
@@ -1623,8 +1781,8 @@ class OrthoViewer(QWidget):
             self._apply_tool()
         self._redraw_overlay()
 
-    def _poly_gesture(self, which: str, x: float, y: float, phase: str) -> None:
-        if which != self._poly_plane or not self._poly_paths:
+    def _poly_gesture(self, view: _RgbView, x: float, y: float, phase: str) -> None:
+        if view is not self._poly_host or view.view_name != self._poly_plane or not self._poly_paths:
             return
         if phase in ("start", "click"):
             hit = nearest_anchor(self._poly_paths, x, y, radius=10.0)
