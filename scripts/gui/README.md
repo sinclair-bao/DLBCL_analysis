@@ -206,8 +206,34 @@ PET 与 MIP 默认 **灰度**（工具栏 **配色** 可选 PET 热金 / Hot / J
 - 主窗口勾选「编辑 mask」后，笔刷、画笔和多边形才可用；未勾选时这三项不可用。已编辑的 mask 仍按原方式保存。当前工具的操作提示显示在三视图下方信息栏和窗口最下方状态栏。勾选后也可在当前三视图上涂擦（无三格对照，容易误改）。
 - 笔刷后的 **画笔** 在当前层画封闭选区：松开后加入当前病灶，按住 Shift 松开则从当前病灶去掉这块。绿色空心方块是起点，琥珀色空心方块是终点；连续单击没有点数上限，只有点中起点才封闭。没封上或换层会取消这笔。**多边形** 用细小空心方块表示当前层病灶，选中时 ROI 内部不铺颜色。两个按钮按下后有绿色描边，再按一次退出。右键单击撤销上一步；勾选「编辑 mask」后笔刷的右键仍是擦除。
 - 形态学：膨胀 / 腐蚀 / 开 / 闭，半径 1–5；范围默认 **当前层 2D**（只改该切片）；**三维**在病灶边界盒内运算，并显示进度条。
-- 保存写入 sidecar `{PatientID}_{StudyDate}_lesion_edited.nii.gz` 并保留历史快照，**从不覆盖** nnU-Net 的 `*_lesion.nii.gz`。编辑窗可切换原始 mask、当前 mask、增删差异。
-- 连通域自动编号；「按体积重新编号」按体素数从大到小变成 1..N。
+- 连通域自动编号；「按体积重新编号」按体素数从大到小变成 1..N。笔刷、画笔、多边形、形态学和重编号都只改内存，并令 `VolumeSet.dirty = True`。撤销最多约 20 步，也不写盘。
+
+### 3.4 保存一名患者的 ROI
+
+改完**当前这一次检查**后，点右侧 **保存调整后的 mask**。窗口最下方出现 `已保存 {PatientID}_{StudyDate}_lesion_edited.nii.gz（未覆盖 nnU-Net 原 mask）` 才算写到磁盘。勾选「编辑 mask」只是放开笔刷、画笔和多边形，不是保存。
+
+换患者、换检查或关闭窗口时，若这份或该患者缓存里还有 `dirty` 的检查，会询问保存、放弃或取消。选保存会把这些未写盘的检查逐份写出。选放弃则丢掉内存中的修改，下次从磁盘重新载入。
+
+写出的文件：
+
+```
+{processed_root}/{PatientID}/{StudyDate}/masks/{PatientID}_{StudyDate}_lesion_edited.nii.gz
+```
+
+纵向队列的 `processed_root` 是 `data/processed`。用「导入检查清单」打开 `finetune_studies.csv` 时，结果目录是清单旁边的 `finetune_studies_review_outputs`，不会写回 `image_for_finetune/<ID>_<日期>/lesion_autopet.nii.gz`，也不会覆盖 `*_lesion.nii.gz`。
+
+`_write_edited_mask` 的顺序：
+
+1. 核对载入时的源 mask 路径和 SHA256。磁盘上的源文件若已变化，拒绝保存并提示刷新。
+2. 若编辑稿已存在，它的 SHA256 必须等于打开时记下的 `edited_sha256`。被别的操作改过则拒绝保存。
+3. 把旧编辑稿复制到 `masks/versions/{文件名}_{UTC时间}_before.nii.gz`。第一次保存没有旧稿，这一步跳过。
+4. 用工作 CT 的仿射把当前 `native` 写成 uint16 NIfTI。先写 `*.tmp.nii.gz`，再替换正式文件。
+5. 再复制一份到 `masks/versions/{文件名}_{UTC时间}.nii.gz`，并把 `{编辑稿文件名}.review.json` 设为 `pending`。事件记在同目录的 `{编辑稿文件名}.events.jsonl`。
+6. `dirty` 清掉。之后再次打开该检查时，`working_lesion` 优先用这份编辑稿。
+
+分割编辑窗里的 **保存并关闭** 会把对话框里的 mask 交回主窗；与主窗当前 mask 不同才调用同一次保存。**取消**不写盘。主窗和编辑窗用的是同一条 `_save_edited` 路径。
+
+保存后右下特征表被清空，提示重新计算特征。质控按钮「核对原始/编辑 mask 并记录质控」要求先保存；它只写审核结论，不代替保存。
 
 ---
 
@@ -306,7 +332,8 @@ DataCatalog 扫描磁盘
   TimepointPanel ──► save_session JSON
         │
         ├── AutoPET ──► 校验 CT+PET ──► 进度条 ──► 主界面结果（可选手动调整）
-        ├── SUV 阈值 / 空白手动 / 载入 ──► SegmentEditorDialog ──► lesion_edited.nii.gz
+        ├── 主窗笔刷 / 画笔 / 多边形 ──► 内存 dirty ──►「保存调整后的 mask」
+        ├── SUV 阈值 / 空白手动 / 载入 ──► SegmentEditorDialog ──► 保存并关闭 ──► lesion_edited.nii.gz
         │
         ├── 映射按钮 ──► 预检 ──► MappingWorker ──► ANTs ──► 切到随访 + 青色 overlay
         │
